@@ -9,3 +9,8 @@ ul.plan li { padding:10px 0; border-bottom:1px dashed #eee; }
 label { display:block; margin:8px 0; }
 input, button { padding:8px 10px; border:1px solid #ddd; border-radius:10px; }
 button { cursor:pointer; }
+
+/* Unified button look for real buttons and anchor buttons */
+button, a.button, a.button:visited { display:inline-block; padding:8px 10px; border:1px solid #ddd; border-radius:10px; background:#ededed; color:#111; text-decoration:none; font: inherit; line-height: normal; box-shadow: inset 0 1px 0 rgba(0,0,0,.02); }
+button:hover, a.button:hover { background:#e6e6e6; text-decoration:none; }
+button:focus, a.button:focus { outline: none; box-shadow: 0 0 0 2px #e5e7eb; }

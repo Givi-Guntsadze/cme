@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>Edit Preferences</h1>
+  <form method="post" action="/preferences" class="card" style="display:grid;gap:8px;max-width:560px;">
+    <label>Name <input name="name" value="{{ user.name }}" required></label>
+    <label>Specialty <input name="specialty" value="{{ user.specialty }}" required></label>
+    <label>City <input name="city" value="{{ user.city or '' }}"></label>
+
+    <label>Target credits <input name="target_credits" type="number" step="0.5" value="{{ '%.1f' % user.target_credits }}" required></label>
+    <label>Budget (USD) <input name="budget_usd" type="number" step="1" value="{{ '%.0f' % user.budget_usd }}" required></label>
+    <label>Days off allowed <input name="days_off" type="number" value="{{ user.days_off }}" required></label>
+    <label>Allow live events? <input name="allow_live" type="checkbox" {% if user.allow_live %}checked{% endif %}></label>
+    <label>Prefer live events? <input name="prefer_live" type="checkbox" {% if user.prefer_live %}checked{% endif %}></label>
+
+    <div style="display:flex;gap:8px;">
+      <button type="submit">Save</button>
+      <a href="/" class="button">Cancel</a>
+    </div>
+  </form>
+{% endblock %}

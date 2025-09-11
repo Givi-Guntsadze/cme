@@ -5,11 +5,14 @@ from .models import User, Activity
 
 
 # Simple scoring: lower is better
-def _score(activity: Activity) -> float:
+def _score(activity: Activity, prefer_live: bool) -> float:
     cost_per_credit = (
         (activity.cost_usd / activity.credits) if activity.credits else 9999
     )
-    travel_penalty = 2.0 if activity.modality == "live" else 0.0
+    base_penalty = 2.0 if activity.modality == "live" else 0.0
+    travel_penalty = (
+        0.8 if (activity.modality == "live" and prefer_live) else base_penalty
+    )
     return cost_per_credit + travel_penalty
 
 
@@ -26,7 +29,7 @@ def build_plan(user: User, session) -> Tuple[List[Activity], float, float, int]:
     if not user.allow_live:
         activities = [a for a in activities if a.modality == "online"]
 
-    activities.sort(key=_score)
+    activities.sort(key=lambda a: _score(a, user.prefer_live))
 
     chosen: List[Activity] = []
     total_credits = 0.0

@@ -10,6 +10,7 @@
         <label>Budget (USD) <input name="budget_usd" type="number" step="1" value="300" required></label>
         <label>Days off allowed <input name="days_off" type="number" value="0" required></label>
         <label>Allow live events? <input name="allow_live" type="checkbox"></label>
+        <label>Prefer live events? <input name="prefer_live" type="checkbox"></label>
         <label>Name <input name="name" value="Doctor"></label>
         <label>Specialty <input name="specialty" value="Psychiatry"></label>
         <label>City <input name="city" placeholder="(optional)"></label>
@@ -19,18 +20,75 @@
   {% else %}
     <section class="stats">
       <div class="badge">Remaining: {{ '%.1f' % user.remaining_credits }} credits</div>
-      <div>Budget: ${{ '%.0f' % user.budget_usd }} | Days off: {{ user.days_off }} | Live OK: {{ 'Yes' if user.allow_live else 'No' }}</div>
+      <div>
+        Budget: ${{ '%.0f' % user.budget_usd }} | Days off: {{ user.days_off }} | Live OK: {{ 'Yes' if user.allow_live else 'No' }} | Prefer live: {{ 'Yes' if user.prefer_live else 'No' }}
+      </div>
     </section>
 
     <section class="card">
-      <h2>Recommended Plan</h2>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+        <h2 style="margin:0;">Assistant</h2>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <a href="/preferences" class="button">Edit Preferences</a>
+          <form method="post" action="/assist">
+            <button type="submit">Explain and ask preferences</button>
+          </form>
+        </div>
+      </div>
+      {% if assistant_messages %}
+        <ul>
+          {% for m in assistant_messages %}
+            <li style="white-space:pre-wrap;">{{ m.content }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>No assistant messages yet.</p>
+      {% endif %}
+      <form method="post" action="/assist/reply" style="margin-top:8px;display:flex;gap:8px;">
+        <input name="answer" placeholder="e.g., Prefer online only, budget under $200, 1 day off max" style="flex:1" required />
+        <button type="submit">Send</button>
+      </form>
+    </section>
+
+    {% set added = request.query_params.get('added') %}
+    {% set fallback = request.query_params.get('fallback') %}
+    {% set error = request.query_params.get('error') %}
+    {% if added %}
+      <div class="card" style="background:#f0fff4;border-left:4px solid #34d399;padding:8px 12px;margin:8px 0;">
+        Imported {{ added }} new activities{% if fallback == '1' %} (with AI web search fallback){% endif %}.
+      </div>
+    {% elif error %}
+      <div class="card" style="background:#fff7f7;border-left:4px solid #f87171;padding:8px 12px;margin:8px 0;">{{ error }}</div>
+    {% endif %}
+
+    <section class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+        <h2 style="margin:0;">Recommended Plan</h2>
+        <form method="post" action="/ingest">
+          <button type="submit">Discover</button>
+        </form>
+      </div>
       {% if plan and plan|length > 0 %}
         <ul class="plan">
           {% for p in plan %}
             <li>
-              <div class="title">{{ p.title }}</div>
-              <div class="meta">{{ p.provider }} • {{ p.modality }}{% if p.city %} • {{ p.city }}{% endif %}</div>
+              <div class="title">
+                {% if p.url %}
+                  <a href="{{ p.url }}" target="_blank" rel="noopener noreferrer">{{ p.title }}</a>
+                {% else %}
+                  {{ p.title }}
+                {% endif %}
+              </div>
+              <div class="meta">
+                {{ p.provider }} • {{ p.modality }}{% if p.city %} • {{ p.city }}{% endif %}
+                {% if p.source %}
+                  <span class="badge" style="margin-left:8px; background:#eef;">{{ p.source|capitalize }}</span>
+                {% endif %}
+              </div>
               <div class="meta">{{ '%.1f' % p.credits }} cr • ${{ '%.0f' % p.cost }}</div>
+              {% if p.summary %}
+                <div class="meta">{{ p.summary }}</div>
+              {% endif %}
             </li>
           {% endfor %}
         </ul>
