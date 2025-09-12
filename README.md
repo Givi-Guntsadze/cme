@@ -32,3 +32,22 @@ pip install -r requirements.txt
 
 # Install pre-commit hooks
 pre-commit install
+```
+
+### Start/Restart the app
+Run one of the following from the repo root after activating the venv.
+
+Foreground (shows logs):
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port ${APP_PORT:-8000}
+```
+
+Background (same terminal free):
+```bash
+nohup .venv/bin/uvicorn app.main:app --reload --host 0.0.0.0 --port ${APP_PORT:-8000} > /tmp/cme-uvicorn.log 2>&1 & disown
+```
+
+Stop any previous server (free port 8000):
+```bash
+lsof -t -i TCP:${APP_PORT:-8000} | xargs -r kill; pkill -f "uvicorn .*app.main:app" || true
+```

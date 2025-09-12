@@ -34,6 +34,17 @@ def _apply_migrations() -> None:
             text("UPDATE activity SET source='seed' WHERE source IS NULL OR source=''")
         )
 
+        # AssistantMessage: add role
+        cols_m = conn.execute(text("PRAGMA table_info(assistantmessage)")).fetchall()
+        m_names = {row[1] for row in cols_m}
+        if "role" not in m_names:
+            conn.execute(text("ALTER TABLE assistantmessage ADD COLUMN role TEXT"))
+            conn.execute(
+                text(
+                    "UPDATE assistantmessage SET role='assistant' WHERE role IS NULL OR role=''"
+                )
+            )
+
 
 def purge_seed_activities() -> None:
     """Delete legacy seed activities if present."""

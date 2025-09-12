@@ -41,3 +41,5 @@ websockets==15.0.1
 python-multipart==0.0.9
 httpx==0.27.2
 openai
+beautifulsoup4
+lxml

@@ -53,5 +53,6 @@ class PlanItem(SQLModel, table=True):
 class AssistantMessage(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id")
+    role: str = "assistant"  # 'user' | 'assistant'
     content: str
     created_at: datetime = Field(default_factory=datetime.utcnow)

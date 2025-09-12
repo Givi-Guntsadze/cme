@@ -4,15 +4,20 @@ import re
 import json
 import logging
 from datetime import date
-from typing import List, Optional, Tuple
+from typing import List, Optional, Dict, Any
+from urllib.parse import urlparse
 
 import httpx
+from bs4 import BeautifulSoup
 from sqlmodel import select
 
 from .db import get_session
 from .models import Activity, User
 
 logger = logging.getLogger(__name__)
+
+# In-memory page cache for a single ingest run
+_page_cache: Dict[str, str] = {}
 
 
 def _redact_key(text: str) -> str:
@@ -21,78 +26,6 @@ def _redact_key(text: str) -> str:
     text = re.sub(r"(key=)[^&\s]+", r"\1REDACTED", text, flags=re.I)
     text = re.sub(r"(GOOGLE_API_KEY:\s*)\S+", r"\1REDACTED", text)
     return text
-
-
-# --- Google Programmable Search (Primary) ---
-
-
-def fetch_google_cse(query: str, num: int = 10, start: Optional[int] = None):
-    key = os.getenv("GOOGLE_API_KEY")
-    cx = os.getenv("GOOGLE_CSE_ID")
-    if not (key and cx):
-        raise RuntimeError("Google CSE not configured")
-
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {"q": query, "key": key, "cx": cx, "num": max(1, min(int(num or 10), 10))}
-    if start is not None:
-        params["start"] = max(1, int(start))
-    try:
-        resp = httpx.get(url, params=params, timeout=20)
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        safe_url = _redact_key(str(e.request.url))
-        logger.error("Google CSE failed %s (%s)", safe_url, e.response.status_code)
-        raise RuntimeError("Google CSE request failed") from None
-    except Exception as e:
-        logger.exception("CSE error: %s", _redact_key(str(e)))
-        raise RuntimeError("Google CSE request failed") from None
-    data = resp.json()
-    items = data.get("items", [])
-    return [
-        {
-            "title": it.get("title", ""),
-            "link": it.get("link", ""),
-            "snippet": it.get("snippet", ""),
-        }
-        for it in items
-    ]
-
-
-def fetch_google_cse_multi(query: str, total: int = 20) -> List[dict]:
-    results: List[dict] = []
-    start = 1
-    while len(results) < total:
-        batch = fetch_google_cse(query, num=10, start=start)
-        if not batch:
-            break
-        # Dedup by link
-        seen = {r.get("link") for r in results}
-        for it in batch:
-            if it.get("link") not in seen:
-                results.append(it)
-        start += 10
-        if start > 91:  # API max
-            break
-    return results[:total]
-
-
-# --- Heuristics (used only for minimal fallback parsing) ---
-CRED_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:AMA PRA)?\s*Category\s*1(?:\s*Credit)?(?:\(s\))?", re.I
-)
-ALT_CRED_RE = re.compile(r"(\d+(?:\.\d+)?)\s*credit", re.I)
-COST_RE = re.compile(r"\$(\d{1,4}(?:\.\d{2})?)")
-MODALITY_RE = re.compile(r"\bonline|virtual|on-demand|webinar|live\b", re.I)
-
-
-def _openai_client():
-    from openai import OpenAI
-
-    return OpenAI()
-
-
-# Robust JSON parsing helper
-# Returns a dict on success or None on failure
 
 
 def safe_json_loads(text: str) -> Optional[dict]:
@@ -110,39 +43,182 @@ def safe_json_loads(text: str) -> Optional[dict]:
         return None
 
 
-def _build_query_for_user(user: Optional[User]) -> str:
-    base = "psychiatry CME AMA PRA Category 1 credit"
-    if not user:
-        return base + " online OR webinar OR on-demand"
-    if user.allow_live:
-        live_part = 'conference OR symposium OR in-person OR "live CME"'
-        if user.city:
-            live_part += f" {user.city}"
-        return f"{base} ({live_part} OR online OR webinar OR on-demand)"
-    else:
-        return base + " online OR webinar OR on-demand OR virtual"
+def fetch_page(url: str, timeout: int = 20) -> Optional[str]:
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; CMEBot/1.0)"}
+        if url in _page_cache:
+            return _page_cache[url]
+        r = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+        if r.status_code == 200:
+            _page_cache[url] = r.text
+            return r.text
+        logger.info("page fetch non-200 for %s: %s", _redact_key(url), r.status_code)
+        return None
+    except Exception as e:
+        logger.exception("page fetch failed: %s", _redact_key(f"{url} {e}"))
+        return None
+
+
+def html_to_text(html: str) -> str:
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        text = soup.get_text(separator=" ")
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:15000]
+    except Exception:
+        logger.exception("html_to_text failed")
+        return ""
+
+
+async def ai_extract_from_text(text: str, url: str) -> Optional[dict]:
+    try:
+        from openai import OpenAI
+
+        client = OpenAI()
+        schema = (
+            "Return STRICT JSON only with keys: title, provider, credits (number), cost_usd (number|null), "
+            "modality ('online'|'live'), city (string|null), start_date (YYYY-MM-DD|null), end_date (YYYY-MM-DD|null), "
+            "days_required (integer|null), url (string)."
+        )
+        prompt = (
+            f"Extract CME info from the following page text. {schema} URL: {url}. "
+            "If provider isn't explicit, use the page domain as provider."
+        )
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {"role": "user", "content": prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+        )
+        data = safe_json_loads(getattr(resp, "output_text", "") or "")
+        return data or None
+    except Exception:
+        logger.exception("ai_extract_from_text failed for %s", _redact_key(url))
+        return None
+
+
+def is_valid_record(r: Dict[str, Any]) -> bool:
+    try:
+        title = (r.get("title") or "").strip()
+        provider = (r.get("provider") or "").strip()
+        url = (r.get("url") or "").strip()
+        if not provider and url:
+            try:
+                provider = urlparse(url).netloc
+                if provider:
+                    r["provider"] = provider
+            except Exception:
+                provider = ""
+        credits = float(r.get("credits") or 0)
+        if not title or not provider or credits <= 0:
+            return False
+        if (r.get("modality") or "").lower() == "online" and r.get("days_required") in (
+            None,
+            "",
+        ):
+            r["days_required"] = 0
+        return True
+    except Exception:
+        return False
+
+
+# OpenAI client factory
+def _openai_client():
+    from openai import OpenAI
+
+    return OpenAI()
+
+
+# --- Google Programmable Search (Primary) ---
+
+
+def fetch_google_cse(
+    query: str, num: int = 10, start: Optional[int] = None
+) -> List[dict]:
+    key = os.getenv("GOOGLE_API_KEY")
+    cx = os.getenv("GOOGLE_CSE_ID")
+    if not (key and cx):
+        raise RuntimeError("Google CSE not configured")
+
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {"q": query, "key": key, "cx": cx, "num": max(1, min(int(num or 10), 10))}
+    if start is not None:
+        params["start"] = max(1, int(start))
+    try:
+        resp = httpx.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("items", [])
+        return [
+            {
+                "title": it.get("title", ""),
+                "link": it.get("link", ""),
+                "displayLink": it.get("displayLink", ""),
+                "snippet": it.get("snippet", ""),
+            }
+            for it in items
+        ]
+    except httpx.HTTPStatusError as e:
+        # Full traceback + redacted URL
+        safe_url = _redact_key(str(e.request.url) if e.request else url)
+        logger.exception(
+            "Google CSE failed %s (%s)",
+            safe_url,
+            getattr(e.response, "status_code", "?"),
+        )
+        raise RuntimeError("Google CSE request failed") from None
+    except Exception as e:
+        logger.exception("CSE error: %s", _redact_key(str(e)))
+        raise RuntimeError("Google CSE request failed") from None
+
+
+def fetch_google_cse_multi(query: str, total: int = 20) -> List[dict]:
+    results: List[dict] = []
+    start = 1
+    # cap to ~30 items to reduce quota
+    target = max(1, min(total, 30))
+    while len(results) < target:
+        batch = fetch_google_cse(query, num=10, start=start)
+        if not batch:
+            break
+        # Dedup by link within candidate pool
+        seen = {r.get("link") for r in results}
+        for it in batch:
+            if it.get("link") not in seen:
+                results.append(it)
+        start += 10
+        if start > 91:
+            break
+    return results[:target]
+
+
+# --- Heuristics ---
+CRED_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:AMA PRA)?\s*Category\s*1(?:\s*Credit)?(?:\(s\))?", re.I
+)
+ALT_CRED_RE = re.compile(r"(\d+(?:\.\d+)?)\s*credit", re.I)
+COST_RE = re.compile(r"\$(\d{1,4}(?:\.\d{2})?)")
+MODALITY_RE = re.compile(r"\bonline|virtual|on-demand|webinar|live\b", re.I)
 
 
 def _build_queries_for_user(user: Optional[User]) -> List[str]:
     base = "psychiatry CME AMA PRA Category 1 credit"
     city = user.city if user and user.city else None
     queries: List[str] = []
-    # Online-focused
     queries.append(base + " online OR webinar OR on-demand")
-    # Provider-oriented
     queries.append(base + " site:ama-assn.org OR site:accme.org OR site:medscape.org")
-    # Live-focused when allowed
     if user and user.allow_live:
         live_terms = 'conference OR symposium OR in-person OR "live CME"'
-        q = f"{base} {live_terms}"
-        queries.append(q + (f" {city}" if city else ""))
-    # City-focused general
+        queries.append(f"{base} {live_terms}" + (f" {city}" if city else ""))
     if city:
         queries.append(f"{base} CME {city}")
-    # Specialty hint
     if user and user.specialty:
         queries.append(f"{user.specialty} {base}")
-    # Remove dupes while preserving order
+    # unique preserve order
     seen = set()
     uniq: List[str] = []
     for q in queries:
@@ -153,54 +229,49 @@ def _build_queries_for_user(user: Optional[User]) -> List[str]:
 
 
 def _insert_items(items: List[dict]) -> int:
-    """Insert parsed items into DB with dedupe by URL, else (title, provider)."""
+    """Insert parsed items into DB with dedupe by (title, provider) only."""
     added = 0
     with get_session() as s:
         for it in items:
             try:
                 title = (it.get("title") or "").strip()
-                provider = (it.get("provider") or "").strip()
+                provider_in = (it.get("provider") or "").strip()
+                url = (it.get("url") or "").strip() or None
+                # Fallback provider to domain if missing
+                provider = provider_in or (urlparse(url).netloc if url else "")
                 credits = float(it.get("credits") or 0)
-                cost = float(it.get("cost_usd") or 0)
                 modality = (it.get("modality") or "online").lower()
+                cost = float(it.get("cost_usd") or 0)
                 city = it.get("city") or None
-                days_required = int(
-                    it.get("days_required") or (0 if modality == "online" else 1)
-                )
                 start_date_s = it.get("start_date") or None
                 end_date_s = it.get("end_date") or None
                 start_date = date.fromisoformat(start_date_s) if start_date_s else None
                 end_date = date.fromisoformat(end_date_s) if end_date_s else None
-                url = (it.get("url") or "").strip() or None
                 summary = it.get("summary") or None
-                source = (it.get("source") or None) or "web"
+                days_required = int(
+                    it.get("days_required") or (0 if modality == "online" else 1)
+                )
 
-                if not title or credits <= 0:
+                # Validation
+                if not title or not provider or credits <= 0:
                     continue
 
-                # Prefer URL-based dedupe
-                exists = None
-                if url:
-                    exists = s.exec(select(Activity).where(Activity.url == url)).first()
-                if not exists:
-                    exists = s.exec(
-                        select(Activity).where(
-                            Activity.title == title, Activity.provider == provider
-                        )
-                    ).first()
+                exists = s.exec(
+                    select(Activity).where(
+                        Activity.title == title, Activity.provider == provider
+                    )
+                ).first()
                 if exists:
                     continue
 
                 a = Activity(
                     title=title[:200],
-                    provider=provider[:120] or (url or "")[:120],
+                    provider=provider[:120],
                     credits=credits,
                     cost_usd=cost,
                     modality=(
                         "online"
-                        if modality.startswith("on")
-                        or modality.startswith("web")
-                        or modality == "virtual"
+                        if modality.startswith("on") or modality == "virtual"
                         else ("live" if modality == "live" else "online")
                     ),
                     city=city,
@@ -209,12 +280,15 @@ def _insert_items(items: List[dict]) -> int:
                     end_date=end_date,
                     url=url,
                     summary=summary,
-                    source=source,
+                    source=(it.get("source") or "web"),
                 )
                 s.add(a)
                 added += 1
-            except Exception as e:
-                logger.debug("insert skip: %s", e)
+            except Exception:
+                logger.exception(
+                    "insert skip (item=%s)",
+                    {k: it.get(k) for k in ("title", "provider", "url")},
+                )
                 continue
         s.commit()
     return added
@@ -223,190 +297,291 @@ def _insert_items(items: List[dict]) -> int:
 def _extract_with_openai_from_candidates(
     candidates: List[dict], count: int
 ) -> List[dict]:
-    """Use OpenAI to turn Google CSE candidates into strict JSON CME items."""
     if not candidates:
         return []
-
+    # If no API key, skip this pass and let deepfetch handle it
+    if not os.getenv("OPENAI_API_KEY"):
+        logger.info("OPENAI_API_KEY not set; skipping first-pass AI extraction")
+        return []
     client = _openai_client()
-    schema_note = (
-        "Return STRICT JSON ONLY (no markdown, no commentary) with this schema: "
-        '{"items": [{"title": "string", "provider": "string", "credits": 0, '
-        '"cost_usd": 0, "modality": "online|live", "city": null, '
-        '"start_date": "YYYY-MM-DD"|null, "end_date": "YYYY-MM-DD"|null, '
-        '"days_required": 0|1|2|null, "url": "string", "summary": "string|null", "source": "web"}]}'
-    )
-    guidance = (
-        "Only include items awarding AMA PRA Category 1 Credits. "
-        "Set url to the candidate's link. If a field is unknown, use null (not an empty string). "
-        "Provide a single-sentence summary of the activity (<=160 chars)."
-    )
-
-    content = (
-        f"You are extracting structured CME activities from candidate web results. {guidance}\n"
-        f"Limit to about {count} best items.\n\n"
-        f"Candidates (JSON with title, link, snippet):\n{json.dumps(candidates, ensure_ascii=False)}\n\n"
-        f"{schema_note}"
-    )
-
-    resp = client.responses.create(
-        model="gpt-4o-mini",
-        input=content,
-        temperature=0,
-    )
-
-    # Parse JSON defensively
-    text = getattr(resp, "output_text", None)
-    if not text:
-        parts = []
-        for item in getattr(resp, "output", []) or []:
-            if item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text":
-                        parts.append(c.get("text", ""))
-        text = "\n".join(parts)
-
-    data = safe_json_loads(text or "")
-    if data is None:
-        print("ingest: JSON load failed from candidates")
-        return []
-
-    items = data.get("items") or []
-    if not isinstance(items, list):
-        return []
-
-    # Ensure URL present by mapping title->link if missing; filter credits>0
-    link_map = {(it.get("title") or "").strip(): it.get("link") for it in candidates}
-    cleaned: List[dict] = []
-    for it in items:
-        try:
-            it = dict(it or {})
-            it.setdefault("url", link_map.get((it.get("title") or "").strip(), ""))
-            it.setdefault("source", "web")
-            if not it.get("summary"):
-                # use snippet as fallback summary
-                snip = next(
-                    (
-                        c.get("snippet")
-                        for c in candidates
-                        if (c.get("title") or "").strip()
-                        == (it.get("title") or "").strip()
-                    ),
-                    "",
-                )
-                it["summary"] = snip or None
-            # credits must be > 0
-            cval = it.get("credits")
-            credits = float(cval) if cval is not None else 0.0
-            if credits <= 0:
+    try:
+        content = (
+            "You are extracting structured CME activities from candidate web results. "
+            "Use the provided title/snippet/URL to infer provider (use domain if unsure) and credits if stated. "
+            'Return STRICT JSON: {"items":[{"title":str,"provider":str,"credits":number,'
+            '"cost_usd":number|null,"modality":"online|live","city":str|null,'
+            '"start_date":"YYYY-MM-DD"|null,"end_date":"YYYY-MM-DD"|null,'
+            '"days_required":0|1|2|null,"url":str,"summary":str|null}]}. '
+            f"Limit to about {count}. Candidates JSON follows.\n"
+            f"{json.dumps(candidates, ensure_ascii=False)}"
+        )
+        resp = client.responses.create(model="gpt-4o-mini", input=content)
+        text = getattr(resp, "output_text", "") or ""
+        data = safe_json_loads(text)
+        if not data:
+            logger.warning("AI extraction JSON parse failed; skipping.")
+            return []
+        items = data.get("items") or []
+        if not isinstance(items, list):
+            return []
+        # Filter/clean with fallbacks
+        cleaned: List[dict] = []
+        link_map = {(c.get("title") or "").strip(): c.get("link") for c in candidates}
+        snippet_map = {
+            (c.get("title") or "").strip(): c.get("snippet") for c in candidates
+        }
+        display_map = {
+            (c.get("title") or "").strip(): c.get("displayLink") for c in candidates
+        }
+        for it in items:
+            try:
+                it = dict(it or {})
+                title = (it.get("title") or "").strip()
+                it.setdefault("url", link_map.get(title, ""))
+                # Provider fallback to domain or displayLink
+                if not it.get("provider"):
+                    url_val = it.get("url") or ""
+                    prov = (
+                        urlparse(url_val).netloc
+                        if url_val
+                        else (display_map.get(title) or "")
+                    )
+                    if prov:
+                        it["provider"] = prov
+                # Credits fallback from snippet/title heuristics
+                if not it.get("credits") or float(it.get("credits") or 0) <= 0:
+                    text_blob = f"{snippet_map.get(title, '')} {title}"
+                    m = CRED_RE.search(text_blob) or ALT_CRED_RE.search(text_blob)
+                    if m:
+                        it["credits"] = float(m.group(1))
+                # Modality fallback
+                if not it.get("modality"):
+                    mm = MODALITY_RE.search(snippet_map.get(title, ""))
+                    it["modality"] = mm.group(0).lower() if mm else "online"
+                # Validate here
+                credits = float(it.get("credits") or 0)
+                provider = (it.get("provider") or "").strip()
+                if credits <= 0 or not provider or not title:
+                    continue
+                cleaned.append(it)
+            except Exception:
+                logger.exception("drop item due to parse error")
                 continue
-            it["credits"] = credits
-            cleaned.append(it)
-        except Exception as e:
-            print(f"ingest: dropping item due to parse error: {e}")
-            continue
-
-    return cleaned
+        logger.info(
+            "AI extracted from Google candidates: %d valid of %d",
+            len(cleaned),
+            len(items),
+        )
+        return cleaned
+    except Exception:
+        logger.exception("AI extraction failed")
+        return []
 
 
 def _fallback_with_openai_web_search(count: int) -> List[dict]:
-    """Use OpenAI web_search tool to find additional CME items."""
     client = _openai_client()
-    prompt = (
-        "Find up-to-date CME opportunities in psychiatry that award AMA PRA Category 1 Credits. "
-        "Return STRICT JSON with top-level 'items' only, with fields: title, provider, credits (number), cost_usd (number|null), "
-        "modality ('online'|'live'), city (string|null), start_date (YYYY-MM-DD|null), end_date (YYYY-MM-DD|null), "
-        f"days_required (0|1|2|null), url, summary (string|null), source ('ai'). Limit to about {count} high-quality results."
-    )
-    resp = client.responses.create(
-        model="gpt-4o-mini",
-        tools=[{"type": "web_search"}],
-        input=prompt,
-        temperature=0,
-    )
+    try:
+        prompt = (
+            "Find up-to-date CME opportunities in psychiatry that award AMA PRA Category 1 Credits. "
+            "Return STRICT JSON with top-level 'items' only, with fields: title, provider, credits (number), "
+            "cost_usd (number|null), modality ('online'|'live'), city (string|null), start_date (YYYY-MM-DD|null), "
+            "end_date (YYYY-MM-DD|null), days_required (0|1|2|null), url, summary (string|null)."
+        )
+        resp = client.responses.create(
+            model="gpt-4o-mini", tools=[{"type": "web_search"}], input=prompt
+        )
+        text = getattr(resp, "output_text", "") or ""
+        data = safe_json_loads(text) or {}
+        items = data.get("items") or []
+        if not isinstance(items, list):
+            return []
+        out: List[dict] = []
+        for it in items:
+            try:
+                credits = float(it.get("credits") or 0)
+                if credits <= 0:
+                    continue
+                it["credits"] = credits
+                it.setdefault("source", "ai")
+                out.append(it)
+            except Exception:
+                logger.exception("drop ai-fallback item parse error")
+                continue
+        return out
+    except Exception:
+        logger.exception("AI web_search fallback failed")
+        return []
 
-    text = getattr(resp, "output_text", None)
-    if not text:
-        parts = []
-        for item in getattr(resp, "output", []) or []:
-            if item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text":
-                        parts.append(c.get("text", ""))
-        text = "\n".join(parts)
 
-    data = safe_json_loads(text or "")
-    items = (data or {}).get("items") or []
-    return items if isinstance(items, list) else []
+async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
+    """Ingest CME using Google CSE (primary) with AI extraction; deep-fetch pages when snippets lack credits.
+    Falls back to AI web_search only if still below threshold.
 
-
-def ingest_psychiatry_online_ai(
-    count: int = 10,
-) -> Tuple[int, bool, int, int, int, int, bool]:
+    Returns (ingested_count, used_fallback) by default, or a debug dict when debug=True.
     """
-    Primary: Use preference-aware multi-query Google CSE to gather candidates, then OpenAI to extract structured CME items.
-    Fallback: If fewer than `count` valid items inserted, use OpenAI web_search tool to supplement.
-
-    Returns (total_inserted, used_fallback, google_inserted, ai_inserted, candidates_count, extracted_count, google_ok).
-    """
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("Set OPENAI_API_KEY")
-
     total_added = 0
     used_fallback = False
-    google_added = 0
-    ai_added = 0
-    candidates_count = 0
-    extracted_count = 0
-    google_ok = False
 
-    # Load user for query shaping
-    with get_session() as s:
-        user = s.exec(select(User)).first()
+    # for counters
+    cse_raw = 0
+    first_pass_valid = 0
+    deepfetch_attempted = 0
+    deepfetch_valid = 0
 
-    # Phase 1: Google CSE candidates -> OpenAI extraction
+    try:
+        with get_session() as s:
+            user = s.exec(select(User)).first()
+    except Exception:
+        logger.exception("Failed to load user; proceeding with default queries")
+        user = None
+
+    # Google phase: candidates
     candidates: List[dict] = []
-    if os.getenv("GOOGLE_API_KEY") and os.getenv("GOOGLE_CSE_ID"):
-        queries = _build_queries_for_user(user)
-        try:
+    try:
+        if os.getenv("GOOGLE_API_KEY") and os.getenv("GOOGLE_CSE_ID"):
+            queries = _build_queries_for_user(user)
             for q in queries:
-                batch = fetch_google_cse_multi(q, total=20)
-                if batch:
-                    google_ok = True
-                    # Dedup by link across queries
-                    seen_links = {c.get("link") for c in candidates}
-                    for it in batch:
-                        if it.get("link") not in seen_links:
-                            candidates.append(it)
-            candidates_count = len(candidates)
-        except Exception as e:
-            logger.error("google ingestion failed: %s", _redact_key(str(e)))
-            candidates = []
-            candidates_count = 0
+                try:
+                    batch = fetch_google_cse_multi(q, total=count * 2)
+                    if batch:
+                        # dedup by link across batches
+                        seen = {c.get("link") for c in candidates}
+                        for it in batch:
+                            if it.get("link") not in seen:
+                                candidates.append(it)
+                except Exception:
+                    logger.exception("Google query failed: %s", _redact_key(q))
+            cse_raw = len(candidates)
+            logger.info("Google candidates: %d", cse_raw)
+        else:
+            logger.warning("Google CSE env not configured; skipping primary search")
+    except Exception:
+        logger.exception("Google phase failed")
 
-    if candidates:
-        items = _extract_with_openai_from_candidates(candidates, count)
-        extracted_count = len(items)
-        added = _insert_items(items)
-        google_added += added
-        total_added += added
+    # First extraction pass from candidates
+    items: List[dict] = []
+    try:
+        if candidates:
+            items = _extract_with_openai_from_candidates(candidates, count * 2)
+        else:
+            logger.warning("Google returned 0 candidates; will consider fallback")
+    except Exception:
+        logger.exception("First extraction pass failed")
+        items = []
 
-    # Phase 2: Fallback to OpenAI web_search if not enough
-    if total_added < count:
-        used_fallback = True
-        more = _fallback_with_openai_web_search(count - total_added)
-        ai_added2 = _insert_items(more)
-        ai_added += ai_added2
-        total_added += ai_added2
+    # If first pass produced nothing, seed prelims from raw candidates for deepfetch
+    if not items and candidates:
+        prelim: List[dict] = []
+        for c in candidates[:30]:  # cap
+            prelim.append(
+                {
+                    "title": c.get("title") or "",
+                    "url": c.get("link") or "",
+                    "provider": c.get("displayLink")
+                    or (urlparse(c.get("link") or "").netloc if c.get("link") else ""),
+                    "credits": 0,
+                }
+            )
+    else:
+        # Validate items and count first-pass valid
+        prelim = []
+        for it in items:
+            try:
+                if is_valid_record(it):
+                    first_pass_valid += 1
+                    prelim.append(it)
+                else:
+                    prelim.append(it)  # keep partial for deepfetch
+            except Exception:
+                continue
 
-    return (
+    # Deep fetch pass for partials
+    max_deepfetch = int(os.getenv("INGEST_MAX_DEEPFETCH", "20"))
+    deepfetch_budget = max_deepfetch
+    improved: List[dict] = []
+
+    # Pre-load set for dedupe check on insert
+    def key_of(r: dict) -> str:
+        return (
+            r.get("title", "").strip().lower()
+            + "|"
+            + (r.get("provider", "").strip().lower())
+        )
+
+    for it in prelim:
+        try:
+            # If valid already, consider for insert directly
+            if is_valid_record(it):
+                improved.append(it)
+                continue
+            if deepfetch_budget <= 0:
+                continue
+            url = it.get("url") or it.get("link")
+            if not url:
+                continue
+            deepfetch_budget -= 1
+            deepfetch_attempted += 1
+            html = fetch_page(url)
+            if not html:
+                continue
+            text = html_to_text(html)
+            if not text:
+                continue
+            r2 = await ai_extract_from_text(text, url=url)
+            if r2 and is_valid_record(r2):
+                deepfetch_valid += 1
+                improved.append(r2)
+            else:
+                improved.append(it)
+        except Exception:
+            logger.exception(
+                "deepfetch failed for %s",
+                _redact_key(str(it.get("url") or it.get("link") or "")),
+            )
+            continue
+
+    # Insert valid, dedupe by (title, provider)
+    seen_pairs = set()
+    to_insert: List[dict] = []
+    for r in improved:
+        if not is_valid_record(r):
+            continue
+        key = key_of(r)
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        to_insert.append(r)
+
+    added_from_google = _insert_items(to_insert)
+    total_added += added_from_google
+    logger.info(
+        "ingest counters: cse_raw=%d first_pass_valid=%d deepfetch_attempted=%d deepfetch_valid=%d inserted=%d",
+        cse_raw,
+        first_pass_valid,
+        deepfetch_attempted,
+        deepfetch_valid,
         total_added,
-        used_fallback,
-        google_added,
-        ai_added,
-        candidates_count,
-        extracted_count,
-        google_ok,
     )
 
+    # Fallback if still below target
+    min_results = int(os.getenv("INGEST_MIN_RESULTS", str(count)))
+    if total_added < min_results:
+        used_fallback = True
+        logger.info("Fallback triggered: OpenAI web_search")
+        try:
+            more = _fallback_with_openai_web_search(min_results - total_added)
+            total_added += _insert_items(more)
+        except Exception:
+            logger.exception("Fallback phase failed")
 
-# NOTE: Bing Web Search API was retired for new keys (Aug 2025). Legacy code removed.
+    if debug:
+        return {
+            "cse_raw": cse_raw,
+            "first_pass_valid": first_pass_valid,
+            "deepfetch_attempted": deepfetch_attempted,
+            "deepfetch_valid": deepfetch_valid,
+            "inserted": total_added,
+            "fallback_used": used_fallback,
+        }
+
+    return total_added, used_fallback
