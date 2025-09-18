@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>Activity Log</h1>
+
+  {% if not user %}
+    <p>No user found. <a href="/">Go home</a></p>
+  {% else %}
+    <section class="card">
+      <div class="stats">
+        <div class="badge">Remaining: {{ '%.1f' % user.remaining_credits }} credits</div>
+        <div>Budget: ${{ '%.0f' % user.budget_usd }} | Days off: {{ user.days_off }}</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <ul>
+        {% for c in claims or [] %}
+          <li>{{ c.date }} — {{ '%.1f' % c.credits }} cr — {{ c.topic or 'general' }} — {{ c.source_text }}</li>
+        {% else %}
+          <li>No activity yet.</li>
+        {% endfor %}
+      </ul>
+    </section>
+    <p><a href="/" class="button">Back to Plan</a></p>
+  {% endif %}
+{% endblock %}

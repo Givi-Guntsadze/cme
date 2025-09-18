@@ -1,0 +1,7 @@
+{% for m in messages %}
+  <div class="row {{ 'right' if m.role == 'user' else 'left' }}">
+    <div class="bubble {{ m.role }}">
+      {{ m.content | e }}
+    </div>
+  </div>
+{% endfor %}

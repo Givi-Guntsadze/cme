@@ -1,0 +1,15 @@
+{
+  "board": "ABPN",
+  "specialty": "Psychiatry",
+  "version": "2025-09-01",
+  "sources": [
+    "https://abpn.org/continuing-certification/"
+  ],
+  "rules": {
+    "cycle_years": 3,
+    "total_credits": 90,
+    "annual_minimum": 30,
+    "safety_or_ethics_min": 2,
+    "audit_evidence_notes": "Retain certificates and transcripts in case of audit."
+  }
+}

@@ -1,29 +1,9 @@
 {% extends "base.html" %}
 {% block content %}
+  {% set current_mode = (plan_mode | default(request.query_params.get('plan_mode', 'variety')))|lower %}
   <h1>CME/MOC Planner (ABPN POC)</h1>
 
-  {% if chat_only %}
-    <section class="card">
-      <h2>Chat</h2>
-      {% if assistant_messages %}
-        <ul>
-          {% for m in assistant_messages %}
-            <li style="white-space:pre-wrap;">
-              <span class="badge" style="margin-right:6px; background:#eee;">{{ m.role or 'assistant' }}</span>
-              {{ m.content }}
-            </li>
-          {% endfor %}
-        </ul>
-      {% else %}
-        <p>No messages yet.</p>
-      {% endif %}
-      <form method="post" action="/chat/send" style="margin-top:8px;display:flex;gap:8px;">
-        <input name="text" placeholder="Ask about your plan or set preferences..." style="flex:1" required />
-        <button type="submit">Send</button>
-      </form>
-      <div style="margin-top:8px;"><a href="/">Back to Plan</a></div>
-    </section>
-  {% elif not user %}
+  {% if not user %}
     <section class="card">
       <h2>Setup</h2>
       <form method="post" action="/setup">
@@ -51,29 +31,46 @@
       </div>
     </section>
 
+    {% if policy_status and policy_status|length > 0 %}
+      <div class="policy-banner">
+        <span>Policy active:</span>
+        {% for p in policy_status %}
+          <span class="badge policy">
+            {{ p.mode|capitalize }}{% if p.hours_left is not none %} (expires in {{ p.hours_left }}h){% endif %}
+          </span>
+        {% endfor %}
+        <form hx-post="/policy/clear" hx-target="#chat-window" hx-swap="beforeend" hx-on::after-request="const el=document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }" style="display:inline; margin-left:8px;">
+          <button type="submit" class="linklike">Clear</button>
+        </form>
+      </div>
+    {% endif %}
+
     <section class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
         <h2 style="margin:0;">Assistant</h2>
-        <div style="display:flex;gap:8px;align-items:center;">
-          <a href="/chat" class="button">Open Chat</a>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
           <a href="/preferences" class="button">Edit Preferences</a>
-          <form method="post" action="/assist">
-            <button type="submit">Explain and ask preferences</button>
-          </form>
         </div>
       </div>
-      {% if assistant_messages %}
-        <ul>
-          {% for m in assistant_messages %}
-            <li style="white-space:pre-wrap;">{{ m.content }}</li>
-          {% endfor %}
-        </ul>
-      {% else %}
-        <p>No assistant messages yet.</p>
-      {% endif %}
-      <form method="post" action="/assist/command" style="margin-top:8px;display:flex;gap:8px;">
-        <input name="command" placeholder="e.g., Avoid subscriptions; diversify providers; focus on ethics" style="flex:1" required />
-        <button type="submit">Apply command</button>
+      <div
+        id="chat-window"
+        class="chat-window"
+        hx-get="/chat"
+        hx-trigger="load"
+        hx-swap="innerHTML"
+        hx-on::after-settle="this.scrollTop = this.scrollHeight"
+      >
+        <!-- Chat messages load here -->
+      </div>
+      <form
+        class="chat-input"
+        hx-post="/chat/send"
+        hx-target="#chat-window"
+        hx-swap="beforeend"
+        hx-on::after-request="this.reset(); const el = document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }"
+      >
+        <input name="text" placeholder="Ask about this plan, request changes, or say 'explain why'…" required />
+        <button type="submit">Send</button>
       </form>
     </section>
 
@@ -93,10 +90,23 @@
     <section class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
         <h2 style="margin:0;">Recommended Plan</h2>
-        <form id="ingestForm" method="post" action="/ingest">
-          <button type="submit">Discover</button>
-        </form>
+        <button
+          hx-post="/ingest"
+          hx-swap="none"
+          hx-on::after-request="window.location.reload()"
+          class="button"
+          type="button"
+        >Discover</button>
       </div>
+      <div class="tabs">
+        <a href="/?plan_mode=cheapest" class="btn{% if current_mode == 'cheapest' %} active{% endif %}">Cheapest</a>
+        <a href="/?plan_mode=variety" class="btn{% if current_mode == 'variety' %} active{% endif %}">Variety</a>
+      </div>
+      {% if current_mode == 'cheapest' %}
+        <p class="meta" style="margin-top:-4px;">Optimized for lowest cost per credit; may choose a single subscription.</p>
+      {% elif current_mode == 'variety' %}
+        <p class="meta" style="margin-top:-4px;">Optimized for balanced mix; avoids letting one item dominate.</p>
+      {% endif %}
       {% if plan and plan|length > 0 %}
         <ul class="plan">
           {% for p in plan %}
@@ -112,6 +122,13 @@
                 {{ p.provider }} • {{ p.modality }}{% if p.city %} • {{ p.city }}{% endif %}
                 {% if p.source %}
                   <span class="badge" style="margin-left:8px; background:#eef;">{{ p.source|capitalize }}</span>
+                {% endif %}
+                {% if p.eligibility_status == 'eligible' %}
+                  <span class="badge eligibility ok" title="{{ p.eligibility_text or 'Eligible for you' }}">✅ Eligible</span>
+                {% elif p.eligibility_status == 'uncertain' %}
+                  <span class="badge eligibility warn" title="{{ p.eligibility_text or 'Eligibility needs manual check' }}">⚠️ Check eligibility</span>
+                {% elif p.eligibility_status == 'ineligible' %}
+                  <span class="badge eligibility no" title="{{ p.eligibility_text or 'Not eligible based on current info' }}">❌ Not eligible</span>
                 {% endif %}
               </div>
               <div class="meta">{{ '%.1f' % p.credits }} cr • ${{ '%.0f' % p.cost }}</div>
@@ -130,13 +147,26 @@
       {% endif %}
     </section>
 
-    <section class="card">
-      <h2>Log a quick update</h2>
-      <form method="post" action="/message">
-        <input name="text" placeholder="e.g., Got 1 credit on Doximity for ethics" required />
-        <button type="submit">Add</button>
-      </form>
-    </section>
+    {% if validation %}
+      <section class="card">
+        <h2>Requirements ({{ validation.meta.board }} — {{ validation.meta.specialty }})</h2>
+        <div class="meta">Version: {{ validation.meta.version }}</div>
+        <div class="meta">Totals: {{ '%.1f' % validation.summary.earned_total }} / {{ validation.summary.target_total }} (remaining {{ '%.1f' % validation.summary.remaining_total }})</div>
+        <ul class="checks">
+          {% for chk in validation.checks %}
+            <li>
+              {% if chk.status == 'ok' %}✅{% elif chk.status == 'warn' %}⚠️{% else %}❌{% endif %}
+              <strong>{{ chk.label }}</strong> — {{ chk.detail }}
+            </li>
+          {% endfor %}
+        </ul>
+        <div class="meta">Sources:
+          {% for s in validation.meta.sources %}
+            <a href="{{ s }}" target="_blank" rel="noopener">{{ s }}</a>{% if not loop.last %}, {% endif %}
+          {% endfor %}
+        </div>
+      </section>
+    {% endif %}
 
     <section class="card">
       <h2>Activity Log</h2>

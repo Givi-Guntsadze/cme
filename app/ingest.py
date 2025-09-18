@@ -205,6 +205,70 @@ COST_RE = re.compile(r"\$(\d{1,4}(?:\.\d{2})?)")
 MODALITY_RE = re.compile(r"\bonline|virtual|on-demand|webinar|live\b", re.I)
 
 
+def _split_list(text: str) -> List[str]:
+    parts = []
+    working = text.replace(" and ", ",")
+    for chunk in working.split(","):
+        item = chunk.strip(" .")
+        if item:
+            parts.append(item)
+    return parts
+
+
+def _parse_eligibility(snippet: Optional[str]) -> Dict[str, Any]:
+    base_text = (snippet or "").strip()
+    result: Dict[str, Any] = {
+        "eligibility_text": base_text or None,
+        "eligible_institutions": [],
+        "eligible_groups": [],
+        "membership_required": None,
+        "open_to_public": True,
+    }
+    if not base_text:
+        return result
+
+    lowered = base_text.lower()
+
+    m = re.search(r"open to ([^.;]+?) at ([^.;]+)", base_text, flags=re.I)
+    if m:
+        groups_raw = m.group(1)
+        inst_raw = m.group(2)
+        groups = _split_list(groups_raw)
+        institutions = _split_list(inst_raw)
+        if groups:
+            result["eligible_groups"] = groups
+        if institutions:
+            result["eligible_institutions"] = institutions
+
+    membership_match = re.search(
+        r"([A-Za-z0-9&\- ]+?)\s+members? only", base_text, flags=re.I
+    )
+    if membership_match:
+        membership = membership_match.group(1).strip(" .")
+        if membership:
+            result["membership_required"] = membership
+
+    if any(
+        phrase in lowered
+        for phrase in (
+            "open registration",
+            "public welcome",
+            "open to the public",
+            "general public",
+        )
+    ):
+        result["open_to_public"] = True
+
+    if (
+        result["eligible_institutions"]
+        or result["eligible_groups"]
+        or result["membership_required"]
+    ):
+        result["open_to_public"] = False
+
+    return result
+
+
 def _build_queries_for_user(user: Optional[User]) -> List[str]:
     base = "psychiatry CME AMA PRA Category 1 credit"
     city = user.city if user and user.city else None
@@ -264,6 +328,44 @@ def _insert_items(items: List[dict]) -> int:
                 if exists:
                     continue
 
+                def _coerce_list(value) -> List[str]:
+                    if not value:
+                        return []
+                    if isinstance(value, list):
+                        return [str(v).strip() for v in value if str(v).strip()]
+                    if isinstance(value, str):
+                        v = value.strip()
+                        return [v] if v else []
+                    return []
+
+                raw_eligibility = (
+                    it.get("eligibility_text")
+                    or it.get("snippet")
+                    or it.get("summary")
+                    or ""
+                )
+                eligibility_data = _parse_eligibility(raw_eligibility)
+
+                incoming_institutions = _coerce_list(it.get("eligible_institutions"))
+                if incoming_institutions:
+                    eligibility_data["eligible_institutions"] = incoming_institutions
+                    eligibility_data["open_to_public"] = False
+
+                incoming_groups = _coerce_list(it.get("eligible_groups"))
+                if incoming_groups:
+                    eligibility_data["eligible_groups"] = incoming_groups
+                    eligibility_data["open_to_public"] = False
+
+                membership_req = it.get("membership_required")
+                if membership_req:
+                    eligibility_data["membership_required"] = str(
+                        membership_req
+                    ).strip()
+                    eligibility_data["open_to_public"] = False
+
+                if it.get("open_to_public") is not None:
+                    eligibility_data["open_to_public"] = bool(it.get("open_to_public"))
+
                 a = Activity(
                     title=title[:200],
                     provider=provider[:120],
@@ -281,6 +383,11 @@ def _insert_items(items: List[dict]) -> int:
                     url=url,
                     summary=summary,
                     source=(it.get("source") or "web"),
+                    eligibility_text=eligibility_data["eligibility_text"],
+                    eligible_institutions=eligibility_data["eligible_institutions"],
+                    eligible_groups=eligibility_data["eligible_groups"],
+                    membership_required=eligibility_data["membership_required"],
+                    open_to_public=eligibility_data["open_to_public"],
                 )
                 s.add(a)
                 added += 1
@@ -358,6 +465,10 @@ def _extract_with_openai_from_candidates(
                 if not it.get("modality"):
                     mm = MODALITY_RE.search(snippet_map.get(title, ""))
                     it["modality"] = mm.group(0).lower() if mm else "online"
+                if "eligibility_text" not in it or not it.get("eligibility_text"):
+                    it["eligibility_text"] = snippet_map.get(title, "")
+                if "snippet" not in it or not it.get("snippet"):
+                    it["snippet"] = snippet_map.get(title, "")
                 # Validate here
                 credits = float(it.get("credits") or 0)
                 provider = (it.get("provider") or "").strip()
@@ -480,6 +591,8 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
                     "provider": c.get("displayLink")
                     or (urlparse(c.get("link") or "").netloc if c.get("link") else ""),
                     "credits": 0,
+                    "eligibility_text": c.get("snippet") or "",
+                    "snippet": c.get("snippet") or "",
                 }
             )
     else:
@@ -529,6 +642,12 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
                 continue
             r2 = await ai_extract_from_text(text, url=url)
             if r2 and is_valid_record(r2):
+                if not r2.get("eligibility_text"):
+                    r2["eligibility_text"] = it.get("eligibility_text") or it.get(
+                        "snippet", ""
+                    )
+                if not r2.get("snippet"):
+                    r2["snippet"] = it.get("snippet") or ""
                 deepfetch_valid += 1
                 improved.append(r2)
             else:
