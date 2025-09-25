@@ -1,6 +1,8 @@
 # CME/MOC POC (ABPN Psychiatry)
 
 ## Overview
+For the most current context and AI session notes, see `AIGROUNDING.md`.
+
 Proof-of-concept tool for psychiatrists to plan and track CME/MOC requirements:
 - Input: target credits, budget, days off, modality (online/live).
 - Output: optimized plan from a seeded catalog of CME activities.

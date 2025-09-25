@@ -15,6 +15,18 @@
         <label>Name <input name="name" value="Doctor"></label>
         <label>Specialty <input name="specialty" value="Psychiatry"></label>
         <label>City <input name="city" placeholder="(optional)"></label>
+        <label>Residency completion year <input name="residency_completion_year" type="number" min="1980" max="2100" placeholder="e.g., 2021"></label>
+        <label>Professional stage
+          <select name="professional_stage">
+            <option value="" selected>Select…</option>
+            <option value="early_career">Early career (&lt;4 years post-residency)</option>
+            <option value="standard">Established practitioner</option>
+            <option value="resident">Resident / Fellow</option>
+          </select>
+        </label>
+        <label>Memberships (comma separated)
+          <input name="memberships" placeholder="American Psychiatric Association, State Society">
+        </label>
         <button type="submit">Save setup</button>
       </form>
     </section>
@@ -23,6 +35,9 @@
       <div class="badge">Remaining: {{ '%.1f' % user.remaining_credits }} credits</div>
       <div>
         Budget: ${{ '%.0f' % user.budget_usd }} | Days off: {{ user.days_off }} | Live OK: {{ 'Yes' if user.allow_live else 'No' }} | Prefer live: {{ 'Yes' if user.prefer_live else 'No' }}
+        {% if user.professional_stage %} | Stage: {{ user.professional_stage.replace('_', ' ')|title }}{% endif %}
+        {% if user.residency_completion_year %} | Residency: {{ user.residency_completion_year }}{% endif %}
+        {% if user.memberships %} | Memberships: {{ (user.memberships or [])|join(', ') }}{% endif %}
         {% if is_dev %}
           <span style="margin-left:8px;">
             <a href="/ingest?debug=1" target="_blank">debug ingest</a>
@@ -79,73 +94,19 @@
     {% set acount = request.query_params.get('acount') %}
     {% set fallback = request.query_params.get('fallback') %}
     {% set error = request.query_params.get('error') %}
-    {% if added %}
-      <div class="card" style="background:#f0fff4;border-left:4px solid #34d399;padding:8px 12px;margin:8px 0;">
-        Imported {{ added }} new activities{% if gcount or acount %} — Google: {{ gcount or 0 }}, AI: {{ acount or 0 }}{% endif %}{% if fallback == '1' %} (fallback used){% endif %}.
-      </div>
-    {% elif error %}
-      <div class="card" style="background:#fff7f7;border-left:4px solid #f87171;padding:8px 12px;margin:8px 0;">{{ error }}</div>
-    {% endif %}
+    <div id="ingest-banner">
+      {% if added %}
+        <div class="card" style="background:#f0fff4;border-left:4px solid #34d399;padding:8px 12px;margin:8px 0;">
+          Imported {{ added }} new activities{% if gcount or acount %} — Web: {{ gcount or 0 }}, AI: {{ acount or 0 }}{% endif %}{% if fallback == '1' %} (fallback used){% endif %}.
+        </div>
+      {% elif error %}
+        <div class="card" style="background:#fff7f7;border-left:4px solid #f87171;padding:8px 12px;margin:8px 0;">{{ error }}</div>
+      {% endif %}
+    </div>
 
-    <section class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
-        <h2 style="margin:0;">Recommended Plan</h2>
-        <button
-          hx-post="/ingest"
-          hx-swap="none"
-          hx-on::after-request="window.location.reload()"
-          class="button"
-          type="button"
-        >Discover</button>
-      </div>
-      <div class="tabs">
-        <a href="/?plan_mode=cheapest" class="btn{% if current_mode == 'cheapest' %} active{% endif %}">Cheapest</a>
-        <a href="/?plan_mode=variety" class="btn{% if current_mode == 'variety' %} active{% endif %}">Variety</a>
-      </div>
-      {% if current_mode == 'cheapest' %}
-        <p class="meta" style="margin-top:-4px;">Optimized for lowest cost per credit; may choose a single subscription.</p>
-      {% elif current_mode == 'variety' %}
-        <p class="meta" style="margin-top:-4px;">Optimized for balanced mix; avoids letting one item dominate.</p>
-      {% endif %}
-      {% if plan and plan|length > 0 %}
-        <ul class="plan">
-          {% for p in plan %}
-            <li>
-              <div class="title">
-                {% if p.url %}
-                  <a href="{{ p.url }}" target="_blank" rel="noopener noreferrer">{{ p.title }}</a>
-                {% else %}
-                  {{ p.title }}
-                {% endif %}
-              </div>
-              <div class="meta">
-                {{ p.provider }} • {{ p.modality }}{% if p.city %} • {{ p.city }}{% endif %}
-                {% if p.source %}
-                  <span class="badge" style="margin-left:8px; background:#eef;">{{ p.source|capitalize }}</span>
-                {% endif %}
-                {% if p.eligibility_status == 'eligible' %}
-                  <span class="badge eligibility ok" title="{{ p.eligibility_text or 'Eligible for you' }}">✅ Eligible</span>
-                {% elif p.eligibility_status == 'uncertain' %}
-                  <span class="badge eligibility warn" title="{{ p.eligibility_text or 'Eligibility needs manual check' }}">⚠️ Check eligibility</span>
-                {% elif p.eligibility_status == 'ineligible' %}
-                  <span class="badge eligibility no" title="{{ p.eligibility_text or 'Not eligible based on current info' }}">❌ Not eligible</span>
-                {% endif %}
-              </div>
-              <div class="meta">{{ '%.1f' % p.credits }} cr • ${{ '%.0f' % p.cost }}</div>
-              {% if p.summary %}
-                <div class="meta">{{ p.summary }}</div>
-              {% endif %}
-              <form method="post" action="/plan/remove" style="margin-top:6px;">
-                <input type="hidden" name="title" value="{{ p.title }}" />
-                <button type="submit" class="linklike" title="Remove this from plan">Remove</button>
-              </form>
-            </li>
-          {% endfor %}
-        </ul>
-      {% else %}
-        <p>No plan yet or all requirements met.</p>
-      {% endif %}
-    </section>
+    <div id="plan-card" data-plan-mode="{{ current_mode }}">
+      {% include '_plan.html' %}
+    </div>
 
     {% if validation %}
       <section class="card">
@@ -177,35 +138,5 @@
       </ul>
     </section>
 
-    <script>
-      document.addEventListener('DOMContentLoaded', () => {
-        const form = document.getElementById('ingestForm');
-        if (!form) return;
-        form.addEventListener('submit', async (e) => {
-          e.preventDefault();
-          const btn = form.querySelector('button[type="submit"]');
-          const original = btn ? btn.textContent : null;
-          if (btn) { btn.disabled = true; btn.textContent = 'Discovering...'; }
-          try {
-            const resp = await fetch('/ingest', { method: 'POST' });
-            let data = {};
-            try { data = await resp.json(); } catch {}
-            if (resp.ok && typeof data.ingested !== 'undefined') {
-              const fb = data.used_fallback ? '1' : '0';
-              const added = encodeURIComponent(data.ingested || 0);
-              const gcount = encodeURIComponent(data.google_inserted || 0);
-              const acount = encodeURIComponent(data.ai_inserted || 0);
-              window.location.href = `/?added=${added}&fallback=${fb}&gcount=${gcount}&acount=${acount}`;
-              return;
-            }
-            window.location.href = '/?error=ingest_failed';
-          } catch (err) {
-            window.location.href = '/?error=ingest_failed';
-          } finally {
-            if (btn) { btn.disabled = false; if (original) btn.textContent = original; }
-          }
-        });
-      });
-    </script>
   {% endif %}
 {% endblock %}

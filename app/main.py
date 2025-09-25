@@ -7,14 +7,15 @@ import asyncio
 from textwrap import dedent
 from types import SimpleNamespace
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request, Form, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import select
 from datetime import date, datetime, timedelta
 
-from .db import create_db_and_tables, get_session, purge_seed_activities
+from .db import create_db_and_tables, get_session
+from .seed import seed_activities
 from .models import (
     User,
     Claim,
@@ -23,7 +24,12 @@ from .models import (
     Activity,
     CompletedActivity,
 )
-from .planner import build_plan, build_plan_with_policy, is_eligible
+from .planner import (
+    build_plan,
+    build_plan_with_policy,
+    is_eligible,
+    pricing_context_for_user,
+)
 from .requirements import (
     load_abpn_psychiatry_requirements,
     validate_against_requirements,
@@ -38,9 +44,10 @@ async def lifespan(app: FastAPI):
     # Startup
     create_db_and_tables()
     try:
-        purge_seed_activities()
+        with get_session() as session:
+            seed_activities(session)
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("failed to seed catalog")
     yield
     # Shutdown: nothing for now
 
@@ -77,6 +84,162 @@ def _safe_json(obj_text: str):
         return None
 
 
+def _normalize_stage(value: object | None) -> str | None:
+    if value is None:
+        return None
+    stage = str(value).strip().lower()
+    if not stage:
+        return None
+    aliases = {
+        "early career": "early_career",
+        "early-career": "early_career",
+        "early_career": "early_career",
+        "early": "early_career",
+        "established": "standard",
+        "attending": "standard",
+        "standard": "standard",
+        "full": "standard",
+        "resident": "resident",
+        "fellow": "resident",
+        "trainee": "resident",
+    }
+    return aliases.get(stage, stage.replace(" ", "_"))
+
+
+def _source_label(source: str | None) -> str:
+    if not source:
+        return "Curated"
+    text = str(source).strip().lower()
+    mapping = {
+        "seed": "Curated",
+        "web": "Web",
+        "ai": "AI",
+    }
+    return mapping.get(text, text.replace("_", " ").title() or "Curated")
+
+
+def _build_plan_payload(user: User, session, plan_mode: str):
+    chosen, total_credits, total_cost, days_used = build_plan(
+        user, session, mode=plan_mode
+    )
+    policy_data = _load_existing_policy(session, user)
+    active_policy = _policy_for_mode(policy_data, plan_mode)
+    if active_policy:
+        chosen, total_credits, total_cost, days_used = build_plan_with_policy(
+            user, session, active_policy, mode=plan_mode
+        )
+
+    plan: list[dict[str, object]] = []
+    for a in chosen:
+        pricing = getattr(a, "_pricing_context", None) or pricing_context_for_user(
+            user, a
+        )
+        cost_value = pricing.get("cost", a.cost_usd)
+        base_cost = pricing.get("base_cost", a.cost_usd)
+        deadline_obj = pricing.get("deadline")
+        deadline_text = None
+        deadline_urgency = None
+        if isinstance(deadline_obj, date):
+            deadline_text = deadline_obj.strftime("%b %d, %Y")
+            days_left = pricing.get("deadline_days")
+            if isinstance(days_left, int) and days_left >= 0:
+                if days_left == 0:
+                    deadline_urgency = "today"
+                elif days_left == 1:
+                    deadline_urgency = "tomorrow"
+                elif days_left <= 14:
+                    deadline_urgency = f"in {days_left} days"
+        if cost_value is None:
+            cost_display = "TBD"
+        else:
+            cost_display = f"${cost_value:,.0f}"
+        pricing_notes = pricing.get("notes") or ""
+        if pricing_notes:
+            pricing_notes = pricing_notes[:180]
+        eligible = is_eligible(user, a)
+        structured_restrictions = bool(
+            (a.eligible_institutions and len(a.eligible_institutions or []))
+            or (a.eligible_groups and len(a.eligible_groups or []))
+            or a.membership_required
+            or not getattr(a, "open_to_public", True)
+        )
+        missing_profile_data = False
+        if a.eligible_institutions and not (getattr(user, "affiliations", []) or []):
+            missing_profile_data = True
+        if a.eligible_groups and not getattr(user, "training_level", None):
+            missing_profile_data = True
+        if a.membership_required and not (getattr(user, "memberships", []) or []):
+            missing_profile_data = True
+        if not eligible:
+            status = "ineligible"
+        elif missing_profile_data or (
+            a.eligibility_text and not structured_restrictions
+        ):
+            status = "uncertain"
+        else:
+            status = "eligible"
+
+        plan.append(
+            {
+                "title": a.title,
+                "provider": a.provider,
+                "credits": a.credits,
+                "cost": cost_value,
+                "cost_display": cost_display,
+                "price_label": pricing.get("label"),
+                "base_cost": base_cost,
+                "deadline_text": deadline_text,
+                "deadline_urgency": deadline_urgency,
+                "pricing_notes": pricing_notes,
+                "modality": a.modality,
+                "city": a.city,
+                "url": a.url,
+                "summary": a.summary,
+                "source": a.source,
+                "source_label": _source_label(getattr(a, "source", None)),
+                "hybrid_available": pricing.get("hybrid_available")
+                or getattr(a, "hybrid_available", False),
+                "topic": getattr(a, "_topic_tag", None),
+                "eligibility_status": status,
+                "eligibility_text": a.eligibility_text,
+            }
+        )
+
+    plan_summary = None
+    if plan:
+        plan_summary = {
+            "item_count": len(plan),
+            "total_credits": total_credits,
+            "total_cost": total_cost,
+            "cost_display": (
+                f"${total_cost:,.2f}" if total_cost is not None else "TBD"
+            ),
+            "days_used": days_used,
+        }
+
+    return plan, plan_summary
+
+
+def _parse_membership_input(raw: object | None) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        items = []
+        for item in raw:
+            text = str(item).strip()
+            if text:
+                items.append(text)
+        return items
+    text = str(raw)
+    chunks = re.split(r"[,;/\n]+", text)
+    members: list[str] = []
+    for chunk in chunks:
+        cleaned = chunk.strip()
+        if cleaned:
+            members.append(cleaned)
+    return members
+
+
 def _apply_patch_to_user(patch: dict, session, user: User) -> list[str]:
     """
     Apply allowed fields to User.
@@ -93,6 +256,8 @@ def _apply_patch_to_user(patch: dict, session, user: User) -> list[str]:
         "city": str,
         "specialty": str,
         "target_credits": float,
+        "professional_stage": str,
+        "residency_completion_year": int,
     }
 
     for key, caster in allowed.items():
@@ -109,8 +274,20 @@ def _apply_patch_to_user(patch: dict, session, user: User) -> list[str]:
             continue
 
         if getattr(user, key, None) != value:
+            if key == "professional_stage":
+                normalized = _normalize_stage(value)
+                if normalized != getattr(user, key, None):
+                    setattr(user, key, normalized)
+                    changed.append("professional_stage")
+                continue
             setattr(user, key, value)
             changed.append(key)
+
+    if "memberships" in patch:
+        parsed_memberships = _parse_membership_input(patch.get("memberships"))
+        if parsed_memberships != (user.memberships or []):
+            user.memberships = parsed_memberships
+            changed.append("memberships")
 
     if changed:
         session.add(user)
@@ -248,17 +425,29 @@ def _state_snapshot(session, user: User) -> dict[str, object]:
     session.add(user)
 
     chosen, _, _, _ = build_plan(user, session, mode="variety")
-    top = [
-        {
-            "title": a.title,
-            "provider": a.provider,
-            "credits": a.credits,
-            "cost": a.cost_usd,
-            "modality": a.modality,
-            "city": a.city,
-        }
-        for a in chosen[:6]
-    ]
+    top = []
+    for a in chosen[:6]:
+        pricing = getattr(a, "_pricing_context", None) or pricing_context_for_user(
+            user, a
+        )
+        deadline_obj = pricing.get("deadline")
+        deadline_str = (
+            deadline_obj.isoformat() if isinstance(deadline_obj, date) else None
+        )
+        top.append(
+            {
+                "title": a.title,
+                "provider": a.provider,
+                "credits": a.credits,
+                "cost": pricing.get("cost", a.cost_usd),
+                "base_cost": pricing.get("base_cost", a.cost_usd),
+                "price_label": pricing.get("label"),
+                "deadline": deadline_str,
+                "modality": a.modality,
+                "city": a.city,
+                "hybrid_available": pricing.get("hybrid_available"),
+            }
+        )
 
     snapshot_user = {
         "budget_usd": user.budget_usd,
@@ -270,6 +459,8 @@ def _state_snapshot(session, user: User) -> dict[str, object]:
         "affiliations": list(getattr(user, "affiliations", []) or []),
         "memberships": list(getattr(user, "memberships", []) or []),
         "training_level": getattr(user, "training_level", None),
+        "professional_stage": getattr(user, "professional_stage", None),
+        "residency_completion_year": getattr(user, "residency_completion_year", None),
     }
     req_data = load_abpn_psychiatry_requirements()
     claims = list(session.exec(select(Claim).where(Claim.user_id == user.id)))
@@ -359,6 +550,29 @@ def _apply_patch_if_present(
         if new_val is not None and new_val != user.target_credits:
             user.target_credits = new_val
             applied.append(f"target_credits {new_val}")
+
+    if "professional_stage" in patch_data:
+        normalized = _normalize_stage(patch_data.get("professional_stage"))
+        if normalized != getattr(user, "professional_stage", None):
+            user.professional_stage = normalized
+            applied.append(f"professional_stage {normalized or 'cleared'}")
+
+    if "residency_completion_year" in patch_data:
+        new_year = _maybe_int(patch_data.get("residency_completion_year"))
+        if new_year != getattr(user, "residency_completion_year", None):
+            user.residency_completion_year = new_year
+            applied.append(
+                "residency_completion_year "
+                + (str(new_year) if new_year else "cleared")
+            )
+
+    if "memberships" in patch_data:
+        parsed = _parse_membership_input(patch_data.get("memberships"))
+        if parsed != (getattr(user, "memberships", []) or []):
+            user.memberships = parsed
+            applied.append(
+                "memberships " + (", ".join(parsed) if parsed else "cleared")
+            )
 
     if not applied:
         return []
@@ -615,7 +829,10 @@ def _derive_controls(
             "allow_live"?: boolean,
             "city"?: string | null,
             "specialty"?: string,
-            "target_credits"?: number
+            "target_credits"?: number,
+            "professional_stage"?: string | null,
+            "residency_completion_year"?: integer | null,
+            "memberships"?: array<string> | string | null
           },
           "policy": null | {
             "default"?: OBJECT,
@@ -696,6 +913,7 @@ def home(request: Request):
                     "claims": [],
                     "assistant_messages": [],
                     "plan_mode": plan_mode,
+                    "active_policy": None,
                     "policy_status": [],
                     "validation": None,
                     "is_dev": bool(
@@ -738,57 +956,9 @@ def home(request: Request):
                 }
             )
 
-        chosen, _, _, _ = build_plan(user, session, mode=plan_mode)
-        if active_policy:
-            chosen, _, _, _ = build_plan_with_policy(
-                user, session, active_policy, mode=plan_mode
-            )
-
+        plan, plan_summary = _build_plan_payload(user, session, plan_mode)
         requirements_data = load_abpn_psychiatry_requirements()
         validation = validate_against_requirements(user, claims, requirements_data)
-
-        plan = []
-        for a in chosen:
-            eligible = is_eligible(user, a)
-            structured_restrictions = bool(
-                (a.eligible_institutions and len(a.eligible_institutions or []))
-                or (a.eligible_groups and len(a.eligible_groups or []))
-                or a.membership_required
-                or not getattr(a, "open_to_public", True)
-            )
-            missing_profile_data = False
-            if a.eligible_institutions and not (
-                getattr(user, "affiliations", []) or []
-            ):
-                missing_profile_data = True
-            if a.eligible_groups and not getattr(user, "training_level", None):
-                missing_profile_data = True
-            if a.membership_required and not (getattr(user, "memberships", []) or []):
-                missing_profile_data = True
-            if not eligible:
-                status = "ineligible"
-            elif missing_profile_data or (
-                a.eligibility_text and not structured_restrictions
-            ):
-                status = "uncertain"
-            else:
-                status = "eligible"
-
-            plan.append(
-                {
-                    "title": a.title,
-                    "provider": a.provider,
-                    "credits": a.credits,
-                    "cost": a.cost_usd,
-                    "modality": a.modality,
-                    "city": a.city,
-                    "url": a.url,
-                    "summary": a.summary,
-                    "source": a.source,
-                    "eligibility_status": status,
-                    "eligibility_text": a.eligibility_text,
-                }
-            )
         claims = list(session.exec(select(Claim).where(Claim.user_id == user.id)))
         return templates.TemplateResponse(
             "index.html",
@@ -796,15 +966,40 @@ def home(request: Request):
                 "request": request,
                 "user": user,
                 "plan": plan,
+                "plan_summary": plan_summary,
                 "claims": claims,
                 "assistant_messages": msgs,
                 "plan_mode": plan_mode,
                 "validation": validation,
+                "active_policy": active_policy,
                 "policy_status": policy_status_entries,
                 "is_dev": bool(
                     os.getenv("ENV") in ("dev", "development")
                     or str(os.getenv("DEBUG")) in ("1", "true", "True")
                 ),
+            },
+        )
+
+
+@app.get("/fragment/plan", response_class=HTMLResponse)
+def plan_fragment(request: Request, plan_mode: str = Query("variety")):
+    plan_mode = (plan_mode or "variety").lower()
+    if plan_mode not in {"cheapest", "variety"}:
+        plan_mode = "variety"
+    with get_session() as session:
+        user = session.exec(select(User)).first()
+        if not user:
+            return HTMLResponse("", status_code=204)
+        plan, plan_summary = _build_plan_payload(user, session, plan_mode)
+        return templates.TemplateResponse(
+            "_plan.html",
+            {
+                "request": request,
+                "user": user,
+                "plan": plan,
+                "plan_summary": plan_summary,
+                "plan_mode": plan_mode,
+                "current_mode": plan_mode,
             },
         )
 
@@ -819,6 +1014,9 @@ def setup(
     target_credits: float = Form(...),
     allow_live: bool = Form(False),
     prefer_live: bool = Form(False),
+    residency_completion_year: str = Form(""),
+    professional_stage: str = Form(""),
+    memberships: str = Form(""),
 ):
     with get_session() as session:
         user = session.exec(select(User)).first()
@@ -833,6 +1031,14 @@ def setup(
         user.remaining_credits = target_credits
         user.allow_live = allow_live
         user.prefer_live = prefer_live
+        try:
+            user.residency_completion_year = (
+                int(residency_completion_year) if residency_completion_year else None
+            )
+        except Exception:
+            user.residency_completion_year = None
+        user.professional_stage = _normalize_stage(professional_stage)
+        user.memberships = _parse_membership_input(memberships)
         session.add(user)
         session.commit()
     return RedirectResponse("/", status_code=303)
@@ -942,7 +1148,12 @@ async def ingest(request: Request = None):
         google_inserted = None
         ai_inserted = None
         if isinstance(result, tuple):
-            if len(result) == 3:
+            if len(result) >= 4:
+                ingested = int(result[0])
+                used_fallback = bool(result[1])
+                google_inserted = int(result[2])
+                ai_inserted = int(result[3])
+            elif len(result) == 3:
                 ingested = int(result[0])
                 used_fallback = bool(result[1])
                 google_inserted = int(result[2])
@@ -987,17 +1198,31 @@ def assist():
             chosen, total_credits, total_cost, days_used = build_plan(
                 user, session, mode="variety"
             )
-        plan = [
-            {
-                "title": a.title,
-                "provider": a.provider,
-                "credits": a.credits,
-                "cost": a.cost_usd,
-                "modality": a.modality,
-                "city": a.city,
-            }
-            for a in chosen
-        ]
+        plan = []
+        for a in chosen:
+            pricing = getattr(a, "_pricing_context", None) or pricing_context_for_user(
+                user, a
+            )
+            deadline_obj = pricing.get("deadline")
+            if isinstance(deadline_obj, date):
+                deadline_str = deadline_obj.isoformat()
+            else:
+                deadline_str = None
+            plan.append(
+                {
+                    "title": a.title,
+                    "provider": a.provider,
+                    "credits": a.credits,
+                    "cost": pricing.get("cost", a.cost_usd),
+                    "base_cost": pricing.get("base_cost", a.cost_usd),
+                    "price_label": pricing.get("label"),
+                    "deadline": deadline_str,
+                    "modality": a.modality,
+                    "city": a.city,
+                    "hybrid_available": pricing.get("hybrid_available")
+                    or getattr(a, "hybrid_available", False),
+                }
+            )
         claims = list(session.exec(select(Claim).where(Claim.user_id == user.id)))
 
     # Compose system/user prompt
@@ -1017,6 +1242,9 @@ def assist():
             "target_credits": user.target_credits,
             "remaining_credits": user.remaining_credits,
             "allow_live": user.allow_live,
+            "professional_stage": user.professional_stage,
+            "residency_completion_year": user.residency_completion_year,
+            "memberships": user.memberships,
         },
         "plan": plan,
         "claims": [
@@ -1067,12 +1295,16 @@ def assist_reply(answer: str = Form(...)):
             "city": user.city,
             "specialty": user.specialty,
             "target_credits": user.target_credits,
+            "professional_stage": user.professional_stage,
+            "residency_completion_year": user.residency_completion_year,
+            "memberships": user.memberships,
         }
 
     sys = (
         "Extract updated preference values from the user's reply. Return STRICT JSON with keys: "
         "budget_usd (number|null), days_off (integer|null), allow_live (boolean|null), city (string|null), "
-        "specialty (string|null), target_credits (number|null). If a value is not provided, set it to null."
+        "specialty (string|null), target_credits (number|null), professional_stage (string|null), "
+        "residency_completion_year (integer|null), memberships (array|string|null). If a value is not provided, set it to null."
     )
     user_msg = {
         "current": current,
@@ -1133,6 +1365,30 @@ def assist_reply(answer: str = Form(...)):
                 updated_fields.append(f"target_credits={user.target_credits}")
             except Exception:
                 pass
+        if data.get("professional_stage") is not None:
+            stage = _normalize_stage(data.get("professional_stage"))
+            user.professional_stage = stage
+            updated_fields.append(f"stage={stage or 'cleared'}")
+        if data.get("residency_completion_year") is not None:
+            try:
+                year_val = (
+                    int(data["residency_completion_year"])
+                    if data["residency_completion_year"]
+                    else None
+                )
+            except Exception:
+                year_val = None
+            user.residency_completion_year = year_val
+            updated_fields.append(
+                f"residency_year={year_val if year_val else 'cleared'}"
+            )
+        if data.get("memberships") is not None:
+            parsed_memberships = _parse_membership_input(data.get("memberships"))
+            user.memberships = parsed_memberships
+            updated_fields.append(
+                "memberships="
+                + (", ".join(parsed_memberships) if parsed_memberships else "cleared")
+            )
         session.add(user)
         session.commit()
 
@@ -1169,6 +1425,9 @@ def preferences_submit(
     target_credits: float = Form(...),
     allow_live: bool = Form(False),
     prefer_live: bool = Form(False),
+    residency_completion_year: str = Form(""),
+    professional_stage: str = Form(""),
+    memberships: str = Form(""),
 ):
     with get_session() as session:
         user = session.exec(select(User)).first()
@@ -1182,6 +1441,14 @@ def preferences_submit(
         user.target_credits = target_credits
         user.allow_live = allow_live
         user.prefer_live = prefer_live
+        try:
+            user.residency_completion_year = (
+                int(residency_completion_year) if residency_completion_year else None
+            )
+        except Exception:
+            user.residency_completion_year = None
+        user.professional_stage = _normalize_stage(professional_stage)
+        user.memberships = _parse_membership_input(memberships)
         session.add(user)
         session.commit()
     return RedirectResponse("/", status_code=303)
@@ -1388,8 +1655,10 @@ def chat_send(request: Request, text: str = Form(...)):
 
                 Append a single machine-readable line:
                 PATCH: {"only_changed_fields_here": "..."}
-                • Only include keys among: budget_usd, days_off, allow_live, city, specialty, target_credits
+                • Only include keys among: budget_usd, days_off, allow_live, city, specialty,
+                  target_credits, professional_stage, residency_completion_year, memberships
                 • Use correct JSON types (numbers for budgets/targets, booleans for allow_live, strings for city/specialty)
+                • memberships should be an array of strings when provided
                 • No backticks, no code fences, no extra text on that line
 
                 If the user indicates remaining credits explicitly (e.g., “remaining 17”

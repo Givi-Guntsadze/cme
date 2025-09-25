@@ -80,7 +80,11 @@ async def ai_extract_from_text(text: str, url: str) -> Optional[dict]:
         schema = (
             "Return STRICT JSON only with keys: title, provider, credits (number), cost_usd (number|null), "
             "modality ('online'|'live'), city (string|null), start_date (YYYY-MM-DD|null), end_date (YYYY-MM-DD|null), "
-            "days_required (integer|null), url (string)."
+            "days_required (integer|null), url (string), hybrid_available (boolean|null), "
+            "pricing_options (array of objects with label, cost_usd, deadline (YYYY-MM-DD|null), "
+            "conditions {membership, stage, max_years_post_residency}), "
+            "eligible_institutions (array of strings|null), eligible_groups (array of strings|null), "
+            "membership_required (string|null), open_to_public (boolean|null)."
         )
         prompt = (
             f"Extract CME info from the following page text. {schema} URL: {url}. "
@@ -115,6 +119,25 @@ def is_valid_record(r: Dict[str, Any]) -> bool:
                 provider = ""
         credits = float(r.get("credits") or 0)
         if not title or not provider or credits <= 0:
+            return False
+        cost_raw = r.get("cost_usd")
+        cost_known = False
+        if isinstance(cost_raw, str):
+            text = cost_raw.strip()
+            if not text:
+                cost_raw = None
+            elif text.lower() in {"free", "complimentary", "no cost", "included"}:
+                cost_raw = 0.0
+        if cost_raw is not None and cost_raw != "":
+            try:
+                cost_val = float(cost_raw)
+                if cost_val < 0:
+                    return False
+                r["cost_usd"] = cost_val
+                cost_known = True
+            except (TypeError, ValueError):
+                return False
+        if not cost_known:
             return False
         if (r.get("modality") or "").lower() == "online" and r.get("days_required") in (
             None,
@@ -269,6 +292,79 @@ def _parse_eligibility(snippet: Optional[str]) -> Dict[str, Any]:
     return result
 
 
+def _normalize_pricing_options(raw: Any) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    if not raw:
+        return normalized
+    options = raw if isinstance(raw, list) else []
+    if not isinstance(options, list):
+        return normalized
+
+    for opt in options:
+        if not isinstance(opt, dict):
+            continue
+        label = str(opt.get("label") or "").strip() or "Alternate pricing"
+        try:
+            cost_val = float(opt.get("cost_usd"))
+        except (TypeError, ValueError):
+            continue
+        if cost_val < 0:
+            continue
+        deadline_raw = opt.get("deadline")
+        deadline_iso = None
+        if deadline_raw:
+            try:
+                deadline_iso = date.fromisoformat(str(deadline_raw)).isoformat()
+            except Exception:
+                deadline_iso = None
+
+        conditions = (
+            opt.get("conditions") if isinstance(opt.get("conditions"), dict) else {}
+        )
+        membership = conditions.get("membership") or conditions.get("memberships")
+        if membership and not isinstance(membership, list):
+            membership = [membership]
+        membership_list = []
+        for item in membership or []:
+            text = str(item).strip()
+            if text:
+                membership_list.append(text)
+
+        stage = conditions.get("stage") or conditions.get("stages")
+        if stage and not isinstance(stage, list):
+            stage = [stage]
+        stage_list = []
+        for item in stage or []:
+            text = str(item).strip()
+            if text:
+                stage_list.append(text)
+
+        max_years = conditions.get("max_years_post_residency")
+        try:
+            max_years_val = float(max_years) if max_years is not None else None
+        except (TypeError, ValueError):
+            max_years_val = None
+
+        normalized.append(
+            {
+                "label": label,
+                "cost_usd": cost_val,
+                "deadline": deadline_iso,
+                "conditions": {
+                    k: v
+                    for k, v in {
+                        "membership": membership_list,
+                        "stage": stage_list,
+                        "max_years_post_residency": max_years_val,
+                    }.items()
+                    if v
+                },
+            }
+        )
+
+    return normalized
+
+
 def _build_queries_for_user(user: Optional[User]) -> List[str]:
     base = "psychiatry CME AMA PRA Category 1 credit"
     city = user.city if user and user.city else None
@@ -292,9 +388,12 @@ def _build_queries_for_user(user: Optional[User]) -> List[str]:
     return uniq
 
 
-def _insert_items(items: List[dict]) -> int:
+def _insert_items(items: List[dict]) -> tuple[int, Dict[str, int]]:
     """Insert parsed items into DB with dedupe by (title, provider) only."""
+
     added = 0
+    by_source: Dict[str, int] = {}
+
     with get_session() as s:
         for it in items:
             try:
@@ -305,7 +404,14 @@ def _insert_items(items: List[dict]) -> int:
                 provider = provider_in or (urlparse(url).netloc if url else "")
                 credits = float(it.get("credits") or 0)
                 modality = (it.get("modality") or "online").lower()
-                cost = float(it.get("cost_usd") or 0)
+                try:
+                    cost = (
+                        float(it.get("cost_usd"))
+                        if it.get("cost_usd") is not None
+                        else 0.0
+                    )
+                except (TypeError, ValueError):
+                    cost = 0.0
                 city = it.get("city") or None
                 start_date_s = it.get("start_date") or None
                 end_date_s = it.get("end_date") or None
@@ -315,6 +421,32 @@ def _insert_items(items: List[dict]) -> int:
                 days_required = int(
                     it.get("days_required") or (0 if modality == "online" else 1)
                 )
+                pricing_options = _normalize_pricing_options(it.get("pricing_options"))
+                if pricing_options:
+                    try:
+                        highest = max(
+                            float(opt.get("cost_usd") or 0) for opt in pricing_options
+                        )
+                    except ValueError:
+                        highest = 0.0
+                    if highest and highest > cost:
+                        cost = highest
+
+                hybrid_flag = it.get("hybrid_available")
+                if isinstance(hybrid_flag, str):
+                    hybrid_available = hybrid_flag.strip().lower() in {
+                        "true",
+                        "1",
+                        "yes",
+                        "both",
+                        "hybrid",
+                        "online and in-person",
+                    }
+                else:
+                    hybrid_available = bool(hybrid_flag)
+
+                if not hybrid_available and "hybrid" in modality:
+                    hybrid_available = True
 
                 # Validation
                 if not title or not provider or credits <= 0:
@@ -366,6 +498,35 @@ def _insert_items(items: List[dict]) -> int:
                 if it.get("open_to_public") is not None:
                     eligibility_data["open_to_public"] = bool(it.get("open_to_public"))
 
+                has_structured_restriction = bool(
+                    eligibility_data["eligible_institutions"]
+                    or eligibility_data["eligible_groups"]
+                    or eligibility_data["membership_required"]
+                )
+
+                if has_structured_restriction:
+                    parts: List[str] = []
+                    if eligibility_data["eligible_institutions"]:
+                        parts.append(
+                            "Institutions: "
+                            + ", ".join(eligibility_data["eligible_institutions"])
+                        )
+                    if eligibility_data["eligible_groups"]:
+                        parts.append(
+                            "Groups: " + ", ".join(eligibility_data["eligible_groups"])
+                        )
+                    if eligibility_data["membership_required"]:
+                        parts.append(
+                            "Membership: " + eligibility_data["membership_required"]
+                        )
+                    eligibility_text_value = "; ".join(parts) or (
+                        eligibility_data["eligibility_text"] or raw_eligibility or None
+                    )
+                else:
+                    eligibility_text_value = None
+
+                source_val = (it.get("source") or "web").strip().lower() or "web"
+
                 a = Activity(
                     title=title[:200],
                     provider=provider[:120],
@@ -373,8 +534,17 @@ def _insert_items(items: List[dict]) -> int:
                     cost_usd=cost,
                     modality=(
                         "online"
-                        if modality.startswith("on") or modality == "virtual"
-                        else ("live" if modality == "live" else "online")
+                        if modality.startswith("on")
+                        or modality in {"virtual", "asynchronous"}
+                        else (
+                            "live"
+                            if (
+                                modality == "live"
+                                or "hybrid" in modality
+                                or "in-person" in modality
+                            )
+                            else "online"
+                        )
                     ),
                     city=city,
                     days_required=days_required,
@@ -382,15 +552,18 @@ def _insert_items(items: List[dict]) -> int:
                     end_date=end_date,
                     url=url,
                     summary=summary,
-                    source=(it.get("source") or "web"),
-                    eligibility_text=eligibility_data["eligibility_text"],
+                    source=source_val,
+                    eligibility_text=eligibility_text_value,
                     eligible_institutions=eligibility_data["eligible_institutions"],
                     eligible_groups=eligibility_data["eligible_groups"],
                     membership_required=eligibility_data["membership_required"],
                     open_to_public=eligibility_data["open_to_public"],
+                    hybrid_available=hybrid_available,
+                    pricing_options=pricing_options,
                 )
                 s.add(a)
                 added += 1
+                by_source[source_val] = by_source.get(source_val, 0) + 1
             except Exception:
                 logger.exception(
                     "insert skip (item=%s)",
@@ -398,7 +571,7 @@ def _insert_items(items: List[dict]) -> int:
                 )
                 continue
         s.commit()
-    return added
+    return added, by_source
 
 
 def _extract_with_openai_from_candidates(
@@ -418,7 +591,7 @@ def _extract_with_openai_from_candidates(
             'Return STRICT JSON: {"items":[{"title":str,"provider":str,"credits":number,'
             '"cost_usd":number|null,"modality":"online|live","city":str|null,'
             '"start_date":"YYYY-MM-DD"|null,"end_date":"YYYY-MM-DD"|null,'
-            '"days_required":0|1|2|null,"url":str,"summary":str|null}]}. '
+            '"days_required":0|1|2|null,"url":str,"summary":str|null,"hybrid_available":boolean|null,"pricing_options":array|null}]}. '
             f"Limit to about {count}. Candidates JSON follows.\n"
             f"{json.dumps(candidates, ensure_ascii=False)}"
         )
@@ -445,6 +618,8 @@ def _extract_with_openai_from_candidates(
                 it = dict(it or {})
                 title = (it.get("title") or "").strip()
                 it.setdefault("url", link_map.get(title, ""))
+                snippet = snippet_map.get(title, "") or ""
+                lowered_snippet = snippet.lower()
                 # Provider fallback to domain or displayLink
                 if not it.get("provider"):
                     url_val = it.get("url") or ""
@@ -455,25 +630,46 @@ def _extract_with_openai_from_candidates(
                     )
                     if prov:
                         it["provider"] = prov
+                if it.get("cost_usd") in (None, ""):
+                    price_match = COST_RE.search(snippet)
+                    if price_match:
+                        try:
+                            it["cost_usd"] = float(price_match.group(1))
+                        except Exception:
+                            pass
+                    elif any(
+                        phrase in lowered_snippet
+                        for phrase in ("free", "no cost", "complimentary", "included")
+                    ):
+                        it["cost_usd"] = 0.0
                 # Credits fallback from snippet/title heuristics
                 if not it.get("credits") or float(it.get("credits") or 0) <= 0:
-                    text_blob = f"{snippet_map.get(title, '')} {title}"
+                    text_blob = f"{snippet} {title}"
                     m = CRED_RE.search(text_blob) or ALT_CRED_RE.search(text_blob)
                     if m:
                         it["credits"] = float(m.group(1))
                 # Modality fallback
                 if not it.get("modality"):
-                    mm = MODALITY_RE.search(snippet_map.get(title, ""))
+                    mm = MODALITY_RE.search(snippet)
                     it["modality"] = mm.group(0).lower() if mm else "online"
                 if "eligibility_text" not in it or not it.get("eligibility_text"):
-                    it["eligibility_text"] = snippet_map.get(title, "")
+                    it["eligibility_text"] = snippet
                 if "snippet" not in it or not it.get("snippet"):
-                    it["snippet"] = snippet_map.get(title, "")
+                    it["snippet"] = snippet
                 # Validate here
                 credits = float(it.get("credits") or 0)
                 provider = (it.get("provider") or "").strip()
                 if credits <= 0 or not provider or not title:
                     continue
+                eligibility_preview = _parse_eligibility(it.get("eligibility_text"))
+                has_restriction = bool(
+                    eligibility_preview["eligible_institutions"]
+                    or eligibility_preview["eligible_groups"]
+                    or eligibility_preview["membership_required"]
+                )
+                has_cost = it.get("cost_usd") not in (None, "")
+                if not has_cost or not has_restriction:
+                    it["_force_deepfetch"] = True
                 cleaned.append(it)
             except Exception:
                 logger.exception("drop item due to parse error")
@@ -496,7 +692,9 @@ def _fallback_with_openai_web_search(count: int) -> List[dict]:
             "Find up-to-date CME opportunities in psychiatry that award AMA PRA Category 1 Credits. "
             "Return STRICT JSON with top-level 'items' only, with fields: title, provider, credits (number), "
             "cost_usd (number|null), modality ('online'|'live'), city (string|null), start_date (YYYY-MM-DD|null), "
-            "end_date (YYYY-MM-DD|null), days_required (0|1|2|null), url, summary (string|null)."
+            "end_date (YYYY-MM-DD|null), days_required (0|1|2|null), url, summary (string|null), "
+            "hybrid_available (boolean|null), pricing_options (array), eligible_institutions (array|null), "
+            "eligible_groups (array|null), membership_required (string|null), open_to_public (boolean|null)."
         )
         resp = client.responses.create(
             model="gpt-4o-mini", tools=[{"type": "web_search"}], input=prompt
@@ -593,6 +791,7 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
                     "credits": 0,
                     "eligibility_text": c.get("snippet") or "",
                     "snippet": c.get("snippet") or "",
+                    "_force_deepfetch": True,
                 }
             )
     else:
@@ -623,11 +822,14 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
 
     for it in prelim:
         try:
-            # If valid already, consider for insert directly
-            if is_valid_record(it):
+            force_deepfetch = bool(it.get("_force_deepfetch"))
+            valid_initial = is_valid_record(it)
+            if valid_initial and not force_deepfetch:
                 improved.append(it)
                 continue
             if deepfetch_budget <= 0:
+                if valid_initial and not force_deepfetch:
+                    improved.append(it)
                 continue
             url = it.get("url") or it.get("link")
             if not url:
@@ -650,7 +852,7 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
                     r2["snippet"] = it.get("snippet") or ""
                 deepfetch_valid += 1
                 improved.append(r2)
-            else:
+            elif valid_initial:
                 improved.append(it)
         except Exception:
             logger.exception(
@@ -671,8 +873,9 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
         seen_pairs.add(key)
         to_insert.append(r)
 
-    added_from_google = _insert_items(to_insert)
+    added_from_google, source_counts = _insert_items(to_insert)
     total_added += added_from_google
+    cumulative_sources: Dict[str, int] = dict(source_counts)
     logger.info(
         "ingest counters: cse_raw=%d first_pass_valid=%d deepfetch_attempted=%d deepfetch_valid=%d inserted=%d",
         cse_raw,
@@ -689,7 +892,10 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
         logger.info("Fallback triggered: OpenAI web_search")
         try:
             more = _fallback_with_openai_web_search(min_results - total_added)
-            total_added += _insert_items(more)
+            added_more, fallback_counts = _insert_items(more)
+            total_added += added_more
+            for key, value in fallback_counts.items():
+                cumulative_sources[key] = cumulative_sources.get(key, 0) + value
         except Exception:
             logger.exception("Fallback phase failed")
 
@@ -701,6 +907,9 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
             "deepfetch_valid": deepfetch_valid,
             "inserted": total_added,
             "fallback_used": used_fallback,
+            "by_source": cumulative_sources,
         }
 
-    return total_added, used_fallback
+    web_count = cumulative_sources.get("web", 0) + cumulative_sources.get("seed", 0)
+    ai_count = cumulative_sources.get("ai", 0)
+    return total_added, used_fallback, web_count, ai_count

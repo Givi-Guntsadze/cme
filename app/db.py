@@ -35,6 +35,12 @@ def _apply_migrations() -> None:
             )
         if "training_level" not in u_names:
             conn.execute(text("ALTER TABLE user ADD COLUMN training_level TEXT"))
+        if "professional_stage" not in u_names:
+            conn.execute(text("ALTER TABLE user ADD COLUMN professional_stage TEXT"))
+        if "residency_completion_year" not in u_names:
+            conn.execute(
+                text("ALTER TABLE user ADD COLUMN residency_completion_year INTEGER")
+            )
 
         # Activity table: add metadata columns
         cols = conn.execute(text("PRAGMA table_info(activity)")).fetchall()
@@ -76,6 +82,22 @@ def _apply_migrations() -> None:
             conn.execute(
                 text(
                     "UPDATE activity SET open_to_public=1 WHERE open_to_public IS NULL"
+                )
+            )
+        if "hybrid_available" not in names:
+            conn.execute(
+                text("ALTER TABLE activity ADD COLUMN hybrid_available BOOLEAN")
+            )
+            conn.execute(
+                text(
+                    "UPDATE activity SET hybrid_available=0 WHERE hybrid_available IS NULL"
+                )
+            )
+        if "pricing_options" not in names:
+            conn.execute(text("ALTER TABLE activity ADD COLUMN pricing_options TEXT"))
+            conn.execute(
+                text(
+                    "UPDATE activity SET pricing_options='[]' WHERE pricing_options IS NULL OR pricing_options=''"
                 )
             )
 

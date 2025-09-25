@@ -1,15 +1,125 @@
 {
   "board": "ABPN",
   "specialty": "Psychiatry",
-  "version": "2025-09-01",
+  "version": "2025-09-25",
   "sources": [
-    "https://abpn.org/continuing-certification/"
+    "https://abpn.org/continuing-certification/",
+    "CC-Booklet.pdf",
+    "ABPN-PIP-Handout.pdf"
   ],
   "rules": {
     "cycle_years": 3,
-    "total_credits": 90,
-    "annual_minimum": 30,
-    "safety_or_ethics_min": 2,
-    "audit_evidence_notes": "Retain certificates and transcripts in case of audit."
+    "cme_total_per_cycle": 90,
+    "sa_cme_min_per_cycle": 16,
+    "pip_required_per_cycle": 1,
+    "patient_safety_activity": {
+      "required": true,
+      "applies_one_time": true,
+      "portal_determined": true,
+      "notes": "Check ABPN Physician Portal; one-time requirement if indicated."
+    },
+    "assessment": {
+      "options": {
+        "ten_year_exam": true,
+        "abcc_pathway": true
+      },
+      "abcc_details": {
+        "must_complete_each_cycle": true,
+        "summary": "Set of online article exams per active certification; complete by end of each 3-year cycle to be excused from a future 10-year exam."
+      }
+    },
+    "licensure": {
+      "active_full_unrestricted_required": true,
+      "jurisdictions": "US state/territory or Canadian province",
+      "all_licenses_must_be_unrestricted": true
+    },
+    "credit_window_policy": {
+      "must_be_within_cycle": true,
+      "carryover_disallowed": true
+    },
+    "activity_sources": {
+      "cme_category1_scope": "Any Category 1 CME relevant to one’s field of practice (need not be ABPN-approved).",
+      "sa_cme_pip_ps_safety_must_be_abpn_approved": true
+    },
+    "clinical_activity_status": {
+      "affects_pip": true,
+      "statuses": {
+        "clinically_active": {
+          "definition": "Any direct and/or consultative patient care in prior 24 months (including supervision).",
+          "pip_required": true
+        },
+        "clinically_active_not_enough_for_pip": {
+          "definition": "Primarily research/academic/administrative; insufficient to complete PIP.",
+          "pip_required": false
+        },
+        "clinically_inactive": {
+          "definition": "No clinical/consultative patient care in past 24 months.",
+          "pip_required": false
+        }
+      }
+    },
+    "alternative_options": {
+      "fellowship_waiver": "See booklet pages on CC Activity Waiver for Fellowships.",
+      "abms_portfolio_program": true,
+      "reciprocal_cc_credit": true
+    },
+    "audit": {
+      "possible": true,
+      "documentation_keep_years": 3,
+      "audit_evidence_notes": "Retain certificates and documentation (CME/SA/PIP/Patient Safety, ABCC article exams). If audited, be prepared to explain PIP process and provide improvement plan materials."
+    },
+    "notes": {
+      "one_set_for_all_certifications": "A single set of CME/SA/PIP/Patient Safety activities applies across specialties/subspecialties.",
+      "abcc_enrollment": "Passing CC exam or completing article pathway enrolls you into CC; then satisfy activity requirements and pay annual fee on 3-year blocks."
+    }
+  },
+  "pip_details": {
+    "modules": [
+      "clinical_chart_review",
+      "patient_or_peer_feedback"
+    ],
+    "timeline_months": 24,
+    "steps": [
+      "A_initial_assessment",
+      "B_identify_and_implement_improvement",
+      "C_reassessment"
+    ],
+    "clinical_chart_review": {
+      "step_a": {
+        "charts": 5,
+        "lookback_years": 3,
+        "compare_to_guidelines": true,
+        "min_quality_measures": 4
+      },
+      "step_c": {
+        "charts": 5,
+        "within_months_of_step_a": 24,
+        "same_category_and_guidelines": true
+      },
+      "eligible_pathways_examples": [
+        "ABPN Approved CC Clinical Module",
+        "ABMS Portfolio Program QI",
+        "APA PsychPRO registry",
+        "Joint Commission OPPE or Stroke Center"
+      ]
+    },
+    "feedback_module": {
+      "step_a_options_any_one": [
+        "5 patient feedback forms",
+        "5 peer feedback forms",
+        "5 resident evaluations",
+        "1 supervisor evaluation",
+        "5 respondents 360-degree evaluation"
+      ],
+      "competencies_required": [
+        "patient care",
+        "medical knowledge",
+        "interpersonal and communication skills",
+        "practice-based learning and improvement",
+        "professionalism",
+        "systems-based practice"
+      ],
+      "step_c_within_months_of_step_a": 24
+    }
   }
 }

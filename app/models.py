@@ -24,6 +24,8 @@ class User(SQLModel, table=True):
         default_factory=list, sa_column=Column(JSON)
     )
     training_level: Optional[str] = None
+    professional_stage: Optional[str] = None  # e.g., early_career, standard, resident
+    residency_completion_year: Optional[int] = None
 
 
 class Activity(SQLModel, table=True):
@@ -50,6 +52,10 @@ class Activity(SQLModel, table=True):
     )
     membership_required: Optional[str] = None
     open_to_public: bool = True
+    hybrid_available: bool = False
+    pricing_options: Optional[List[dict]] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
 
 
 class Claim(SQLModel, table=True):

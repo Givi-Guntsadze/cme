@@ -1,0 +1,90 @@
+<section class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+    <h2 style="margin:0;">Recommended Plan</h2>
+    <button
+      hx-post="/ingest"
+      hx-swap="none"
+      hx-on::before-request="this.dataset.originalText=this.textContent; this.disabled=true; this.textContent='Discovering…';"
+      hx-on::after-request="(function(btn, evt){ if(btn.dataset){ btn.textContent=btn.dataset.originalText||'Discover'; btn.disabled=false; } try { const xhr = evt.detail && evt.detail.xhr; if (xhr) { let data = {}; try { data = JSON.parse(xhr.responseText || '{}'); } catch (err) { data = {}; } if (typeof data.ingested !== 'undefined') { const params = new URLSearchParams(window.location.search); params.set('added', data.ingested || 0); if (typeof data.google_inserted !== 'undefined') { params.set('gcount', data.google_inserted || 0); } if (typeof data.ai_inserted !== 'undefined') { params.set('acount', data.ai_inserted || 0); } params.set('fallback', data.used_fallback ? '1' : '0'); history.replaceState(null, '', '?' + params.toString()); const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#f0fff4;border-left:4px solid #34d399;padding:8px 12px;margin:8px 0;\'>Imported ' + (data.ingested || 0) + ' new activities — Web: ' + (data.google_inserted || 0) + ', AI: ' + (data.ai_inserted || 0) + (data.used_fallback ? ' (fallback used)' : '') + '.</div>'; } const planRoot = document.getElementById('plan-card'); if (planRoot && window.htmx) { const mode = planRoot.dataset.planMode || 'variety'; window.htmx.ajax('GET', '/fragment/plan?plan_mode=' + mode, '#plan-card'); planRoot.dataset.planMode = mode; } return; } if (data.error) { const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#fff7f7;border-left:4px solid #f87171;padding:8px 12px;margin:8px 0;\'>' + data.error + '</div>'; } return; } } } catch (err) { console.error(err); } })(this, event);"
+      class="button"
+      type="button"
+    >Discover</button>
+  </div>
+  <div class="tabs">
+    <a href="/?plan_mode=cheapest" class="btn{% if current_mode == 'cheapest' %} active{% endif %}">Cheapest</a>
+    <a href="/?plan_mode=variety" class="btn{% if current_mode == 'variety' %} active{% endif %}">Variety</a>
+  </div>
+  {% if current_mode == 'cheapest' %}
+    <p class="meta" style="margin-top:-4px;">Optimized for lowest cost per credit; may choose a single subscription.</p>
+  {% elif current_mode == 'variety' %}
+    <p class="meta" style="margin-top:-4px;">Optimized for balanced mix; avoids letting one item dominate.</p>
+  {% endif %}
+  {% if plan_summary %}
+    <div class="meta plan-summary">
+      {{ plan_summary.item_count }} {{ 'activity' if plan_summary.item_count == 1 else 'activities' }}
+      • {{ '%.1f' % plan_summary.total_credits }} cr
+      • {{ plan_summary.cost_display }}
+      {% if plan_summary.days_used %}
+        • {{ plan_summary.days_used }} days off
+      {% endif %}
+    </div>
+  {% endif %}
+  {% if plan and plan|length > 0 %}
+    <ul class="plan">
+      {% for p in plan %}
+        <li>
+          <div class="title">
+            {% if p.url %}
+              <a href="{{ p.url }}" target="_blank" rel="noopener noreferrer">{{ p.title }}</a>
+            {% else %}
+              {{ p.title }}
+            {% endif %}
+          </div>
+          <div class="meta">
+            {{ p.provider }} • {{ p.modality }}{% if p.city %} • {{ p.city }}{% endif %}
+            {% if p.source_label %}
+              <span class="badge" style="margin-left:8px; background:#eef;">{{ p.source_label }}</span>
+            {% endif %}
+            {% if p.topic and p.topic != 'general' %}
+              <span class="badge topic">{{ p.topic.replace('_', ' ')|title }}</span>
+            {% endif %}
+            {% if p.hybrid_available %}
+              <span class="badge" style="margin-left:8px; background:#e6fffa;">Hybrid</span>
+            {% endif %}
+            {% if p.eligibility_status == 'eligible' %}
+              <span class="badge eligibility ok" title="{{ p.eligibility_text or 'Eligible for you' }}">✅ Eligible</span>
+            {% elif p.eligibility_status == 'uncertain' %}
+              <span class="badge eligibility warn" title="{{ p.eligibility_text or 'Eligibility needs manual check' }}">⚠️ Check eligibility</span>
+            {% elif p.eligibility_status == 'ineligible' %}
+              <span class="badge eligibility no" title="{{ p.eligibility_text or 'Not eligible based on current info' }}">❌ Not eligible</span>
+            {% endif %}
+          </div>
+          <div class="meta">
+            {{ '%.1f' % p.credits }} cr • {{ p.cost_display }}
+            {% if p.price_label %}
+              <span class="badge" style="margin-left:8px; background:#fef3c7;">{{ p.price_label }}</span>
+            {% endif %}
+            {% if p.base_cost and p.base_cost != p.cost %}
+              <span class="meta" style="margin-left:8px;">Std ${{ '%.0f' % p.base_cost }}</span>
+            {% endif %}
+          </div>
+          {% if p.deadline_text %}
+            <div class="meta" style="color:#b45309;">Register by {{ p.deadline_text }}{% if p.deadline_urgency %} ({{ p.deadline_urgency }}){% endif %}</div>
+          {% endif %}
+          {% if p.pricing_notes %}
+            <div class="meta" style="color:#6b7280;">{{ p.pricing_notes }}</div>
+          {% endif %}
+          {% if p.summary %}
+            <div class="meta">{{ p.summary }}</div>
+          {% endif %}
+          <form method="post" action="/plan/remove" style="margin-top:6px;">
+            <input type="hidden" name="title" value="{{ p.title }}" />
+            <button type="submit" class="linklike" title="Remove this from plan">Remove</button>
+          </form>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p>No plan yet or all requirements met.</p>
+  {% endif %}
+</section>

@@ -5,6 +5,18 @@
     <label>Name <input name="name" value="{{ user.name }}" required></label>
     <label>Specialty <input name="specialty" value="{{ user.specialty }}" required></label>
     <label>City <input name="city" value="{{ user.city or '' }}"></label>
+    <label>Residency completion year <input name="residency_completion_year" type="number" min="1980" max="2100" value="{{ user.residency_completion_year or '' }}"></label>
+    <label>Professional stage
+      <select name="professional_stage">
+        <option value="" {% if not user.professional_stage %}selected{% endif %}>Select…</option>
+        <option value="early_career" {% if user.professional_stage == 'early_career' %}selected{% endif %}>Early career (&lt;4 years post-residency)</option>
+        <option value="standard" {% if user.professional_stage == 'standard' %}selected{% endif %}>Established practitioner</option>
+        <option value="resident" {% if user.professional_stage == 'resident' %}selected{% endif %}>Resident / Fellow</option>
+      </select>
+    </label>
+    <label>Memberships (comma separated)
+      <input name="memberships" value="{{ (user.memberships or [])|join(', ') }}" placeholder="American Psychiatric Association, State Society">
+    </label>
 
     <label>Target credits <input name="target_credits" type="number" step="0.5" value="{{ '%.1f' % user.target_credits }}" required></label>
     <label>Budget (USD) <input name="budget_usd" type="number" step="1" value="{{ '%.0f' % user.budget_usd }}" required></label>
