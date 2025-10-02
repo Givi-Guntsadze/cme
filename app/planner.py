@@ -3,7 +3,17 @@ import logging
 from datetime import date
 from typing import List, Tuple, Dict, Any, Optional
 from sqlmodel import select
-from .models import User, Activity, CompletedActivity
+from .models import User, Activity, CompletedActivity, Claim
+from .requirements import (
+    SA_CME_KEYWORDS,
+    PIP_KEYWORDS,
+    PATIENT_SAFETY_KEYWORDS,
+    classify_topic,
+    load_abpn_psychiatry_requirements,
+    pip_activity_count,
+    requirements_rules,
+    sa_cme_credit_sum,
+)
 
 
 MIN_VARIETY_ITEMS = 4
@@ -31,12 +41,17 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
     "child_adolescent": ["child", "adolescent", "youth", "pediatric", "teen"],
     "geriatric": ["geriatric", "older", "aging", "senior"],
     "ethics": ["ethic", "risk", "legal", "compliance"],
+    "patient_safety": [
+        "patient safety",
+        "risk management",
+        "error prevention",
+        "quality improvement",
+    ],
     "practice": ["practice", "leadership", "management", "billing", "operations"],
     "telehealth": ["telehealth", "telepsychiatry", "virtual care", "remote"],
     "psychopharm": ["pharm", "pharmacology", "medication", "prescrib", "drug"],
     "culture": ["culture", "equity", "diversity", "inclusion", "bias"],
 }
-
 
 CHEAPEST = {
     "diversity_w": 0.0,  # no diversity pressure
@@ -113,6 +128,87 @@ def _normalize_stage_value(value: object | None) -> Optional[str]:
         "trainee": "resident",
     }
     return aliases.get(text, text.replace(" ", "_"))
+
+
+def _activity_text(activity: Activity) -> str:
+    text_bits: List[str] = []
+    if activity.title:
+        text_bits.append(activity.title.lower())
+    if activity.summary:
+        text_bits.append(activity.summary.lower())
+    return " ".join(text_bits)
+
+
+def _is_patient_safety_activity(activity: Activity) -> bool:
+    tags = set(getattr(activity, "requirement_tags", []) or [])
+    if "patient_safety" in tags:
+        return True
+    text = _activity_text(activity)
+    if not text:
+        return False
+    if "patient" in text and "safety" in text:
+        return True
+    for kw in PATIENT_SAFETY_KEYWORDS:
+        if kw in text:
+            return True
+    return False
+
+
+def _is_sa_cme_activity(activity: Activity) -> bool:
+    tags = set(getattr(activity, "requirement_tags", []) or [])
+    if "sa_cme" in tags:
+        return True
+    text = _activity_text(activity)
+    if not text:
+        return False
+    return any(keyword in text for keyword in SA_CME_KEYWORDS)
+
+
+def _is_pip_activity(activity: Activity) -> bool:
+    tags = set(getattr(activity, "requirement_tags", []) or [])
+    if "pip" in tags:
+        return True
+    text = _activity_text(activity)
+    if not text:
+        return False
+    return any(keyword in text for keyword in PIP_KEYWORDS)
+
+
+def _requirements_planning_context(session, user: User) -> dict[str, object]:
+    requirements = load_abpn_psychiatry_requirements()
+    rules = requirements_rules(requirements)
+    safety_block = rules.get("patient_safety_activity")
+    safety_required = False
+    if isinstance(safety_block, dict):
+        safety_required = bool(safety_block.get("required"))
+    elif isinstance(safety_block, bool):
+        safety_required = bool(safety_block)
+    stmt = select(Claim).where(Claim.user_id == user.id)
+    claims = list(session.exec(stmt))
+    safety_completed = any(classify_topic(claim) == "safety" for claim in claims)
+    sa_min = float(rules.get("sa_cme_min_per_cycle") or 0.0)
+    sa_total = sa_cme_credit_sum(claims)
+    sa_needed = max(sa_min - sa_total, 0.0)
+    pip_required = int(rules.get("pip_required_per_cycle") or 0)
+    pip_completed = pip_activity_count(claims)
+    pip_needed = max(pip_required - pip_completed, 0)
+    return {
+        "requirements": requirements,
+        "needs_patient_safety": bool(safety_required and not safety_completed),
+        "has_patient_safety_credit": safety_completed,
+        "sa_credits_needed": sa_needed,
+        "pip_needed": pip_needed,
+    }
+
+
+def requirements_gap_summary(session, user: User) -> dict[str, object]:
+    ctx = _requirements_planning_context(session, user)
+    return {
+        "needs_patient_safety": bool(ctx.get("needs_patient_safety")),
+        "sa_credits_needed": float(ctx.get("sa_credits_needed") or 0.0),
+        "pip_needed": int(ctx.get("pip_needed") or 0),
+        "requirements": ctx.get("requirements"),
+    }
 
 
 def pricing_context_for_user(user: User, activity: Activity) -> Dict[str, Any]:
@@ -396,6 +492,20 @@ def build_plan(
         activities = [a for a in activities if a.modality == "online"]
     activities = [a for a in activities if is_eligible(user, a)]
 
+    req_ctx = _requirements_planning_context(session, user)
+    patient_safety_pending = bool(req_ctx.get("needs_patient_safety"))
+    if patient_safety_pending:
+        if not any(_is_patient_safety_activity(a) for a in activities):
+            patient_safety_pending = False
+    sa_needed = float(req_ctx.get("sa_credits_needed") or 0.0)
+    if sa_needed > 0:
+        if not any(_is_sa_cme_activity(a) for a in activities):
+            sa_needed = 0.0
+    pip_needed = int(req_ctx.get("pip_needed") or 0)
+    if pip_needed > 0:
+        if not any(_is_pip_activity(a) for a in activities):
+            pip_needed = 0
+
     chosen: List[Activity] = []
     total_credits = 0.0
     total_cost = 0.0
@@ -421,6 +531,9 @@ def build_plan(
             current_remaining: float = remaining_needed,
             current_days_used: int = days_used,
             current_total_cost: float = total_cost,
+            patient_safety_required: bool = patient_safety_pending,
+            sa_credits_required: float = sa_needed,
+            pip_required: int = pip_needed,
         ) -> tuple[
             Optional[Activity], float, Optional[Dict[str, Any]], Optional[str], bool
         ]:
@@ -488,6 +601,25 @@ def build_plan(
                     if effective_cost == 0.0:
                         score += 0.6
 
+                safety_activity = _is_patient_safety_activity(a)
+                sa_activity = _is_sa_cme_activity(a)
+                pip_activity = _is_pip_activity(a)
+                if patient_safety_required:
+                    if safety_activity:
+                        score -= 200.0
+                    else:
+                        score += 5.0
+                if sa_credits_required > 0:
+                    if sa_activity:
+                        score -= 120.0 * min(a.credits or 0.0, sa_credits_required)
+                    else:
+                        score += 3.0
+                if pip_required > 0:
+                    if pip_activity:
+                        score -= 500.0
+                    else:
+                        score += 200.0
+
                 if score < best_score_local:
                     best_score_local = score
                     best_local = a
@@ -518,6 +650,14 @@ def build_plan(
             )
         total_cost += float(best_context.get("cost") or best.cost_usd or 0.0)
         best._pricing_context = best_context
+        requirement_tags = set(getattr(best, "requirement_tags", []) or [])
+        if _is_patient_safety_activity(best):
+            requirement_tags.add("patient_safety")
+        if _is_sa_cme_activity(best):
+            requirement_tags.add("sa_cme")
+        if _is_pip_activity(best):
+            requirement_tags.add("pip")
+        best._requirement_tags = requirement_tags
         if best.modality == "live":
             days_used += best.days_required
 
@@ -530,6 +670,12 @@ def build_plan(
                 best_topic or getattr(best, "_topic_tag", None) or _infer_topic(best)
             )
             topic_counts[topic_key] = topic_counts.get(topic_key, 0) + 1
+        if patient_safety_pending and "patient_safety" in requirement_tags:
+            patient_safety_pending = False
+        if sa_needed > 0 and "sa_cme" in requirement_tags:
+            sa_needed = max(sa_needed - float(best.credits or 0.0), 0.0)
+        if pip_needed > 0 and "pip" in requirement_tags:
+            pip_needed = max(pip_needed - 1, 0)
 
         activities.remove(best)
 
@@ -561,6 +707,20 @@ def build_plan_with_policy(
     if not user.allow_live:
         activities = [a for a in activities if a.modality == "online"]
     activities = [a for a in activities if is_eligible(user, a)]
+
+    req_ctx = _requirements_planning_context(session, user)
+    patient_safety_pending = bool(req_ctx.get("needs_patient_safety"))
+    if patient_safety_pending:
+        if not any(_is_patient_safety_activity(a) for a in activities):
+            patient_safety_pending = False
+    sa_needed = float(req_ctx.get("sa_credits_needed") or 0.0)
+    if sa_needed > 0:
+        if not any(_is_sa_cme_activity(a) for a in activities):
+            sa_needed = 0.0
+    pip_needed = int(req_ctx.get("pip_needed") or 0)
+    if pip_needed > 0:
+        if not any(_is_pip_activity(a) for a in activities):
+            pip_needed = 0
 
     chosen: List[Activity] = []
     total_credits = 0.0
@@ -621,6 +781,24 @@ def build_plan_with_policy(
                 topic_w = float(config.get("topic_diversity_w") or 0.0)
                 if topic_w:
                     score += topic_w * topic_counts.get(topic, 0)
+            safety_activity = _is_patient_safety_activity(a)
+            sa_activity = _is_sa_cme_activity(a)
+            pip_activity = _is_pip_activity(a)
+            if patient_safety_pending:
+                if safety_activity:
+                    score -= 200.0
+                else:
+                    score += 5.0
+            if sa_needed > 0:
+                if sa_activity:
+                    score -= 120.0 * min(a.credits or 0.0, sa_needed)
+                else:
+                    score += 3.0
+            if pip_needed > 0:
+                if pip_activity:
+                    score -= 500.0
+                else:
+                    score += 200.0
             if score < best_score:
                 best_score = score
                 best = a
@@ -637,6 +815,14 @@ def build_plan_with_policy(
             )
         total_cost += float(best_context.get("cost") or best.cost_usd or 0.0)
         best._pricing_context = best_context
+        requirement_tags = set(getattr(best, "requirement_tags", []) or [])
+        if _is_patient_safety_activity(best):
+            requirement_tags.add("patient_safety")
+        if _is_sa_cme_activity(best):
+            requirement_tags.add("sa_cme")
+        if _is_pip_activity(best):
+            requirement_tags.add("pip")
+        best._requirement_tags = requirement_tags
         if best.modality == "live":
             days_used += best.days_required
         key = (best.provider or "").lower()
@@ -648,6 +834,12 @@ def build_plan_with_policy(
                 best_topic or getattr(best, "_topic_tag", None) or _infer_topic(best)
             )
             topic_counts[topic_key] = topic_counts.get(topic_key, 0) + 1
+        if patient_safety_pending and "patient_safety" in requirement_tags:
+            patient_safety_pending = False
+        if sa_needed > 0 and "sa_cme" in requirement_tags:
+            sa_needed = max(sa_needed - float(best.credits or 0.0), 0.0)
+        if pip_needed > 0 and "pip" in requirement_tags:
+            pip_needed = max(pip_needed - 1, 0)
         # Remove picked to avoid duplicates
         activities.remove(best)
 

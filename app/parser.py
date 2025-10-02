@@ -4,14 +4,48 @@ from datetime import date, timedelta
 from typing import Optional, Tuple
 
 # Patterns
-_CRED_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:credit(?:s)?|cr(?:edits?)?|cme)\b", re.I)
+_CREDIT_PATTERNS = [
+    re.compile(r"(\d+(?:\.\d+)?)\s*(?:credit(?:s)?|cr(?:eds?)?|hour(?:s)?)\b", re.I),
+    re.compile(
+        r"(?:earn(?:ed)?|log(?:ged)?|claim(?:ed)?|finish(?:ed)?|complete(?:d)?)\s*(\d+(?:\.\d+)?)\s*cme\b",
+        re.I,
+    ),
+    re.compile(r"cme\s*(?:credit(?:s)?|hour(?:s)?)\s*(\d+(?:\.\d+)?)", re.I),
+]
 _TOPIC_RE = re.compile(r"ethic|safety|opioid|psychopharm", re.I)
 _DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 
+def _looks_like_year(raw: str) -> bool:
+    if not raw.isdigit():
+        return False
+    value = int(raw)
+    return 1800 <= value <= 2200
+
+
+def _extract_credits(text: str) -> float:
+    lowered = text.lower()
+    for pattern in _CREDIT_PATTERNS:
+        match = pattern.search(lowered)
+        if not match:
+            continue
+        raw_value = match.group(1)
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        # Guard against capturing cycle years like "2023 CME"
+        if value.is_integer() and _looks_like_year(raw_value):
+            continue
+        # Very large values are almost always mistakes
+        if value > 200:
+            continue
+        return value
+    return 0.0
+
+
 def _regex_parse(text: str) -> Tuple[float, Optional[str], date]:
-    m = _CRED_RE.search(text)
-    credits = float(m.group(1)) if m else 0.0
+    credits = _extract_credits(text)
 
     tm = _TOPIC_RE.search(text)
     topic = tm.group(0).lower() if tm else None

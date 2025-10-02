@@ -12,23 +12,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import select
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 from .db import create_db_and_tables, get_session
-from .seed import seed_activities
 from .models import (
     User,
     Claim,
     AssistantMessage,
-    UserPolicy,
     Activity,
     CompletedActivity,
-)
-from .planner import (
-    build_plan,
-    build_plan_with_policy,
-    is_eligible,
-    pricing_context_for_user,
 )
 from .requirements import (
     load_abpn_psychiatry_requirements,
@@ -37,17 +29,20 @@ from .requirements import (
 from .parser import parse_message
 from .ingest import ingest_psychiatry_online_ai, safe_json_loads
 from openai import OpenAI
+from .services.plan import (
+    PlanManager,
+    active_policy_status,
+    apply_policy_payloads,
+    clear_policies,
+    load_policy_bundle,
+    policy_for_mode,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     create_db_and_tables()
-    try:
-        with get_session() as session:
-            seed_activities(session)
-    except Exception:
-        logging.getLogger(__name__).exception("failed to seed catalog")
     yield
     # Shutdown: nothing for now
 
@@ -104,120 +99,6 @@ def _normalize_stage(value: object | None) -> str | None:
         "trainee": "resident",
     }
     return aliases.get(stage, stage.replace(" ", "_"))
-
-
-def _source_label(source: str | None) -> str:
-    if not source:
-        return "Curated"
-    text = str(source).strip().lower()
-    mapping = {
-        "seed": "Curated",
-        "web": "Web",
-        "ai": "AI",
-    }
-    return mapping.get(text, text.replace("_", " ").title() or "Curated")
-
-
-def _build_plan_payload(user: User, session, plan_mode: str):
-    chosen, total_credits, total_cost, days_used = build_plan(
-        user, session, mode=plan_mode
-    )
-    policy_data = _load_existing_policy(session, user)
-    active_policy = _policy_for_mode(policy_data, plan_mode)
-    if active_policy:
-        chosen, total_credits, total_cost, days_used = build_plan_with_policy(
-            user, session, active_policy, mode=plan_mode
-        )
-
-    plan: list[dict[str, object]] = []
-    for a in chosen:
-        pricing = getattr(a, "_pricing_context", None) or pricing_context_for_user(
-            user, a
-        )
-        cost_value = pricing.get("cost", a.cost_usd)
-        base_cost = pricing.get("base_cost", a.cost_usd)
-        deadline_obj = pricing.get("deadline")
-        deadline_text = None
-        deadline_urgency = None
-        if isinstance(deadline_obj, date):
-            deadline_text = deadline_obj.strftime("%b %d, %Y")
-            days_left = pricing.get("deadline_days")
-            if isinstance(days_left, int) and days_left >= 0:
-                if days_left == 0:
-                    deadline_urgency = "today"
-                elif days_left == 1:
-                    deadline_urgency = "tomorrow"
-                elif days_left <= 14:
-                    deadline_urgency = f"in {days_left} days"
-        if cost_value is None:
-            cost_display = "TBD"
-        else:
-            cost_display = f"${cost_value:,.0f}"
-        pricing_notes = pricing.get("notes") or ""
-        if pricing_notes:
-            pricing_notes = pricing_notes[:180]
-        eligible = is_eligible(user, a)
-        structured_restrictions = bool(
-            (a.eligible_institutions and len(a.eligible_institutions or []))
-            or (a.eligible_groups and len(a.eligible_groups or []))
-            or a.membership_required
-            or not getattr(a, "open_to_public", True)
-        )
-        missing_profile_data = False
-        if a.eligible_institutions and not (getattr(user, "affiliations", []) or []):
-            missing_profile_data = True
-        if a.eligible_groups and not getattr(user, "training_level", None):
-            missing_profile_data = True
-        if a.membership_required and not (getattr(user, "memberships", []) or []):
-            missing_profile_data = True
-        if not eligible:
-            status = "ineligible"
-        elif missing_profile_data or (
-            a.eligibility_text and not structured_restrictions
-        ):
-            status = "uncertain"
-        else:
-            status = "eligible"
-
-        plan.append(
-            {
-                "title": a.title,
-                "provider": a.provider,
-                "credits": a.credits,
-                "cost": cost_value,
-                "cost_display": cost_display,
-                "price_label": pricing.get("label"),
-                "base_cost": base_cost,
-                "deadline_text": deadline_text,
-                "deadline_urgency": deadline_urgency,
-                "pricing_notes": pricing_notes,
-                "modality": a.modality,
-                "city": a.city,
-                "url": a.url,
-                "summary": a.summary,
-                "source": a.source,
-                "source_label": _source_label(getattr(a, "source", None)),
-                "hybrid_available": pricing.get("hybrid_available")
-                or getattr(a, "hybrid_available", False),
-                "topic": getattr(a, "_topic_tag", None),
-                "eligibility_status": status,
-                "eligibility_text": a.eligibility_text,
-            }
-        )
-
-    plan_summary = None
-    if plan:
-        plan_summary = {
-            "item_count": len(plan),
-            "total_credits": total_credits,
-            "total_cost": total_cost,
-            "cost_display": (
-                f"${total_cost:,.2f}" if total_cost is not None else "TBD"
-            ),
-            "days_used": days_used,
-        }
-
-    return plan, plan_summary
 
 
 def _parse_membership_input(raw: object | None) -> list[str]:
@@ -291,7 +172,8 @@ def _apply_patch_to_user(patch: dict, session, user: User) -> list[str]:
 
     if changed:
         session.add(user)
-        session.commit()
+        session.flush()
+        PlanManager.invalidate_user_plans(session, user.id, reason="preferences_update")
 
     return changed
 
@@ -328,8 +210,10 @@ def _maybe_set_remaining_from_text(user: User, user_text: str, session) -> str |
         source_text=f"Assistant adjustment to set remaining to {desired_remaining:.1f}",
     )
     session.add(adjustment)
-    session.commit()
+    session.flush()
     _recalculate_remaining(user, session)
+    PlanManager.invalidate_user_plans(session, user.id, reason="remaining_adjusted")
+    session.commit()
     return (
         f"Logged an adjustment of {delta:.1f} credits to set remaining ~"
         f"{desired_remaining:.1f}."
@@ -342,7 +226,7 @@ def _recalculate_remaining(user: User, session) -> None:
         total_claimed += float(claim.credits or 0.0)
     user.remaining_credits = max(float(user.target_credits or 0.0) - total_claimed, 0.0)
     session.add(user)
-    session.commit()
+    session.flush()
 
 
 def _maybe_log_claim_from_text(user: User, user_text: str, session) -> str | None:
@@ -361,8 +245,10 @@ def _maybe_log_claim_from_text(user: User, user_text: str, session) -> str | Non
         source_text=user_text,
     )
     session.add(claim)
-    session.commit()
+    session.flush()
     _recalculate_remaining(user, session)
+    PlanManager.invalidate_user_plans(session, user.id, reason="claim_logged")
+    session.commit()
     return f"Logged {credits:.1f} credits for {topic}."
 
 
@@ -411,8 +297,10 @@ def _maybe_complete_activity_from_text(
     if not existing:
         completed_entry = CompletedActivity(user_id=user.id, activity_id=match.id)
         session.add(completed_entry)
-    session.commit()
+    session.flush()
     _recalculate_remaining(user, session)
+    PlanManager.invalidate_user_plans(session, user.id, reason="activity_completed")
+    session.commit()
     return f"Marked '{match.title}' completed (+{match.credits:.1f} credits)."
 
 
@@ -424,28 +312,24 @@ def _state_snapshot(session, user: User) -> dict[str, object]:
     user.remaining_credits = remaining
     session.add(user)
 
-    chosen, _, _, _ = build_plan(user, session, mode="variety")
+    plan_manager = PlanManager(session)
+    policy_bundle = load_policy_bundle(session, user)
+    run = plan_manager.ensure_plan(user, "variety", policy_bundle)
+    plan_entries, _, _ = plan_manager.serialize_plan(run, user)
     top = []
-    for a in chosen[:6]:
-        pricing = getattr(a, "_pricing_context", None) or pricing_context_for_user(
-            user, a
-        )
-        deadline_obj = pricing.get("deadline")
-        deadline_str = (
-            deadline_obj.isoformat() if isinstance(deadline_obj, date) else None
-        )
+    for entry in plan_entries[:6]:
         top.append(
             {
-                "title": a.title,
-                "provider": a.provider,
-                "credits": a.credits,
-                "cost": pricing.get("cost", a.cost_usd),
-                "base_cost": pricing.get("base_cost", a.cost_usd),
-                "price_label": pricing.get("label"),
-                "deadline": deadline_str,
-                "modality": a.modality,
-                "city": a.city,
-                "hybrid_available": pricing.get("hybrid_available"),
+                "title": entry.get("title"),
+                "provider": entry.get("provider"),
+                "credits": entry.get("credits"),
+                "cost": entry.get("cost"),
+                "base_cost": entry.get("base_cost"),
+                "price_label": entry.get("price_label"),
+                "deadline": entry.get("deadline_text"),
+                "modality": entry.get("modality"),
+                "city": entry.get("city"),
+                "hybrid_available": entry.get("hybrid_available"),
             }
         )
 
@@ -592,224 +476,9 @@ def _apply_patch_if_present(
     )
     session.add(user)
     session.add(confirmation)
+    session.flush()
+    PlanManager.invalidate_user_plans(session, user.id, reason="preferences_update")
     return [confirmation]
-
-
-def _load_existing_policy(session, user: User) -> dict[str, object]:
-    now = datetime.utcnow()
-    rows = list(
-        session.exec(
-            select(UserPolicy)
-            .where(UserPolicy.user_id == user.id, UserPolicy.active.is_(True))
-            .order_by(UserPolicy.created_at.desc())
-        )
-    )
-    result: dict[str, object] = {"by_mode": {}, "default": None}
-    changed = False
-
-    for row in rows:
-        if row.expires_at and row.expires_at <= now:
-            row.active = False
-            session.add(row)
-            changed = True
-            continue
-        payload = row.payload or {}
-        if row.mode == "default":
-            if not result.get("default"):
-                result["default"] = payload
-        else:
-            if row.mode not in result["by_mode"]:
-                result["by_mode"][row.mode] = payload
-
-    if changed:
-        session.commit()
-
-    cleaned: dict[str, object] = {}
-    if result.get("by_mode"):
-        cleaned["by_mode"] = result["by_mode"]
-    if result.get("default"):
-        cleaned["default"] = result["default"]
-    return cleaned
-
-
-def _apply_policy_payloads(payloads: list[str], user: User, session) -> None:
-    if not payloads:
-        return
-
-    ttl = timedelta(days=1)
-    now = datetime.utcnow()
-    entries: list[tuple[str, dict]] = []
-
-    for payload in payloads:
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            logging.warning("Failed to parse POLICY payload: %s", payload)
-            continue
-        if not isinstance(data, dict):
-            continue
-
-        if "by_mode" in data and isinstance(data["by_mode"], dict):
-            for mode, rules in data["by_mode"].items():
-                if isinstance(rules, dict):
-                    entries.append((mode.lower(), rules))
-            continue
-
-        if "plan_mode" in data and isinstance(data["plan_mode"], str):
-            mode_key = data["plan_mode"].lower()
-            rules = {k: v for k, v in data.items() if k not in {"plan_mode", "by_mode"}}
-            entries.append((mode_key, rules))
-            continue
-
-        entries.append(("default", data))
-
-    if not entries:
-        return
-
-    active_policies = list(
-        session.exec(
-            select(UserPolicy).where(
-                UserPolicy.user_id == user.id, UserPolicy.active.is_(True)
-            )
-        )
-    )
-    for row in active_policies:
-        row.active = False
-        session.add(row)
-
-    for mode, payload in entries:
-        session.add(
-            UserPolicy(
-                user_id=user.id,
-                mode=mode or "default",
-                payload=payload or {},
-                ttl_days=1,
-                active=True,
-                created_at=now,
-                expires_at=now + ttl,
-            )
-        )
-
-    summary = ", ".join(sorted({mode or "default" for mode, _ in entries}))
-    session.add(
-        AssistantMessage(
-            user_id=user.id,
-            role="assistant",
-            content=f"Policy updated for {summary}. Expires in 24h.",
-        )
-    )
-
-
-def _active_policy_status(session, user: User) -> list[dict[str, object]]:
-    now = datetime.utcnow()
-    rows = list(
-        session.exec(
-            select(UserPolicy).where(
-                UserPolicy.user_id == user.id, UserPolicy.active.is_(True)
-            )
-        )
-    )
-    status: list[dict[str, object]] = []
-    changed = False
-    for row in rows:
-        if row.expires_at and row.expires_at <= now:
-            row.active = False
-            session.add(row)
-            changed = True
-            continue
-        status.append(
-            {
-                "mode": row.mode or "default",
-                "expires_at": row.expires_at,
-                "payload": row.payload or {},
-            }
-        )
-    if changed:
-        session.commit()
-    return status
-
-
-def _clear_policies(session, user: User) -> bool:
-    rows = list(
-        session.exec(
-            select(UserPolicy).where(
-                UserPolicy.user_id == user.id, UserPolicy.active.is_(True)
-            )
-        )
-    )
-    if not rows:
-        return False
-    for row in rows:
-        row.active = False
-        session.add(row)
-    session.commit()
-    return True
-
-
-def _policy_for_mode(
-    data: dict[str, object] | None, mode: str
-) -> dict[str, object] | None:
-    if not data:
-        return None
-    result: dict[str, object] | None = None
-    by_mode = data.get("by_mode") if isinstance(data, dict) else None
-    if isinstance(by_mode, dict):
-        selected = by_mode.get(mode)
-        if isinstance(selected, dict):
-            result = selected
-    if not result:
-        default_policy = data.get("default") if isinstance(data, dict) else None
-        if isinstance(default_policy, dict):
-            result = default_policy
-    if not result and isinstance(data, dict):
-        fallback = {k: v for k, v in data.items() if k not in {"by_mode", "default"}}
-        if fallback:
-            result = fallback
-    return result
-
-
-def _summarize_plans(user: User, session) -> tuple[str, int, int]:
-    policy_bundle = _load_existing_policy(session, user)
-
-    def compute(mode: str):
-        plan, _, _, _ = build_plan(user, session, mode=mode)
-        active = _policy_for_mode(policy_bundle, mode)
-        if active:
-            plan, _, _, _ = build_plan_with_policy(user, session, active, mode=mode)
-        return plan
-
-    variety_plan = compute("variety")
-    cheapest_plan = compute("cheapest")
-
-    def summarize(plan, tag):
-        if not plan:
-            return f"{tag}: no activities available"
-        details = []
-        for a in plan[:3]:
-            item = f"{a.title[:60]} ({a.credits:.1f} cr)"
-            elig_bits = []
-            if not getattr(a, "open_to_public", True):
-                elig_bits.append("restricted access")
-            text = (a.eligibility_text or "").strip()
-            if text:
-                snippet = text[:60] + ("…" if len(text) > 60 else "")
-                elig_bits.append(snippet)
-            if elig_bits:
-                item += f" [elig: {'; '.join(elig_bits)}]"
-            details.append(item)
-        top = ", ".join(details)
-        total = sum(a.credits for a in plan)
-        return f"{tag}: {total:.1f} cr — {top}"
-
-    summary_text = "\n".join(
-        [
-            "Plan refresh:",
-            summarize(variety_plan, "Variety"),
-            summarize(cheapest_plan, "Cheapest"),
-        ]
-    )
-
-    return summary_text, len(variety_plan), len(cheapest_plan)
 
 
 def _derive_controls(
@@ -894,10 +563,7 @@ def _derive_controls(
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    plan_mode = request.query_params.get("plan_mode", "variety") or "variety"
-    plan_mode = plan_mode.lower()
-    if plan_mode not in {"cheapest", "variety"}:
-        plan_mode = "variety"
+    plan_mode = "variety"
 
     policy_status_entries: list[dict[str, object]] = []
 
@@ -935,10 +601,23 @@ def home(request: Request):
             )
         )
 
-        policy_data = _load_existing_policy(session, user)
-        active_policy = _policy_for_mode(policy_data, plan_mode)
+        if not msgs:
+            welcome = AssistantMessage(
+                user_id=user.id,
+                role="assistant",
+                content=(
+                    "Welcome! Let me know your CME priorities and I’ll start building a plan."
+                ),
+            )
+            session.add(welcome)
+            session.commit()
+            msgs = [welcome]
+
+        plan_manager = PlanManager(session)
+        policy_bundle = load_policy_bundle(session, user)
+        active_policy = policy_for_mode(policy_bundle, plan_mode)
         policy_status_entries = []
-        for entry in _active_policy_status(session, user):
+        for entry in active_policy_status(session, user):
             expires_at = entry.get("expires_at")
             hours_left = None
             if isinstance(expires_at, datetime):
@@ -956,7 +635,21 @@ def home(request: Request):
                 }
             )
 
-        plan, plan_summary = _build_plan_payload(user, session, plan_mode)
+        force_refresh = request.query_params.get("refresh", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        plan_run = plan_manager.ensure_plan(
+            user,
+            plan_mode,
+            policy_bundle,
+            force_refresh=force_refresh,
+            reason="home_refresh" if force_refresh else None,
+        )
+        plan, plan_summary, plan_requirements = plan_manager.serialize_plan(
+            plan_run, user
+        )
         requirements_data = load_abpn_psychiatry_requirements()
         validation = validate_against_requirements(user, claims, requirements_data)
         claims = list(session.exec(select(Claim).where(Claim.user_id == user.id)))
@@ -967,9 +660,9 @@ def home(request: Request):
                 "user": user,
                 "plan": plan,
                 "plan_summary": plan_summary,
+                "plan_requirements": plan_requirements,
                 "claims": claims,
                 "assistant_messages": msgs,
-                "plan_mode": plan_mode,
                 "validation": validation,
                 "active_policy": active_policy,
                 "policy_status": policy_status_entries,
@@ -983,14 +676,28 @@ def home(request: Request):
 
 @app.get("/fragment/plan", response_class=HTMLResponse)
 def plan_fragment(request: Request, plan_mode: str = Query("variety")):
-    plan_mode = (plan_mode or "variety").lower()
-    if plan_mode not in {"cheapest", "variety"}:
-        plan_mode = "variety"
+    plan_mode = "variety"
     with get_session() as session:
         user = session.exec(select(User)).first()
         if not user:
             return HTMLResponse("", status_code=204)
-        plan, plan_summary = _build_plan_payload(user, session, plan_mode)
+        plan_manager = PlanManager(session)
+        policy_bundle = load_policy_bundle(session, user)
+        force_refresh = request.query_params.get("refresh", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        plan_run = plan_manager.ensure_plan(
+            user,
+            plan_mode,
+            policy_bundle,
+            force_refresh=force_refresh,
+            reason="fragment_refresh" if force_refresh else None,
+        )
+        plan, plan_summary, plan_requirements = plan_manager.serialize_plan(
+            plan_run, user
+        )
         return templates.TemplateResponse(
             "_plan.html",
             {
@@ -998,8 +705,8 @@ def plan_fragment(request: Request, plan_mode: str = Query("variety")):
                 "user": user,
                 "plan": plan,
                 "plan_summary": plan_summary,
+                "plan_requirements": plan_requirements,
                 "plan_mode": plan_mode,
-                "current_mode": plan_mode,
             },
         )
 
@@ -1087,7 +794,7 @@ def log(request: Request):
             else None
         )
         if user:
-            for entry in _active_policy_status(session, user):
+            for entry in active_policy_status(session, user):
                 expires_at = entry.get("expires_at")
                 hours_left = None
                 if isinstance(expires_at, datetime):
@@ -1187,42 +894,25 @@ def assist():
         user = session.exec(select(User)).first()
         if not user:
             return JSONResponse({"error": "no_user"}, status_code=400)
-        # Build current plan snapshot using same policy logic as home
-        policy_bundle = _load_existing_policy(session, user)
-        active_policy = _policy_for_mode(policy_bundle, "variety")
-        if active_policy:
-            chosen, total_credits, total_cost, days_used = build_plan_with_policy(
-                user, session, active_policy, mode="variety"
-            )
-        else:
-            chosen, total_credits, total_cost, days_used = build_plan(
-                user, session, mode="variety"
-            )
-        plan = []
-        for a in chosen:
-            pricing = getattr(a, "_pricing_context", None) or pricing_context_for_user(
-                user, a
-            )
-            deadline_obj = pricing.get("deadline")
-            if isinstance(deadline_obj, date):
-                deadline_str = deadline_obj.isoformat()
-            else:
-                deadline_str = None
-            plan.append(
-                {
-                    "title": a.title,
-                    "provider": a.provider,
-                    "credits": a.credits,
-                    "cost": pricing.get("cost", a.cost_usd),
-                    "base_cost": pricing.get("base_cost", a.cost_usd),
-                    "price_label": pricing.get("label"),
-                    "deadline": deadline_str,
-                    "modality": a.modality,
-                    "city": a.city,
-                    "hybrid_available": pricing.get("hybrid_available")
-                    or getattr(a, "hybrid_available", False),
-                }
-            )
+        plan_manager = PlanManager(session)
+        policy_bundle = load_policy_bundle(session, user)
+        run = plan_manager.ensure_plan(user, "variety", policy_bundle)
+        plan_entries, _, _ = plan_manager.serialize_plan(run, user)
+        plan = [
+            {
+                "title": entry.get("title"),
+                "provider": entry.get("provider"),
+                "credits": entry.get("credits"),
+                "cost": entry.get("cost"),
+                "base_cost": entry.get("base_cost"),
+                "price_label": entry.get("price_label"),
+                "deadline": entry.get("deadline_text"),
+                "modality": entry.get("modality"),
+                "city": entry.get("city"),
+                "hybrid_available": entry.get("hybrid_available"),
+            }
+            for entry in plan_entries
+        ]
         claims = list(session.exec(select(Claim).where(Claim.user_id == user.id)))
 
     # Compose system/user prompt
@@ -1517,7 +1207,7 @@ def assist_command(command: str = Form(...)):
         user = session.exec(select(User)).first()
         if not user:
             return RedirectResponse("/", status_code=303)
-        _apply_policy_payloads([json.dumps(policy)], user, session)
+        apply_policy_payloads([json.dumps(policy)], user, session)
 
     return RedirectResponse("/?policy=1", status_code=303)
 
@@ -1579,6 +1269,7 @@ def chat_send(request: Request, text: str = Form(...)):
                 session.commit()
                 session.refresh(user)
 
+            plan_manager = PlanManager(session)
             user_message = AssistantMessage(
                 user_id=user.id, role="user", content=text.strip()[:4000]
             )
@@ -1593,7 +1284,7 @@ def chat_send(request: Request, text: str = Form(...)):
                 pending_notes.append(note_text)
 
             if normalized_text in {"clear policy", "clear policies", "reset policy"}:
-                cleared = _clear_policies(session, user)
+                cleared = clear_policies(session, user)
                 response_text = (
                     "Policy cleared. Planner reset."
                     if cleared
@@ -1603,8 +1294,12 @@ def chat_send(request: Request, text: str = Form(...)):
                     user_id=user.id, role="assistant", content=response_text
                 )
                 session.add(confirm)
-                summary_text, variety_count, cheapest_count = _summarize_plans(
-                    user, session
+                plan_manager = PlanManager(session)
+                policy_bundle = load_policy_bundle(session, user)
+                summary_text, variety_count, cheapest_count = (
+                    plan_manager.summarize_modes(
+                        user, policy_bundle, force_refresh=True
+                    )
                 )
                 summary_msg = AssistantMessage(
                     user_id=user.id,
@@ -1728,7 +1423,7 @@ def chat_send(request: Request, text: str = Form(...)):
             session.add(assistant_message)
 
             extra_messages = _apply_patch_if_present(patch_payloads, user, session)
-            _apply_policy_payloads(policy_payloads, user, session)
+            apply_policy_payloads(policy_payloads, user, session)
 
             confirmations: list[AssistantMessage] = []
             for note_text in pending_notes:
@@ -1771,6 +1466,7 @@ def chat_send(request: Request, text: str = Form(...)):
             except Exception:
                 logging.exception("Remaining adjustment failed")
 
+            ingest_success = False
             if should_ingest:
                 try:
                     try:
@@ -1789,11 +1485,17 @@ def chat_send(request: Request, text: str = Form(...)):
                             new_loop.close()
                     else:
                         asyncio.run(ingest_psychiatry_online_ai(count=10, debug=False))
+                    ingest_success = True
                 except Exception:
                     logging.exception("ingest during chat failed")
+                if ingest_success:
+                    PlanManager.invalidate_user_plans(
+                        session, user.id, reason="ingest_refresh"
+                    )
 
-            plan_summary, variety_count, cheapest_count = _summarize_plans(
-                user, session
+            policy_bundle = load_policy_bundle(session, user)
+            plan_summary, variety_count, cheapest_count = plan_manager.summarize_modes(
+                user, policy_bundle, force_refresh=ingest_success
             )
 
             if should_ingest:
@@ -1870,6 +1572,7 @@ def plan_remove(title: str = Form(...)):
             AssistantMessage(user_id=user.id, content="POLICY:" + json.dumps(policy))
         )
         session.add(AssistantMessage(user_id=user.id, content=f"Removed: {title}"))
+        PlanManager.invalidate_user_plans(session, user.id, reason="plan_remove")
         session.commit()
     return RedirectResponse("/", status_code=303)
 
@@ -1893,7 +1596,7 @@ def policy_clear(request: Request):
         user = session.exec(select(User)).first()
         if not user:
             return HTMLResponse("", status_code=204)
-        cleared = _clear_policies(session, user)
+        cleared = clear_policies(session, user)
         message = (
             "Policy cleared. Planner reset."
             if cleared
@@ -1901,7 +1604,11 @@ def policy_clear(request: Request):
         )
         note = AssistantMessage(user_id=user.id, role="assistant", content=message)
         session.add(note)
-        summary_text, variety_count, cheapest_count = _summarize_plans(user, session)
+        plan_manager = PlanManager(session)
+        policy_bundle = load_policy_bundle(session, user)
+        summary_text, variety_count, cheapest_count = plan_manager.summarize_modes(
+            user, policy_bundle, force_refresh=True
+        )
         summary_msg = AssistantMessage(
             user_id=user.id,
             role="assistant",

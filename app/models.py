@@ -1,9 +1,13 @@
 from __future__ import annotations
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import List, Optional
 from sqlalchemy import Column
 from sqlalchemy.types import JSON
 from sqlmodel import SQLModel, Field
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class User(SQLModel, table=True):
@@ -56,6 +60,9 @@ class Activity(SQLModel, table=True):
     pricing_options: Optional[List[dict]] = Field(
         default_factory=list, sa_column=Column(JSON)
     )
+    requirement_tags: Optional[List[str]] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
 
 
 class Claim(SQLModel, table=True):
@@ -67,11 +74,40 @@ class Claim(SQLModel, table=True):
     source_text: str
 
 
+class PlanRun(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id")
+    mode: str = "variety"
+    generated_at: datetime = Field(default_factory=utcnow)
+    status: str = "active"  # active | stale | superseded
+    reason: Optional[str] = None
+    total_credits: float = 0.0
+    total_cost: float = 0.0
+    days_used: int = 0
+    remaining_credits: float = 0.0
+    requirement_focus: Optional[List[str]] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    context: Optional[dict] = Field(default_factory=dict, sa_column=Column(JSON))
+
+
 class PlanItem(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id")
     activity_id: int = Field(foreign_key="activity.id")
+    plan_run_id: Optional[int] = Field(default=None, foreign_key="planrun.id")
+    mode: str = "variety"
+    position: int = 0
     chosen: bool = True
+    pricing_snapshot: Optional[dict] = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
+    requirement_snapshot: Optional[dict] = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
+    eligibility_status: Optional[str] = None
+    notes: Optional[str] = None
+    generated_at: datetime = Field(default_factory=utcnow)
 
 
 class AssistantMessage(SQLModel, table=True):
@@ -79,7 +115,7 @@ class AssistantMessage(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.id")
     role: str = "assistant"  # 'user' | 'assistant'
     content: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class RequirementsSnapshot(SQLModel, table=True):
@@ -93,7 +129,7 @@ class RequirementsSnapshot(SQLModel, table=True):
     )
     rules: Optional[dict] = Field(default_factory=dict, sa_column=Column(JSON))
     content_hash: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class UserPolicy(SQLModel, table=True):
@@ -103,7 +139,7 @@ class UserPolicy(SQLModel, table=True):
     payload: Optional[dict] = Field(default_factory=dict, sa_column=Column(JSON))
     ttl_days: int = 1
     active: bool = True
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
     expires_at: Optional[datetime] = None
 
 
@@ -111,4 +147,4 @@ class CompletedActivity(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id")
     activity_id: int = Field(foreign_key="activity.id")
-    completed_at: datetime = Field(default_factory=datetime.utcnow)
+    completed_at: datetime = Field(default_factory=utcnow)

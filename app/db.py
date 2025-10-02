@@ -100,6 +100,13 @@ def _apply_migrations() -> None:
                     "UPDATE activity SET pricing_options='[]' WHERE pricing_options IS NULL OR pricing_options=''"
                 )
             )
+        if "requirement_tags" not in names:
+            conn.execute(text("ALTER TABLE activity ADD COLUMN requirement_tags TEXT"))
+            conn.execute(
+                text(
+                    "UPDATE activity SET requirement_tags='[]' WHERE requirement_tags IS NULL OR requirement_tags=''"
+                )
+            )
 
         # AssistantMessage: add role
         cols_m = conn.execute(text("PRAGMA table_info(assistantmessage)")).fetchall()
@@ -163,6 +170,79 @@ def _apply_migrations() -> None:
             )
         except Exception:
             pass
+
+        try:
+            conn.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS planrun ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "user_id INTEGER,"
+                    "mode TEXT,"
+                    "generated_at TIMESTAMP,"
+                    "status TEXT,"
+                    "reason TEXT,"
+                    "total_credits REAL,"
+                    "total_cost REAL,"
+                    "days_used INTEGER,"
+                    "remaining_credits REAL,"
+                    "requirement_focus TEXT,"
+                    "context TEXT"
+                    ")"
+                )
+            )
+        except Exception:
+            pass
+
+        try:
+            cols_pi = conn.execute(text("PRAGMA table_info(planitem)")).fetchall()
+        except Exception:
+            cols_pi = []
+        if cols_pi:
+            pi_names = {row[1] for row in cols_pi}
+            if "plan_run_id" not in pi_names:
+                conn.execute(
+                    text("ALTER TABLE planitem ADD COLUMN plan_run_id INTEGER")
+                )
+            if "mode" not in pi_names:
+                conn.execute(text("ALTER TABLE planitem ADD COLUMN mode TEXT"))
+                conn.execute(
+                    text(
+                        "UPDATE planitem SET mode='variety' WHERE mode IS NULL OR mode=''"
+                    )
+                )
+            if "position" not in pi_names:
+                conn.execute(text("ALTER TABLE planitem ADD COLUMN position INTEGER"))
+                conn.execute(
+                    text("UPDATE planitem SET position=0 WHERE position IS NULL")
+                )
+            if "pricing_snapshot" not in pi_names:
+                conn.execute(
+                    text("ALTER TABLE planitem ADD COLUMN pricing_snapshot TEXT")
+                )
+                conn.execute(
+                    text(
+                        "UPDATE planitem SET pricing_snapshot='{}' WHERE pricing_snapshot IS NULL OR pricing_snapshot=''"
+                    )
+                )
+            if "requirement_snapshot" not in pi_names:
+                conn.execute(
+                    text("ALTER TABLE planitem ADD COLUMN requirement_snapshot TEXT")
+                )
+                conn.execute(
+                    text(
+                        "UPDATE planitem SET requirement_snapshot='{}' WHERE requirement_snapshot IS NULL OR requirement_snapshot=''"
+                    )
+                )
+            if "eligibility_status" not in pi_names:
+                conn.execute(
+                    text("ALTER TABLE planitem ADD COLUMN eligibility_status TEXT")
+                )
+            if "notes" not in pi_names:
+                conn.execute(text("ALTER TABLE planitem ADD COLUMN notes TEXT"))
+            if "generated_at" not in pi_names:
+                conn.execute(
+                    text("ALTER TABLE planitem ADD COLUMN generated_at TIMESTAMP")
+                )
 
 
 def purge_seed_activities() -> None:

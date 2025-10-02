@@ -9,9 +9,47 @@ from typing import Dict, List, Optional
 from .models import User, Claim, RequirementsSnapshot
 from .db import get_session
 from sqlalchemy import select as sa_select
+from .knowledge import get as get_knowledge_base
 
 LOGGER = logging.getLogger(__name__)
 CONFIG_PATH = Path(__file__).parent / "config" / "abpn_psychiatry_requirements.json"
+
+
+SA_CME_KEYWORDS = [
+    "sa-cme",
+    "self assessment",
+    "self-assessment",
+    "knowledge self-assessment",
+    "ksa",
+    "self assessment module",
+    "sam",
+]
+
+PIP_KEYWORDS = [
+    "pip",
+    "performance improvement",
+    "practice improvement",
+    "quality improvement",
+    "chart review",
+    "reassessment",
+    "improvement plan",
+]
+
+
+PATIENT_SAFETY_KEYWORDS = [
+    "patient safety",
+    "risk management",
+    "error prevention",
+    "quality improvement",
+    "safety culture",
+    "safety training",
+]
+
+REQUIREMENT_LABELS = {
+    "patient_safety": "Patient Safety Activity",
+    "sa_cme": "Self-Assessment CME",
+    "pip": "Performance Improvement (PIP)",
+}
 
 
 @dataclass
@@ -51,36 +89,103 @@ def _safe_requirements() -> dict:
     }
 
 
-def load_abpn_psychiatry_requirements() -> dict:
+def _normalize_requirements_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("Requirements payload must be a dict")
+
+    data = dict(payload)
+    data.setdefault("board", SAFE_DEFAULT.board)
+    data.setdefault("specialty", SAFE_DEFAULT.specialty)
+    data.setdefault("version", SAFE_DEFAULT.version)
+
+    sources = data.get("sources") or []
+    if not isinstance(sources, list):
+        sources = [sources]
+    data["sources"] = [str(src) for src in sources if src]
+
+    rules_input = data.get("rules") or {}
+    if not isinstance(rules_input, dict):
+        rules_input = {}
+    rules = dict(rules_input)
+
+    def _int_or(default_key: str, candidate) -> int:
+        try:
+            return int(candidate)
+        except (TypeError, ValueError):
+            return int(rules.get(default_key) or 0)
+
+    total = rules.get("total_credits")
+    if total is None:
+        total = _int_or("total_credits", rules.get("cme_total_per_cycle"))
+    rules["total_credits"] = int(total or 0)
+
     try:
-        with CONFIG_PATH.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-            if not isinstance(data, dict):
-                raise ValueError("requirements JSON must be a dict")
-            # Basic validation
-            data.setdefault("board", SAFE_DEFAULT.board)
-            data.setdefault("specialty", SAFE_DEFAULT.specialty)
-            data.setdefault("version", SAFE_DEFAULT.version)
-            data.setdefault("sources", [])
-            if not isinstance(data["sources"], list):
-                data["sources"] = []
-            data.setdefault("rules", {})
-            if not isinstance(data["rules"], dict):
-                data["rules"] = {}
-            rules = data["rules"]
-            rules.setdefault("cycle_years", 0)
-            rules.setdefault("total_credits", 0)
-            rules.setdefault("annual_minimum", 0)
-            rules.setdefault("safety_or_ethics_min", 0)
-            rules.setdefault("audit_evidence_notes", "")
-            return data
-    except FileNotFoundError:
-        LOGGER.warning("Requirements config missing at %s", CONFIG_PATH)
-    except json.JSONDecodeError:
-        LOGGER.exception("Failed to parse requirements JSON")
-    except Exception:
-        LOGGER.exception("Unexpected error loading requirements")
+        rules["cycle_years"] = int(rules.get("cycle_years") or 0)
+    except (TypeError, ValueError):
+        rules["cycle_years"] = 0
+
+    if "annual_minimum" not in rules:
+        rules["annual_minimum"] = _int_or(
+            "annual_minimum", rules.get("annual_minimum_credits")
+        )
+    try:
+        rules["annual_minimum"] = int(rules.get("annual_minimum") or 0)
+    except (TypeError, ValueError):
+        rules["annual_minimum"] = 0
+
+    safety_block = rules.get("patient_safety_activity")
+    safety_min = rules.get("safety_or_ethics_min")
+    if isinstance(safety_block, dict) and safety_block.get("required"):
+        rules["safety_or_ethics_min"] = max(int(safety_min or 0), 1)
+    else:
+        try:
+            rules["safety_or_ethics_min"] = int(safety_min or 0)
+        except (TypeError, ValueError):
+            rules["safety_or_ethics_min"] = 0
+
+    try:
+        rules["sa_cme_min_per_cycle"] = float(rules.get("sa_cme_min_per_cycle") or 0.0)
+    except (TypeError, ValueError):
+        rules["sa_cme_min_per_cycle"] = 0.0
+
+    try:
+        rules["pip_required_per_cycle"] = int(rules.get("pip_required_per_cycle") or 0)
+    except (TypeError, ValueError):
+        rules["pip_required_per_cycle"] = 0
+
+    rules["audit_evidence_notes"] = str(rules.get("audit_evidence_notes") or "")
+
+    data["rules"] = rules
+    return data
+
+
+def _load_requirements_from_file(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError("requirements JSON must be a dict")
+    return data
+
+
+def load_requirements_for(board: str, specialty: str) -> dict:
+    kb = get_knowledge_base(board, specialty)
+    if kb:
+        try:
+            data = kb.load_requirements()
+            return _normalize_requirements_payload(data)
+        except Exception:
+            LOGGER.exception("knowledge base load failed for %s %s", board, specialty)
+    if board.lower() == "abpn" and specialty.lower() == "psychiatry":
+        try:
+            data = _load_requirements_from_file(CONFIG_PATH)
+            return _normalize_requirements_payload(data)
+        except Exception:
+            LOGGER.exception("Failed to read ABPN psychiatry requirements file")
     return _safe_requirements()
+
+
+def load_abpn_psychiatry_requirements() -> dict:
+    return load_requirements_for("ABPN", "Psychiatry")
 
 
 def requirements_version(req: dict) -> str:
@@ -101,32 +206,69 @@ def requirements_rules(req: dict) -> dict:
     return rules
 
 
+def _claim_text(claim: Claim) -> str:
+    parts = [
+        claim.topic or "",
+        claim.source_text or "",
+    ]
+    return " ".join(filter(None, parts)).lower()
+
+
 def classify_topic(claim: Claim) -> Optional[str]:
-    text = " ".join(
-        filter(
-            None,
-            [
-                claim.topic or "",
-                claim.source_text or "",
-            ],
-        )
-    ).lower()
-    keywords = {
-        "ethics": "ethic",
-        "safety": "patient safety",
-        "risk": "risk",
-        "opioid": "opioid safety",
-    }
-    for label, needle in keywords.items():
-        if needle in text:
-            if label == "ethics":
-                return "ethics"
-            return "safety"
+    text = _claim_text(claim)
+    if not text:
+        return None
     if "ethic" in text:
         return "ethics"
-    if "safety" in text:
-        return "safety"
+    safety_needles = list(PATIENT_SAFETY_KEYWORDS) + ["opioid safety", "risk", "safety"]
+    for needle in safety_needles:
+        if needle in text:
+            return "safety"
     return None
+
+
+def is_sa_cme_claim(claim: Claim) -> bool:
+    text = _claim_text(claim)
+    if not text:
+        return False
+    return any(keyword in text for keyword in SA_CME_KEYWORDS)
+
+
+def is_pip_claim(claim: Claim) -> bool:
+    text = _claim_text(claim)
+    if not text:
+        return False
+    return any(keyword in text for keyword in PIP_KEYWORDS)
+
+
+def infer_requirement_tags_from_text(*parts: object) -> set[str]:
+    text = " ".join(str(p).lower() for p in parts if p).strip()
+    tags: set[str] = set()
+    if not text:
+        return tags
+    if any(keyword in text for keyword in PATIENT_SAFETY_KEYWORDS):
+        tags.add("patient_safety")
+    if any(keyword in text for keyword in SA_CME_KEYWORDS):
+        tags.add("sa_cme")
+    if any(keyword in text for keyword in PIP_KEYWORDS):
+        tags.add("pip")
+    return tags
+
+
+def sa_cme_credit_sum(claims: List[Claim]) -> float:
+    total = 0.0
+    for claim in claims:
+        if is_sa_cme_claim(claim):
+            total += float(claim.credits or 0.0)
+    return total
+
+
+def pip_activity_count(claims: List[Claim]) -> int:
+    count = 0
+    for claim in claims:
+        if is_pip_claim(claim):
+            count += 1
+    return count
 
 
 def _annual_credits(claims: List[Claim]) -> Dict[int, float]:
@@ -141,7 +283,9 @@ def _annual_credits(claims: List[Claim]) -> Dict[int, float]:
 
 def validate_against_requirements(user: User, claims: List[Claim], req: dict) -> dict:
     rules = requirements_rules(req)
-    target_total = int(rules.get("total_credits") or 0)
+    target_total = int(
+        rules.get("total_credits") or rules.get("cme_total_per_cycle") or 0
+    )
     if getattr(user, "target_credits", 0) and user.target_credits > 0:
         target_total = int(user.target_credits)
     earned_total = sum(float(c.credits or 0.0) for c in claims)
@@ -198,6 +342,62 @@ def validate_against_requirements(user: User, claims: List[Claim], req: dict) ->
             {
                 "label": "Safety/Ethics minimum",
                 "status": status_bucket,
+                "detail": detail,
+            }
+        )
+
+    # Self-Assessment CME minimum
+    sa_min = float(rules.get("sa_cme_min_per_cycle") or 0)
+    if sa_min > 0:
+        sa_total = sa_cme_credit_sum(claims)
+        short_sa = sa_min - sa_total
+        status_sa = "ok"
+        if short_sa > 0:
+            status_sa = "warn" if short_sa < 1.0 else "fail"
+        detail = f"{sa_total:.1f} of {sa_min} SA-CME credits documented"
+        checks.append(
+            {
+                "label": "Self-Assessment CME",
+                "status": status_sa,
+                "detail": detail,
+            }
+        )
+
+    # Performance Improvement (PIP) requirement
+    pip_required = int(rules.get("pip_required_per_cycle") or 0)
+    if pip_required > 0:
+        pip_completed = pip_activity_count(claims)
+        short_pip = pip_required - pip_completed
+        status_pip = "ok" if short_pip <= 0 else "fail"
+        detail = f"{pip_completed} of {pip_required} PIP activities documented"
+        checks.append(
+            {
+                "label": "Performance Improvement (PIP)",
+                "status": status_pip,
+                "detail": detail,
+            }
+        )
+
+    # Patient safety activity requirement (one-time per cycle)
+    safety_block = rules.get("patient_safety_activity")
+    if isinstance(safety_block, dict) and safety_block.get("required"):
+        safety_completed = False
+        for claim in claims:
+            if classify_topic(claim) == "safety":
+                safety_completed = True
+                break
+        detail = (
+            "At least one patient safety activity completed"
+            if safety_completed
+            else "No patient safety activity logged yet"
+        )
+        status = "ok" if safety_completed else "warn"
+        if safety_block.get("portal_determined") and not safety_completed:
+            detail += "; verify status in ABPN Physician Portal"
+        checks.append(
+            {
+                "label": "Patient safety activity",
+                "status": status,
                 "detail": detail,
             }
         )

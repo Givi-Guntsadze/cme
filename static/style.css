@@ -84,3 +84,7 @@ button:focus, a.button:focus, .btn:focus { outline: none; box-shadow: 0 0 0 2px 
 .badge.policy { background:#fef9c3; color:#854d0e; }
 .linklike { background:none; border:none; padding:0; color:#2563eb; cursor:pointer; text-decoration:underline; font: inherit; }
 .linklike:hover { text-decoration:none; }
+
+.requirement-banner { background:#f0f9ff; border-left:4px solid #0ea5e9; padding:8px 12px; border-radius:12px; margin:8px 0 12px; color:#0c4a6e; font-size:14px; }
+.badge.requirement { background:#e0f2fe; color:#0c4a6e; margin-left:8px; }
+.badge.requirement.warn { background:#fee2e2; color:#b91c1c; }

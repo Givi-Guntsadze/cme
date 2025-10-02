@@ -13,11 +13,22 @@ from sqlmodel import select
 
 from .db import get_session
 from .models import Activity, User
+from .requirements import infer_requirement_tags_from_text
 
 logger = logging.getLogger(__name__)
 
 # In-memory page cache for a single ingest run
 _page_cache: Dict[str, str] = {}
+
+
+def _infer_requirement_tags(
+    title: str, summary: str, extras: list[str] | None = None
+) -> list[str]:
+    parts = [title, summary]
+    if extras:
+        parts.extend(extras)
+    tags = infer_requirement_tags_from_text(*parts)
+    return sorted(tags)
 
 
 def _redact_key(text: str) -> str:
@@ -527,6 +538,23 @@ def _insert_items(items: List[dict]) -> tuple[int, Dict[str, int]]:
 
                 source_val = (it.get("source") or "web").strip().lower() or "web"
 
+                extra_texts: list[str] = [
+                    raw_eligibility,
+                    it.get("summary") or "",
+                    it.get("snippet") or "",
+                    " ".join(eligibility_data["eligible_institutions"]),
+                    " ".join(eligibility_data["eligible_groups"]),
+                    eligibility_data["membership_required"] or "",
+                ]
+                if pricing_options:
+                    for opt in pricing_options:
+                        if isinstance(opt, dict):
+                            extra_texts.append(str(opt.get("label") or ""))
+                            extra_texts.append(str(opt.get("notes") or ""))
+                requirement_tags = _infer_requirement_tags(
+                    title or "", summary or "", extra_texts
+                )
+
                 a = Activity(
                     title=title[:200],
                     provider=provider[:120],
@@ -560,6 +588,7 @@ def _insert_items(items: List[dict]) -> tuple[int, Dict[str, int]]:
                     open_to_public=eligibility_data["open_to_public"],
                     hybrid_available=hybrid_available,
                     pricing_options=pricing_options,
+                    requirement_tags=requirement_tags,
                 )
                 s.add(a)
                 added += 1

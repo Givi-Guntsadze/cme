@@ -5,20 +5,12 @@
       hx-post="/ingest"
       hx-swap="none"
       hx-on::before-request="this.dataset.originalText=this.textContent; this.disabled=true; this.textContent='Discovering…';"
-      hx-on::after-request="(function(btn, evt){ if(btn.dataset){ btn.textContent=btn.dataset.originalText||'Discover'; btn.disabled=false; } try { const xhr = evt.detail && evt.detail.xhr; if (xhr) { let data = {}; try { data = JSON.parse(xhr.responseText || '{}'); } catch (err) { data = {}; } if (typeof data.ingested !== 'undefined') { const params = new URLSearchParams(window.location.search); params.set('added', data.ingested || 0); if (typeof data.google_inserted !== 'undefined') { params.set('gcount', data.google_inserted || 0); } if (typeof data.ai_inserted !== 'undefined') { params.set('acount', data.ai_inserted || 0); } params.set('fallback', data.used_fallback ? '1' : '0'); history.replaceState(null, '', '?' + params.toString()); const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#f0fff4;border-left:4px solid #34d399;padding:8px 12px;margin:8px 0;\'>Imported ' + (data.ingested || 0) + ' new activities — Web: ' + (data.google_inserted || 0) + ', AI: ' + (data.ai_inserted || 0) + (data.used_fallback ? ' (fallback used)' : '') + '.</div>'; } const planRoot = document.getElementById('plan-card'); if (planRoot && window.htmx) { const mode = planRoot.dataset.planMode || 'variety'; window.htmx.ajax('GET', '/fragment/plan?plan_mode=' + mode, '#plan-card'); planRoot.dataset.planMode = mode; } return; } if (data.error) { const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#fff7f7;border-left:4px solid #f87171;padding:8px 12px;margin:8px 0;\'>' + data.error + '</div>'; } return; } } } catch (err) { console.error(err); } })(this, event);"
+      hx-on::after-request="(function(btn, evt){ if(btn.dataset){ btn.textContent=btn.dataset.originalText||'Discover'; btn.disabled=false; } try { const xhr = evt.detail && evt.detail.xhr; if (xhr) { let data = {}; try { data = JSON.parse(xhr.responseText || '{}'); } catch (err) { data = {}; } if (typeof data.ingested !== 'undefined') { const params = new URLSearchParams(window.location.search); params.set('added', data.ingested || 0); if (typeof data.google_inserted !== 'undefined') { params.set('gcount', data.google_inserted || 0); } if (typeof data.ai_inserted !== 'undefined') { params.set('acount', data.ai_inserted || 0); } params.set('fallback', data.used_fallback ? '1' : '0'); history.replaceState(null, '', '?' + params.toString()); const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#f0fff4;border-left:4px solid #34d399;padding:8px 12px;margin:8px 0;\'>Imported ' + (data.ingested || 0) + ' new activities — Web: ' + (data.google_inserted || 0) + ', AI: ' + (data.ai_inserted || 0) + (data.used_fallback ? ' (fallback used)' : '') + '.</div>'; } const planRoot = document.getElementById('plan-card'); if (planRoot && window.htmx) { window.htmx.ajax('GET', '/fragment/plan', '#plan-card'); } return; } if (data.error) { const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#fff7f7;border-left:4px solid #f87171;padding:8px 12px;margin:8px 0;\'>' + data.error + '</div>'; } return; } } } catch (err) { console.error(err); } })(this, event);"
       class="button"
       type="button"
     >Discover</button>
   </div>
-  <div class="tabs">
-    <a href="/?plan_mode=cheapest" class="btn{% if current_mode == 'cheapest' %} active{% endif %}">Cheapest</a>
-    <a href="/?plan_mode=variety" class="btn{% if current_mode == 'variety' %} active{% endif %}">Variety</a>
-  </div>
-  {% if current_mode == 'cheapest' %}
-    <p class="meta" style="margin-top:-4px;">Optimized for lowest cost per credit; may choose a single subscription.</p>
-  {% elif current_mode == 'variety' %}
-    <p class="meta" style="margin-top:-4px;">Optimized for balanced mix; avoids letting one item dominate.</p>
-  {% endif %}
+  <p class="meta" style="margin-top: -4px;">Current plan balances requirements, cost, and variety based on your profile.</p>
   {% if plan_summary %}
     <div class="meta plan-summary">
       {{ plan_summary.item_count }} {{ 'activity' if plan_summary.item_count == 1 else 'activities' }}
@@ -27,6 +19,11 @@
       {% if plan_summary.days_used %}
         • {{ plan_summary.days_used }} days off
       {% endif %}
+    </div>
+  {% endif %}
+  {% if plan_requirements and plan_requirements.messages %}
+    <div class="requirement-banner">
+      <strong>Requirement focus:</strong> {{ plan_requirements.messages | join(' • ') }}
     </div>
   {% endif %}
   {% if plan and plan|length > 0 %}
@@ -77,6 +74,24 @@
           {% if p.summary %}
             <div class="meta">{{ p.summary }}</div>
           {% endif %}
+          {% if p.requirement_tags %}
+            <div class="meta">
+              {% for tag in p.requirement_tags %}
+                <span class="badge requirement{% if tag.pending %} warn{% endif %}">
+                  {{ tag.label }}
+                  {% if tag.pending and tag.key == 'sa_cme' and tag.value %}
+                    ({{ '%.1f' % tag.value }} cr needed)
+                  {% elif tag.pending and tag.key == 'pip' and tag.value %}
+                    ({{ tag.value }} remaining)
+                  {% elif tag.pending and tag.key == 'patient_safety' %}
+                    (required)
+                  {% elif not tag.pending %}
+                    (covered)
+                  {% endif %}
+                </span>
+              {% endfor %}
+            </div>
+          {% endif %}
           <form method="post" action="/plan/remove" style="margin-top:6px;">
             <input type="hidden" name="title" value="{{ p.title }}" />
             <button type="submit" class="linklike" title="Remove this from plan">Remove</button>
@@ -85,6 +100,6 @@
       {% endfor %}
     </ul>
   {% else %}
-    <p>No plan yet or all requirements met.</p>
+    <p class="meta">We’re lining up activities that match your profile. Once discovery finishes, they’ll appear here.</p>
   {% endif %}
 </section>
