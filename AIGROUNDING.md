@@ -1,64 +1,48 @@
 # AI Grounding Snapshot
 
-_Last updated: 2025-09-27_
+_Last updated: 2025-10-03_
 
-## Project Context
-- Proof-of-concept assistant for ABPN-certified psychiatrists to plan, discover, and track CME/MOC credits.
-- Single-user FastAPI web app with SQLite persistence and Jinja/HTMX UI.
-- Chat-first workflow that keeps planning logic server-side but surfaces plans, compliance, and activity log in the browser.
+## Mission
+Deliver an AI-first CME concierge for ABPN psychiatrists. The assistant must interpret natural-language intent, reason about the 3-year / 90-credit obligation (including patient safety, SA-CME, and PIP sub-requirements), and orchestrate discovery so the surface plan always mirrors the latest goals.
 
-## Core Capabilities
-- **Profile & Preferences**: Collects target credits, budget, days off, city, live-event preferences, affiliations, memberships, and training level during setup or via chat-driven PATCH directives.
-- **Activity Catalog**: Starts with seeded activities and can ingest new ones via Google Programmable Search; falls back to OpenAI-powered page parsing when search results are sparse.
-- **Eligibility Awareness**: Normalizes institution, group, and membership constraints on activities, tracking whether each item is publicly available or needs profile data to confirm eligibility.
-- **Pricing Intelligence**: Stores tiered pricing (member, early-career, late/on-site) with registration deadlines and hybrid attendance, selecting the best-fit cost based on the user's memberships and career stage while flagging missing data or expiring rates.
-- **Plan Generation**: Uses persistent plan runs (`PlanRun`/`PlanItem`) so the assistant can explain and reuse plans across messages; delivers a single balanced plan that honors budget, modality, profile, and policy constraints.
-- **Requirement-Aware Planning**: Loads ABPN requirements through the knowledge-base registry and prioritizes gaps (patient safety, SA-CME, PIP) when scoring activities; highlights requirement tags and focus banners in the UI.
-- **Assistant Chat Loop**: Stores structured user/assistant messages, applies PATCH and POLICY directives, explains plan rationale, and turns natural language updates into claims or adjustments.
-- **Discovery & Ingestion**: Onboards new users by triggering Google CSE + OpenAI extraction in the background when the catalog is empty; parses pricing tiers, eligibility, and requirement cues per activity before inserting.
-- **Progress Tracking**: Parses user messages into Claim records, marks specific catalog items complete, recalculates remaining credits, and summarizes compliance against ABPN psychiatry requirements using the same rule source as the planner.
-- **Requirements Validation**: Loads versioned rules via the knowledge base, rendering pass/warn/fail checks plus source links; auto-tagged activities map to requirement badges in the plan.
-- **Operations & Debug**: Provides ingest debug hook, requirements sync endpoint, policy clear/reset flows, and simple health check.
+## Current System Prompt (high-level)
+- Presents the assistant as a dedicated CME concierge for a psychiatrist.
+- Requires reading the state snapshot (profile, remaining vs target credits, plan summary, requirement gaps, recent claims) before every reply.
+- Emphasises treating “I’d rather…” statements as future preferences, not logged credits.
+- Encourages concrete numerical reasoning (e.g., two 45-credit conferences cover the cycle) and proactive guidance when discovery yields no matches.
+- Allows control lines after the prose response:
+  - `PATCH: {...}` -> update profile fields (budget_usd, days_off, allow_live, city, specialty, target_credits, professional_stage, residency_completion_year, memberships).
+  - `POLICY: {...}` -> adjust planner heuristics (diversity weighting, avoid_terms, prefer_topics, etc.).
+  - `ACTION: discover` -> trigger ingestion/plan refresh when new activities are needed.
+- Forbids wrapping control lines in code fences or echoing their contents in prose.
 
-## Key Technologies & Integrations
-- **Backend**: FastAPI + SQLModel on SQLite, now with persistent plan run tables and knowledge-base registry; auto-ingestion uses asyncio-aware helpers.
-- **Frontend**: Jinja templates, HTMX partials, and basic styling in `static/style.css`.
-- **External Services**: OpenAI (assistant responses, fallback parsing, optional message parsing) and Google Custom Search (primary discovery pipeline).
+## Conversational Guardrails
+1. **Future vs Completion** – Only log credits when the user states a completion verb (“earned”, “logged”, “completed”). Preference phrasing no longer creates claims.
+2. **Snapshot Reasoning Order** – Remaining credits → requirement summary/gaps → plan summary/top items → profile preferences.
+3. **Tone & Tempo** – Warm, professional, concise (2–4 sentences + purposeful bullets). Optional clarifying question only when necessary. Responses include a 1.2 s think-time delay to feel human.
+4. **Empty Results** – When discovery finds nothing, explain why and suggest adjustments (budget, modality, memberships) instead of silently failing.
+5. **Eligibility Messaging** – UI shows “⚠️ Check eligibility” for uncertain cases; we avoid negative language while still flagging restrictions.
 
-## Known Constraints / Next Focus Areas
-- Auto-ingestion currently focuses on ABPN psychiatry; expand the knowledge base and ingest query builder for other specialties (family medicine, surgery) before launching more broadly.
-- Policy entries still expire after 24h; consider user-visible management or longer-lived preferences.
-- Pricing ingestion depends on page structure; additional heuristics or provider-specific adapters could tighten member rate detection.
-- Eligibility checks remain coarse when profile data is missing; prompt for affiliations/memberships to reduce "uncertain" statuses.
-- Extend requirement tagging beyond psychiatry once new specialty knowledge bases are added.
+## Architecture Highlights
+- **Backend**: FastAPI + SQLModel (`app/main.py`, `app/services/plan.py`) with persistent plan runs and requirement validation.
+- **Planner**: `app/planner.py` ranks activities using requirement gaps, pricing tiers, modality filters, and policies. Balanced mode now pins user-committed activities before filling gaps, while a cheapest mode can still be requested ad hoc without disturbing those commitments.
+- **Discovery Engine**: `app/ingest.py` runs Google Programmable Search plus OpenAI extraction; deep-fetches pages when snippets lack pricing/eligibility.
+- **Parser**: `app/parser.py` distinguishes preference language from completion statements to prevent phantom credits.
+- **Frontend**: Jinja + HTMX (`app/templates/`); the plan card listens for a `plan-refresh` event so discoveries surface without manual reload. HTMX buttons now toggle “Keep” / “Remove from plan” to manage commitments inline.
+- **Delay & Messaging**: Chat responses end with a compact confirmation bubble such as “Plan updated (N items, $C total, R remaining)” whenever changes affect the plan. Removal flows add explicit prompts and internal markers so the user can approve or decline the proposed substitute.
+- **Validation**: `app/requirements.py` exposes `validate_full_cc`—a comprehensive CC checklist that scores CME totals, SA-CME, PIP status, and patient-safety activity against `abpn_psychiatry_requirements.json`, returning both pillar-level detail and consolidated gaps.
 
-## File Guide
-- `app/main.py`: FastAPI app, HTMX endpoints, chat loop, ingest orchestration, and requirements view logic; now delegates plan state to `PlanManager` and auto-triggers discovery for empty catalogs.
-- `app/planner.py`: Plan assembly heuristics, eligibility helpers, requirement-aware scoring, and policy integration; exposes `requirements_gap_summary` for other services.
-- `app/ingest.py`: Google CSE search, deep fetch, OpenAI extraction, eligibility parsing, and requirement tagging prior to insertion.
-- `app/parser.py`: Regex + optional OpenAI parsing of user chat messages into credits/topics/dates with guardrails against misreading years.
-- `app/requirements.py`: Loads requirement payloads through the knowledge-base registry, normalizes rules, validates claims, and exposes requirement tagging helpers.
-- `app/services/plan.py`: Persistent plan run manager handling caching, policy application, auto-ingestion, and serialization for UI/chat consumers.
-- `app/knowledge/`: Knowledge-base registry plus ABPN psychiatry loader used by requirements/planner.
-- `app/models.py`: SQLModel definitions for users, activities, claims, assistant messages, requirements snapshots, policies, and completion log.
-- `static/style.css` & `app/templates/`: UI layout, chat window, plan presentation, and requirements dashboard.
-
-## Data & Configuration Notes
-- Requirements configs live under `app/config/` and are exposed via knowledge-base classes (e.g., ABPN psychiatry) for reuse across services.
-- SQLite database `cme.sqlite` is created at runtime; `app/db.py` now migrates plan run tables and JSON columns required by the plan cache.
-- Activity rows persist pricing tiers, eligibility attributes, and requirement tags that inform planner/validation logic.
-- Environment variables: `OPENAI_API_KEY`, `OPENAI_ASSISTANT_MODEL`, `GOOGLE_API_KEY`, `GOOGLE_CSE_ID` (already configured in the deployment shell).
-- Plan cache repopulates automatically after asynchronous discovery; welcome assistant message is inserted on first login so the chat column always has context.
+## Environment & Data
+- SQLite database `cme.sqlite` with migrations in `app/db.py`.
+- Requirement data loaded via `app/requirements.py` from `app/config/` knowledge bases.
+- Environment variables: `OPENAI_API_KEY`, `OPENAI_ASSISTANT_MODEL`, optional `ENABLE_GPT5`, Google CSE keys, ingest tuning knobs.
 
 ## Session History
-- Initial grounding created; update this log with key changes or milestones at the end of each session.
-- Added pricing tiers, membership/stage preferences, and hybrid-aware planning/visualization (2025-09-25).
-- Fixed ingest counters/UI feedback, mapped membership aliases for pricing, and restored Discover button status updates (2025-09-25).
-- Hardened ingest to require real pricing, force deep-fetch when snippets lack price/eligibility, and removed generic "check eligibility" badges for public items (2025-09-25).
-- Enabled dynamic plan refresh after discovery and exposed curated source labels (2025-09-25).
-- Initial version with core planning, chat loop, profile/preferences, activity ingest, claim parsing, and requirements validation (2025-09-20).
-- Updated the abpn_psychiatry_requirements.json to be more detailed (2025-09-25).
-- Planner and compliance summary now leverage enriched ABPN requirement data; requirement gaps influence scoring/UI, ingest persists requirement tags, and legacy activities are backfilled (2025-09-26).
-- Introduced persistent plan runs, knowledge-base registry, and safer logging/parser fixes to stabilize chat-driven planning (2025-09-27).
-- Disabled default seed catalog; first-run plans now auto-ingest real activities when empty (2025-09-27).
-- Simplified to a single balanced plan mode; first dashboard load now shows a welcome message while background discovery populates activities (2025-09-27).
+- **2025-09-27**: Replaced system prompt with concierge-focused guidance, added ACTION parsing, formatted plan updates, enforced chat think-time, refreshed documentation. Parser now ignores future-intent credit phrasing; plan fragment refreshes dynamically via HTMX event. README updated to describe the concierge workflow.
+- **2025-09-28**: Balanced planning became the default UI. Users can commit individual activities, toggle them via HTMX buttons, and request a cheapest-only view on demand. Chat gains “keep this plan” and “remove X” intents that update commitments and surface replacements via follow-up confirmation bubbles.
+- **2025-10-03**: Introduced fuzzy `find_activity_by_title` matching, substitute discovery via `propose_substitute`, and a robust chat/HTMX removal loop that uncommits, confirms, and optionally commits a replacement. Expanded CC validation with `validate_full_cc`, producing CME/SA-CME/PIP/patient-safety checklists and gap summaries in the UI. README and docs updated to reflect balanced default plans, commitment workflow, and cheapest-on-request guidance.
+- **2025-09-27**: Made Discover button fire global refresh event; plan fragment pulls automatically post-ingest. Updated UI messaging and eligibility badges.
+- **2025-09-27**: Introduced persistent plan runs, knowledge-base registry, and safer logging/parser fixes to stabilize chat-driven planning.
+- **2025-09-26**: Planner and compliance summary leverage enriched ABPN requirement data; ingest persists requirement tags.
+- **2025-09-25**: Added pricing tiers, membership/stage preferences, hybrid-aware planning; improved ingest counters and debug feedback.
+- **2025-09-20**: Initial version with core planning, chat loop, profile/preferences, activity ingest, claim parsing, and requirements validation.

@@ -23,6 +23,9 @@ from ..models import (
 from ..planner import (
     build_plan,
     build_plan_with_policy,
+    _is_patient_safety_activity,
+    _is_sa_cme_activity,
+    _is_pip_activity,
     is_eligible,
     pricing_context_for_user,
     requirements_gap_summary,
@@ -148,7 +151,11 @@ def policy_for_mode(
 
 
 def apply_policy_payloads(
-    payloads: Iterable[str], user: User, session, invalidate: bool = True
+    payloads: Iterable[str],
+    user: User,
+    session,
+    invalidate: bool = True,
+    record_message: bool = True,
 ) -> None:
     payload_list = [p for p in payloads if p]
     if not payload_list:
@@ -209,13 +216,14 @@ def apply_policy_payloads(
         )
 
     summary = ", ".join(sorted({mode or "default" for mode, _ in entries}))
-    session.add(
-        AssistantMessage(
-            user_id=user.id,
-            role="assistant",
-            content=f"Policy updated for {summary}. Expires in 24h.",
+    if record_message:
+        session.add(
+            AssistantMessage(
+                user_id=user.id,
+                role="assistant",
+                content=f"Policy updated for {summary}. Expires in 24h.",
+            )
         )
-    )
 
     if invalidate:
         PlanManager.invalidate_user_plans(session, user.id, reason="policy_update")
@@ -306,15 +314,15 @@ class PlanManager:
     ) -> PlanRun:
         run = self.latest_run(user.id, mode)
         if run and not force_refresh and self._is_run_current(run, user):
-            plan_preview, _, _ = self.serialize_plan(run, user)
-            if not plan_preview:
-                self._auto_discover_for_user(user)
             return run
 
-        run = self._rebuild_run(user, mode, policy_bundle, reason)
-        plan_preview, _, _ = self.serialize_plan(run, user)
-        if not plan_preview:
-            self._auto_discover_for_user(user)
+        run = self._rebuild_run(
+            user,
+            mode,
+            policy_bundle,
+            reason,
+            existing_run=run,
+        )
         return run
 
     def _is_run_current(self, run: PlanRun, user: User) -> bool:
@@ -354,17 +362,156 @@ class PlanManager:
         mode: str,
         policy_bundle: Optional[Dict[str, Any]],
         reason: Optional[str],
+        existing_run: Optional[PlanRun] = None,
     ) -> PlanRun:
         plan_context = _compute_plan_context(self.session, user)
         policy = policy_for_mode(policy_bundle, mode)
 
-        chosen, total_credits, total_cost, days_used = build_plan(
-            user, self.session, mode=mode
-        )
-        if policy:
-            chosen, total_credits, total_cost, days_used = build_plan_with_policy(
-                user, self.session, policy, mode=mode
+        committed_source_items: List[PlanItem] = []
+        if existing_run:
+            committed_source_items = list(
+                self.session.exec(
+                    select(PlanItem)
+                    .where(
+                        PlanItem.plan_run_id == existing_run.id,
+                        PlanItem.committed.is_(True),
+                    )
+                    .order_by(PlanItem.position.asc())
+                )
             )
+        if not committed_source_items and mode != "balanced":
+            anchor_run = self.latest_run(user.id, "balanced")
+            if anchor_run:
+                committed_source_items = list(
+                    self.session.exec(
+                        select(PlanItem)
+                        .where(
+                            PlanItem.plan_run_id == anchor_run.id,
+                            PlanItem.committed.is_(True),
+                        )
+                        .order_by(PlanItem.position.asc())
+                    )
+                )
+
+        committed_entries: List[Dict[str, Any]] = []
+        committed_ids: set[int] = set()
+        committed_credits = 0.0
+        committed_cost = 0.0
+        committed_days = 0
+
+        for item in committed_source_items:
+            activity = self.session.get(Activity, item.activity_id)
+            if not activity or activity.id in committed_ids:
+                continue
+            committed_ids.add(activity.id)
+            pricing = pricing_context_for_user(user, activity)
+            cost_value = float(pricing.get("cost") or activity.cost_usd or 0.0)
+            base_cost = pricing.get("base_cost")
+            if base_cost is None:
+                base_cost = activity.cost_usd
+            deadline_obj = pricing.get("deadline")
+            deadline_text = None
+            deadline_urgency = None
+            if deadline_obj:
+                try:
+                    days_left = pricing.get("deadline_days")
+                    if isinstance(days_left, int):
+                        if days_left == 0:
+                            deadline_urgency = "today"
+                        elif days_left == 1:
+                            deadline_urgency = "tomorrow"
+                        elif days_left <= 14:
+                            deadline_urgency = f"in {days_left} days"
+                    deadline_text = deadline_obj.strftime("%b %d, %Y")
+                except Exception:
+                    deadline_text = None
+
+            requirement_tags = set(getattr(activity, "requirement_tags", []) or [])
+            if _is_patient_safety_activity(activity):
+                requirement_tags.add("patient_safety")
+            if _is_sa_cme_activity(activity):
+                requirement_tags.add("sa_cme")
+            if _is_pip_activity(activity):
+                requirement_tags.add("pip")
+
+            eligible = is_eligible(user, activity)
+            missing_profile_data = False
+            if activity.eligible_institutions and not (user.affiliations or []):
+                missing_profile_data = True
+            if activity.eligible_groups and not getattr(user, "training_level", None):
+                missing_profile_data = True
+            if activity.membership_required and not (user.memberships or []):
+                missing_profile_data = True
+            if not eligible:
+                eligibility_status = "ineligible"
+            elif missing_profile_data or (
+                activity.eligibility_text
+                and not (
+                    activity.eligible_institutions
+                    or activity.eligible_groups
+                    or activity.membership_required
+                    or not getattr(activity, "open_to_public", True)
+                )
+            ):
+                eligibility_status = "uncertain"
+            else:
+                eligibility_status = "eligible"
+
+            committed_entries.append(
+                {
+                    "activity": activity,
+                    "position": item.position,
+                    "pricing": {
+                        "cost": cost_value,
+                        "base_cost": base_cost,
+                        "deadline_text": deadline_text,
+                        "deadline_urgency": deadline_urgency,
+                        "price_label": pricing.get("label"),
+                        "notes": pricing.get("notes"),
+                        "hybrid_available": pricing.get("hybrid_available"),
+                    },
+                    "requirement_tags": requirement_tags,
+                    "eligibility": eligibility_status,
+                    "notes": pricing.get("notes"),
+                }
+            )
+
+            committed_credits += float(activity.credits or 0.0)
+            committed_cost += cost_value
+            if activity.modality == "live":
+                committed_days += activity.days_required
+
+        committed_entries.sort(key=lambda entry: entry["position"])
+
+        remaining_override = max(user.remaining_credits - committed_credits, 0.0)
+        budget_override = max(float(user.budget_usd or 0.0) - committed_cost, 0.0)
+        days_override = max(int(getattr(user, "days_off", 0) or 0) - committed_days, 0)
+
+        if policy:
+            recommended, rec_credits, rec_cost, rec_days = build_plan_with_policy(
+                user,
+                self.session,
+                policy,
+                mode=mode,
+                remaining_override=remaining_override,
+                budget_override=budget_override,
+                days_override=days_override,
+                exclude_ids=committed_ids,
+            )
+        else:
+            recommended, rec_credits, rec_cost, rec_days = build_plan(
+                user,
+                self.session,
+                mode=mode,
+                remaining_override=remaining_override,
+                budget_override=budget_override,
+                days_override=days_override,
+                exclude_ids=committed_ids,
+            )
+
+        total_credits = committed_credits + rec_credits
+        total_cost = committed_cost + rec_cost
+        days_used = committed_days + rec_days
 
         existing_runs = list(
             self.session.exec(
@@ -400,10 +547,83 @@ class PlanManager:
         self.session.flush()
 
         plan_items: List[PlanItem] = []
-        for position, activity in enumerate(chosen):
-            pricing = pricing_context_for_user(user, activity)
+        position_counter = 0
+
+        def _tag_payload_from_set(raw_tags: set[str]) -> List[Dict[str, Any]]:
+            payload: List[Dict[str, Any]] = []
+            for key, label in REQUIREMENT_LABELS.items():
+                if key in raw_tags:
+                    payload.append(
+                        {
+                            "key": key,
+                            "label": label,
+                            "pending": bool(plan_context.pending_flags.get(key)),
+                            "value": plan_context.pending_values.get(key),
+                        }
+                    )
+            return payload
+
+        def _build_plan_item(
+            *,
+            activity: Activity,
+            position: int,
+            pricing: Dict[str, Any],
+            requirement_tags: set[str],
+            eligibility_status: str,
+            notes: Optional[str],
+            committed: bool,
+        ) -> PlanItem:
+            return PlanItem(
+                user_id=user.id,
+                activity_id=activity.id,
+                plan_run_id=run.id,
+                mode=mode,
+                position=position,
+                chosen=True,
+                pricing_snapshot={
+                    "cost": pricing.get("cost"),
+                    "base_cost": pricing.get("base_cost"),
+                    "deadline_text": pricing.get("deadline_text"),
+                    "deadline_urgency": pricing.get("deadline_urgency"),
+                    "price_label": pricing.get("price_label"),
+                    "notes": notes,
+                    "hybrid_available": pricing.get("hybrid_available"),
+                },
+                requirement_snapshot={
+                    "tags": _tag_payload_from_set(requirement_tags),
+                    "requirement_priority": any(
+                        plan_context.pending_flags.get(tag) for tag in requirement_tags
+                    ),
+                },
+                eligibility_status=eligibility_status,
+                notes=notes,
+                committed=committed,
+            )
+
+        for entry in committed_entries:
+            activity = entry["activity"]
+            pricing = entry["pricing"]
+            plan_items.append(
+                _build_plan_item(
+                    activity=activity,
+                    position=position_counter,
+                    pricing=pricing,
+                    requirement_tags=set(entry["requirement_tags"]),
+                    eligibility_status=entry["eligibility"],
+                    notes=entry.get("notes"),
+                    committed=True,
+                )
+            )
+            position_counter += 1
+
+        for activity in recommended:
+            pricing = getattr(activity, "_pricing_context", None)
+            if not pricing:
+                pricing = pricing_context_for_user(user, activity)
             cost_value = pricing.get("cost", activity.cost_usd)
-            base_cost = pricing.get("base_cost", activity.cost_usd)
+            base_cost = pricing.get("base_cost")
+            if base_cost is None:
+                base_cost = activity.cost_usd
             deadline_obj = pricing.get("deadline")
             deadline_text = None
             deadline_urgency = None
@@ -420,6 +640,29 @@ class PlanManager:
                     deadline_text = deadline_obj.strftime("%b %d, %Y")
                 except Exception:
                     deadline_text = None
+
+            pricing_payload = dict(pricing)
+            pricing_payload.update(
+                {
+                    "cost": cost_value,
+                    "base_cost": base_cost,
+                    "deadline_text": deadline_text,
+                    "deadline_urgency": deadline_urgency,
+                    "price_label": pricing.get("label"),
+                    "hybrid_available": pricing.get("hybrid_available"),
+                }
+            )
+
+            requirement_tags = set(
+                getattr(activity, "_requirement_tags", [])
+                or getattr(activity, "requirement_tags", [])
+            )
+            if _is_patient_safety_activity(activity):
+                requirement_tags.add("patient_safety")
+            if _is_sa_cme_activity(activity):
+                requirement_tags.add("sa_cme")
+            if _is_pip_activity(activity):
+                requirement_tags.add("pip")
 
             eligible = is_eligible(user, activity)
             missing_profile_data = False
@@ -444,46 +687,18 @@ class PlanManager:
             else:
                 status = "eligible"
 
-            raw_tags = set(getattr(activity, "requirement_tags", []) or [])
-            tag_payload: List[Dict[str, Any]] = []
-            for key, label in REQUIREMENT_LABELS.items():
-                if key in raw_tags:
-                    tag_payload.append(
-                        {
-                            "key": key,
-                            "label": label,
-                            "pending": bool(plan_context.pending_flags.get(key)),
-                            "value": plan_context.pending_values.get(key),
-                        }
-                    )
-
             plan_items.append(
-                PlanItem(
-                    user_id=user.id,
-                    activity_id=activity.id,
-                    plan_run_id=run.id,
-                    mode=mode,
-                    position=position,
-                    chosen=True,
-                    pricing_snapshot={
-                        "cost": cost_value,
-                        "base_cost": base_cost,
-                        "deadline_text": deadline_text,
-                        "deadline_urgency": deadline_urgency,
-                        "price_label": pricing.get("label"),
-                        "notes": pricing.get("notes"),
-                        "hybrid_available": pricing.get("hybrid_available"),
-                    },
-                    requirement_snapshot={
-                        "tags": tag_payload,
-                        "requirement_priority": any(
-                            tag.get("pending") for tag in tag_payload
-                        ),
-                    },
+                _build_plan_item(
+                    activity=activity,
+                    position=position_counter,
+                    pricing=pricing_payload,
+                    requirement_tags=requirement_tags,
                     eligibility_status=status,
                     notes=pricing.get("notes"),
+                    committed=False,
                 )
             )
+            position_counter += 1
 
         if plan_items:
             self.session.add_all(plan_items)
@@ -575,6 +790,7 @@ class PlanManager:
 
             plan.append(
                 {
+                    "activity_id": item.activity_id,
                     "title": activity.title,
                     "provider": activity.provider,
                     "credits": activity.credits,
@@ -603,6 +819,7 @@ class PlanManager:
                     "requirement_priority": bool(
                         (item.requirement_snapshot or {}).get("requirement_priority")
                     ),
+                    "committed": bool(item.committed),
                 }
             )
 
@@ -615,6 +832,7 @@ class PlanManager:
             ),
             "days_used": run.days_used,
             "requirement_focus": list(run.requirement_focus or []),
+            "committed_count": sum(1 for item in items if item.committed),
         }
 
         plan_requirements = {
@@ -633,7 +851,7 @@ class PlanManager:
     ) -> Tuple[str, int, int]:
         summaries = []
         counts = {}
-        for mode in ("variety", "cheapest"):
+        for mode in ("balanced", "cheapest"):
             run = self.ensure_plan(
                 user,
                 mode,
@@ -668,7 +886,7 @@ class PlanManager:
                 f"{mode.title()}: {total:.1f} cr — {', '.join(top_details)}"
             )
         summary_text = "\n".join(["Plan refresh:", *summaries])
-        return summary_text, counts.get("variety", 0), counts.get("cheapest", 0)
+        return summary_text, counts.get("balanced", 0), counts.get("cheapest", 0)
 
     def _auto_discover_for_user(self, user: User) -> bool:
         specialty = (user.specialty or "").strip().lower()

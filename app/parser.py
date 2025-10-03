@@ -23,6 +23,50 @@ def _looks_like_year(raw: str) -> bool:
     return 1800 <= value <= 2200
 
 
+FUTURE_INTENT_HINTS = {
+    "want",
+    "rather",
+    "prefer",
+    "looking",
+    "searching",
+    "need",
+    "should",
+    "must",
+    "hoping",
+    "plan to",
+    "planning",
+    "would like",
+    "going to",
+}
+
+COMPLETION_HINTS = {
+    "earn",
+    "earned",
+    "log",
+    "logged",
+    "claim",
+    "claimed",
+    "finish",
+    "finished",
+    "complete",
+    "completed",
+    "attended",
+    "took",
+    "received",
+    "got",
+}
+
+
+def _has_completion_language(text: str) -> bool:
+    lowered = text.lower()
+    return any(hint in lowered for hint in COMPLETION_HINTS)
+
+
+def _has_future_language(text: str) -> bool:
+    lowered = text.lower()
+    return any(hint in lowered for hint in FUTURE_INTENT_HINTS)
+
+
 def _extract_credits(text: str) -> float:
     lowered = text.lower()
     for pattern in _CREDIT_PATTERNS:
@@ -90,6 +134,8 @@ def parse_message(text: str) -> Tuple[float, Optional[str], date]:
     # Try regex first (fast & deterministic)
     c, t, d = _regex_parse(text)
     if c > 0:
+        if _has_future_language(text) and not _has_completion_language(text):
+            return 0.0, t, d
         return c, t, d
 
     # If regex fails, try AI when key is present

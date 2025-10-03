@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-  {% set current_mode = (plan_mode | default(request.query_params.get('plan_mode', 'variety')))|lower %}
+{% set current_mode = (plan_mode | default(request.query_params.get('mode', 'balanced')))|lower %}
   <h1>CME/MOC Planner (ABPN POC)</h1>
 
   {% if not user %}
@@ -104,7 +104,12 @@
       {% endif %}
     </div>
 
-    <div id="plan-card" data-plan-mode="{{ current_mode }}">
+    <div id="plan-card" data-plan-mode="{{ current_mode }}"
+         hx-get="/fragment/plan?mode={{ current_mode }}"
+         hx-trigger="plan-refresh from:body"
+         hx-target="this"
+         hx-swap="innerHTML"
+         hx-vals='{"refresh":"1"}'>
       {% include '_plan.html' %}
     </div>
 
@@ -126,6 +131,23 @@
             <a href="{{ s }}" target="_blank" rel="noopener">{{ s }}</a>{% if not loop.last %}, {% endif %}
           {% endfor %}
         </div>
+        {% if validation_full %}
+          <div class="meta" style="margin-top:12px;">Comprehensive CC Checklist</div>
+          <ul class="checks">
+            {% for key in ['cme', 'sa_cme', 'pip', 'patient_safety'] %}
+              {% set pillar = validation_full.pillars.get(key) %}
+              {% if pillar %}
+                <li>
+                  {% if pillar.status == 'ok' %}✅{% elif pillar.status == 'warn' %}⚠️{% else %}❌{% endif %}
+                  <strong>{{ pillar.label }}</strong> — {{ pillar.detail }}
+                </li>
+              {% endif %}
+            {% endfor %}
+          </ul>
+          {% if validation_full.gaps %}
+            <div class="meta">Gaps: {{ validation_full.gaps | join(', ') }}</div>
+          {% endif %}
+        {% endif %}
       </section>
     {% endif %}
 

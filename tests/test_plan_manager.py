@@ -56,13 +56,13 @@ class PlanManagerTests(unittest.TestCase):
         user = self._create_user_with_catalog()
         manager = PlanManager(self.session)
 
-        run_one = manager.ensure_plan(user, "variety", policy_bundle={})
+        run_one = manager.ensure_plan(user, "balanced", policy_bundle={})
         self.assertIsNotNone(run_one.id)
         plan_one, summary_one, _ = manager.serialize_plan(run_one, user)
         self.assertTrue(plan_one)
         self.assertIsNotNone(summary_one)
 
-        run_two = manager.ensure_plan(user, "variety", policy_bundle={})
+        run_two = manager.ensure_plan(user, "balanced", policy_bundle={})
         self.assertEqual(run_one.id, run_two.id)
 
         first_title = plan_one[0]["title"]
@@ -75,7 +75,7 @@ class PlanManagerTests(unittest.TestCase):
         )
         self.session.commit()
 
-        run_three = manager.ensure_plan(user, "variety", policy_bundle={})
+        run_three = manager.ensure_plan(user, "balanced", policy_bundle={})
         self.assertNotEqual(run_one.id, run_three.id)
         plan_three, summary_three, _ = manager.serialize_plan(run_three, user)
         self.assertTrue(plan_three)

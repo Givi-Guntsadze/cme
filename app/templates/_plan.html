@@ -5,12 +5,16 @@
       hx-post="/ingest"
       hx-swap="none"
       hx-on::before-request="this.dataset.originalText=this.textContent; this.disabled=true; this.textContent='Discovering…';"
-      hx-on::after-request="(function(btn, evt){ if(btn.dataset){ btn.textContent=btn.dataset.originalText||'Discover'; btn.disabled=false; } try { const xhr = evt.detail && evt.detail.xhr; if (xhr) { let data = {}; try { data = JSON.parse(xhr.responseText || '{}'); } catch (err) { data = {}; } if (typeof data.ingested !== 'undefined') { const params = new URLSearchParams(window.location.search); params.set('added', data.ingested || 0); if (typeof data.google_inserted !== 'undefined') { params.set('gcount', data.google_inserted || 0); } if (typeof data.ai_inserted !== 'undefined') { params.set('acount', data.ai_inserted || 0); } params.set('fallback', data.used_fallback ? '1' : '0'); history.replaceState(null, '', '?' + params.toString()); const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#f0fff4;border-left:4px solid #34d399;padding:8px 12px;margin:8px 0;\'>Imported ' + (data.ingested || 0) + ' new activities — Web: ' + (data.google_inserted || 0) + ', AI: ' + (data.ai_inserted || 0) + (data.used_fallback ? ' (fallback used)' : '') + '.</div>'; } const planRoot = document.getElementById('plan-card'); if (planRoot && window.htmx) { window.htmx.ajax('GET', '/fragment/plan', '#plan-card'); } return; } if (data.error) { const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#fff7f7;border-left:4px solid #f87171;padding:8px 12px;margin:8px 0;\'>' + data.error + '</div>'; } return; } } } catch (err) { console.error(err); } })(this, event);"
+      hx-on::after-request="(function(btn, evt){ if(btn.dataset){ btn.textContent=btn.dataset.originalText||'Discover'; btn.disabled=false; } try { const xhr = evt.detail && evt.detail.xhr; if (xhr) { let data = {}; try { data = JSON.parse(xhr.responseText || '{}'); } catch (err) { data = {}; } if (typeof data.ingested !== 'undefined') { const params = new URLSearchParams(window.location.search); params.set('added', data.ingested || 0); if (typeof data.google_inserted !== 'undefined') { params.set('gcount', data.google_inserted || 0); } if (typeof data.ai_inserted !== 'undefined') { params.set('acount', data.ai_inserted || 0); } params.set('fallback', data.used_fallback ? '1' : '0'); history.replaceState(null, '', '?' + params.toString()); const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#f0fff4;border-left:4px solid #34d399;padding:8px 12px;margin:8px 0;\'>Imported ' + (data.ingested || 0) + ' new activities — Web: ' + (data.google_inserted || 0) + ', AI: ' + (data.ai_inserted || 0) + (data.used_fallback ? ' (fallback used)' : '') + '.</div>'; } const planRoot = document.getElementById('plan-card'); if (planRoot && window.htmx) { window.htmx.trigger(document.body || window, 'plan-refresh'); } return; } if (data.error) { const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#fff7f7;border-left:4px solid #f87171;padding:8px 12px;margin:8px 0;\'>' + data.error + '</div>'; } return; } } } catch (err) { console.error(err); } })(this, event);"
       class="button"
       type="button"
     >Discover</button>
   </div>
-  <p class="meta" style="margin-top: -4px;">Current plan balances requirements, cost, and variety based on your profile.</p>
+  {% if plan_mode == 'cheapest' %}
+    <p class="meta" style="margin-top: -4px;">Cheapest plan view. Your committed picks stay fixed while we surface lower-cost fillers.</p>
+  {% else %}
+    <p class="meta" style="margin-top: -4px;">Balanced plan shown. Ask for a "cheapest plan" if you prefer maximum savings.</p>
+  {% endif %}
   {% if plan_summary %}
     <div class="meta plan-summary">
       {{ plan_summary.item_count }} {{ 'activity' if plan_summary.item_count == 1 else 'activities' }}
@@ -50,10 +54,8 @@
             {% endif %}
             {% if p.eligibility_status == 'eligible' %}
               <span class="badge eligibility ok" title="{{ p.eligibility_text or 'Eligible for you' }}">✅ Eligible</span>
-            {% elif p.eligibility_status == 'uncertain' %}
-              <span class="badge eligibility warn" title="{{ p.eligibility_text or 'Eligibility needs manual check' }}">⚠️ Check eligibility</span>
-            {% elif p.eligibility_status == 'ineligible' %}
-              <span class="badge eligibility no" title="{{ p.eligibility_text or 'Not eligible based on current info' }}">❌ Not eligible</span>
+            {% elif p.eligibility_status in ['uncertain', 'ineligible'] %}
+              <span class="badge eligibility warn" title="{{ p.eligibility_text or 'Eligibility may be restricted — please double check.' }}">⚠️ Check eligibility</span>
             {% endif %}
           </div>
           <div class="meta">
@@ -92,14 +94,34 @@
               {% endfor %}
             </div>
           {% endif %}
-          <form method="post" action="/plan/remove" style="margin-top:6px;">
-            <input type="hidden" name="title" value="{{ p.title }}" />
-            <button type="submit" class="linklike" title="Remove this from plan">Remove</button>
-          </form>
+          {% if plan_mode == 'balanced' %}
+            <div class="plan-actions">
+              {% if p.committed %}
+                <span class="badge committed">Committed</span>
+                <button
+                  type="button"
+                  class="linklike"
+                  hx-post="/plan/uncommit/{{ p.activity_id }}"
+                  hx-target="#plan-card"
+                  hx-swap="innerHTML"
+                  title="Release this activity so the planner can suggest alternatives"
+                >Remove from plan</button>
+              {% else %}
+                <button
+                  type="button"
+                  class="linklike"
+                  hx-post="/plan/commit/{{ p.activity_id }}"
+                  hx-target="#plan-card"
+                  hx-swap="innerHTML"
+                  title="Lock this activity into your plan"
+                >Keep</button>
+              {% endif %}
+            </div>
+          {% endif %}
         </li>
       {% endfor %}
     </ul>
   {% else %}
-    <p class="meta">We’re lining up activities that match your profile. Once discovery finishes, they’ll appear here.</p>
+    <p class="meta">You don't have a CME plan yet, let's fix that.</p>
   {% endif %}
 </section>

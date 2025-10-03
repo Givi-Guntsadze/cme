@@ -16,7 +16,7 @@ from .requirements import (
 )
 
 
-MIN_VARIETY_ITEMS = 4
+MIN_BALANCED_ITEMS = 4
 LOGGER = logging.getLogger(__name__)
 
 MEMBERSHIP_ALIASES: Dict[str, str] = {
@@ -54,16 +54,17 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
 }
 
 CHEAPEST = {
-    "diversity_w": 0.0,  # no diversity pressure
-    "single_cap_ratio": 1.0,  # allow 100% from one item
-    "subscription_penalty": 0.0,  # no penalty
+    "diversity_w": 0.0,
+    "single_cap_ratio": 1.0,
+    "subscription_penalty": 0.1,
+    "topic_diversity_w": 0.0,
 }
 
-VARIETY = {
-    "diversity_w": 0.55,  # stronger penalty for repeating same provider/modality
-    "topic_diversity_w": 0.6,  # discourage repeating the same focus area
-    "single_cap_ratio": 0.55,  # any single item ≤ 55% of remaining
-    "subscription_penalty": 0.6,  # favor mixing over subscriptions
+BALANCED = {
+    "diversity_w": 0.45,
+    "topic_diversity_w": 0.45,
+    "single_cap_ratio": 0.5,
+    "subscription_penalty": 1.0,
 }
 
 
@@ -466,16 +467,39 @@ def _apply_policy_filters(
     return filtered
 
 
-# Returns (selected_activities, total_credits, total_cost, days_used)
 def build_plan(
-    user: User, session, mode: str = "variety"
+    user: User,
+    session,
+    mode: str = "balanced",
+    *,
+    remaining_override: Optional[float] = None,
+    budget_override: Optional[float] = None,
+    days_override: Optional[int] = None,
+    exclude_ids: Optional[set[int]] = None,
 ) -> Tuple[List[Activity], float, float, int]:
-    remaining = max(user.remaining_credits, 0.0)
-    if remaining <= 0:
+    remaining_target = (
+        remaining_override
+        if remaining_override is not None
+        else max(float(user.remaining_credits or 0.0), 0.0)
+    )
+    if remaining_target <= 0:
         return ([], 0.0, 0.0, 0)
 
+    budget_cap = (
+        float(budget_override)
+        if budget_override is not None
+        else float(user.budget_usd or 0.0)
+    )
+    day_cap = (
+        int(days_override)
+        if days_override is not None
+        else int(getattr(user, "days_off", 0) or 0)
+    )
+
+    excluded = set(exclude_ids or set())
+
     q = select(Activity)
-    activities = list(session.exec(q))
+    activities = [a for a in session.exec(q) if (a.id not in excluded)]
 
     completed_ids = set(
         session.exec(
@@ -487,24 +511,24 @@ def build_plan(
     if completed_ids:
         activities = [a for a in activities if a.id not in completed_ids]
 
-    # Filter by prefs
     if not user.allow_live:
         activities = [a for a in activities if a.modality == "online"]
     activities = [a for a in activities if is_eligible(user, a)]
 
     req_ctx = _requirements_planning_context(session, user)
     patient_safety_pending = bool(req_ctx.get("needs_patient_safety"))
-    if patient_safety_pending:
-        if not any(_is_patient_safety_activity(a) for a in activities):
-            patient_safety_pending = False
+    if patient_safety_pending and not any(
+        _is_patient_safety_activity(a) for a in activities
+    ):
+        patient_safety_pending = False
+
     sa_needed = float(req_ctx.get("sa_credits_needed") or 0.0)
-    if sa_needed > 0:
-        if not any(_is_sa_cme_activity(a) for a in activities):
-            sa_needed = 0.0
+    if sa_needed > 0 and not any(_is_sa_cme_activity(a) for a in activities):
+        sa_needed = 0.0
+
     pip_needed = int(req_ctx.get("pip_needed") or 0)
-    if pip_needed > 0:
-        if not any(_is_pip_activity(a) for a in activities):
-            pip_needed = 0
+    if pip_needed > 0 and not any(_is_pip_activity(a) for a in activities):
+        pip_needed = 0
 
     chosen: List[Activity] = []
     total_credits = 0.0
@@ -512,18 +536,18 @@ def build_plan(
     days_used = 0
 
     mode_key = (mode or "").lower()
-    config = VARIETY if mode_key == "variety" else CHEAPEST
+    config = BALANCED if mode_key == "balanced" else CHEAPEST
 
     provider_counts: Dict[str, int] = {}
     modality_counts: Dict[str, int] = {}
     topic_counts: Dict[str, int] = {}
     pricing_cache: Dict[int, Dict[str, Any]] = {}
 
-    def needs_more_variety() -> bool:
-        return mode_key == "variety" and len(chosen) < MIN_VARIETY_ITEMS
+    def needs_more_balanced() -> bool:
+        return mode_key == "balanced" and len(chosen) < MIN_BALANCED_ITEMS
 
-    while (total_credits < remaining or needs_more_variety()) and activities:
-        remaining_needed = max(remaining - total_credits, 0.0)
+    while (total_credits < remaining_target or needs_more_balanced()) and activities:
+        remaining_needed = max(remaining_target - total_credits, 0.0)
 
         def _pick_candidate(
             ignore_cap: bool = False,
@@ -547,7 +571,7 @@ def build_plan(
                 new_days = current_days_used + (
                     a.days_required if a.modality == "live" else 0
                 )
-                if new_days > user.days_off:
+                if new_days > day_cap:
                     continue
 
                 cache_key = a.id or id(a)
@@ -558,10 +582,10 @@ def build_plan(
                 effective_cost = float(pricing.get("cost") or a.cost_usd or 0.0)
 
                 new_cost = current_total_cost + effective_cost
-                if new_cost > user.budget_usd:
+                if new_cost > budget_cap:
                     continue
 
-                if mode_key == "variety" and current_remaining > 0:
+                if mode_key == "balanced" and current_remaining > 0:
                     limit = config.get("single_cap_ratio", 1.0) * current_remaining
                     if limit > 0 and a.credits > limit and not ignore_cap:
                         skipped_for_cap = True
@@ -570,8 +594,8 @@ def build_plan(
                         relaxed_limit = max(
                             current_remaining,
                             min(
-                                max(remaining, current_remaining + 6.0),
-                                remaining * 1.1,
+                                max(remaining_target, current_remaining + 6.0),
+                                remaining_target * 1.1,
                             ),
                         )
                         if a.credits > relaxed_limit:
@@ -587,7 +611,7 @@ def build_plan(
                     topic = _infer_topic(a)
                     a._topic_tag = topic
 
-                if mode_key == "variety":
+                if mode_key == "balanced":
                     provider = (a.provider or "").lower()
                     modality = (a.modality or "").lower()
                     div_w = float(config.get("diversity_w") or 0.0)
@@ -600,6 +624,9 @@ def build_plan(
                         score += float(config.get("subscription_penalty") or 0.0)
                     if effective_cost == 0.0:
                         score += 0.6
+                else:
+                    if config.get("subscription_penalty") and _is_subscription(a):
+                        score += float(config.get("subscription_penalty") or 0.0)
 
                 safety_activity = _is_patient_safety_activity(a)
                 sa_activity = _is_sa_cme_activity(a)
@@ -635,7 +662,7 @@ def build_plan(
             )
 
         best, best_score, best_context, best_topic, skipped_cap = _pick_candidate(False)
-        if not best and skipped_cap and mode_key == "variety":
+        if not best and skipped_cap and mode_key == "balanced":
             best, best_score, best_context, best_topic, _ = _pick_candidate(True)
 
         if not best:
@@ -661,7 +688,7 @@ def build_plan(
         if best.modality == "live":
             days_used += best.days_required
 
-        if mode_key == "variety":
+        if mode_key == "balanced":
             provider = (best.provider or "").lower()
             modality = (best.modality or "").lower()
             provider_counts[provider] = provider_counts.get(provider, 0) + 1
@@ -683,14 +710,39 @@ def build_plan(
 
 
 def build_plan_with_policy(
-    user: User, session, policy: Dict[str, Any], mode: str = "variety"
+    user: User,
+    session,
+    policy: Dict[str, Any],
+    mode: str = "balanced",
+    *,
+    remaining_override: Optional[float] = None,
+    budget_override: Optional[float] = None,
+    days_override: Optional[int] = None,
+    exclude_ids: Optional[set[int]] = None,
 ) -> Tuple[List[Activity], float, float, int]:
-    remaining = max(user.remaining_credits, 0.0)
-    if remaining <= 0:
+    remaining_target = (
+        remaining_override
+        if remaining_override is not None
+        else max(float(user.remaining_credits or 0.0), 0.0)
+    )
+    if remaining_target <= 0:
         return ([], 0.0, 0.0, 0)
 
+    budget_cap = (
+        float(budget_override)
+        if budget_override is not None
+        else float(user.budget_usd or 0.0)
+    )
+    day_cap = (
+        int(days_override)
+        if days_override is not None
+        else int(getattr(user, "days_off", 0) or 0)
+    )
+
+    excluded = set(exclude_ids or set())
+
     q = select(Activity)
-    activities = list(session.exec(q))
+    activities = [a for a in session.exec(q) if (a.id not in excluded)]
 
     completed_ids = set(
         session.exec(
@@ -703,24 +755,24 @@ def build_plan_with_policy(
         activities = [a for a in activities if a.id not in completed_ids]
     activities = _apply_policy_filters(activities, policy)
 
-    # Respect allow_live
     if not user.allow_live:
         activities = [a for a in activities if a.modality == "online"]
     activities = [a for a in activities if is_eligible(user, a)]
 
     req_ctx = _requirements_planning_context(session, user)
     patient_safety_pending = bool(req_ctx.get("needs_patient_safety"))
-    if patient_safety_pending:
-        if not any(_is_patient_safety_activity(a) for a in activities):
-            patient_safety_pending = False
+    if patient_safety_pending and not any(
+        _is_patient_safety_activity(a) for a in activities
+    ):
+        patient_safety_pending = False
+
     sa_needed = float(req_ctx.get("sa_credits_needed") or 0.0)
-    if sa_needed > 0:
-        if not any(_is_sa_cme_activity(a) for a in activities):
-            sa_needed = 0.0
+    if sa_needed > 0 and not any(_is_sa_cme_activity(a) for a in activities):
+        sa_needed = 0.0
+
     pip_needed = int(req_ctx.get("pip_needed") or 0)
-    if pip_needed > 0:
-        if not any(_is_pip_activity(a) for a in activities):
-            pip_needed = 0
+    if pip_needed > 0 and not any(_is_pip_activity(a) for a in activities):
+        pip_needed = 0
 
     chosen: List[Activity] = []
     total_credits = 0.0
@@ -731,17 +783,21 @@ def build_plan_with_policy(
     topic_counts: Dict[str, int] = {}
     pricing_cache: Dict[int, Dict[str, Any]] = {}
     mode_key = (mode or "").lower()
-    config = VARIETY if mode_key == "variety" else CHEAPEST
+    config = BALANCED if mode_key == "balanced" else CHEAPEST
 
-    # Greedy selection with policy-aware scoring
-    while total_credits < remaining:
+    def needs_more_balanced() -> bool:
+        return mode_key == "balanced" and len(chosen) < MIN_BALANCED_ITEMS
+
+    while (total_credits < remaining_target or needs_more_balanced()) and activities:
+        remaining_needed = max(remaining_target - total_credits, 0.0)
         best = None
         best_score = float("inf")
         best_context: Optional[Dict[str, Any]] = None
         best_topic: Optional[str] = None
         for a in activities:
-            # Skip if would violate hard constraints
             new_days = days_used + (a.days_required if a.modality == "live" else 0)
+            if new_days > day_cap:
+                continue
             cache_key = a.id or id(a)
             pricing = pricing_cache.get(cache_key)
             if not pricing:
@@ -749,28 +805,24 @@ def build_plan_with_policy(
                 pricing_cache[cache_key] = pricing
             effective_cost = float(pricing.get("cost") or a.cost_usd or 0.0)
             new_cost = total_cost + effective_cost
-            if new_days > user.days_off:
+            tol = float(policy.get("budget_tolerance") or 0)
+            over_budget_allowed = budget_cap * (1 + max(tol, 0.0))
+            if new_cost > over_budget_allowed:
                 continue
-            if new_cost > user.budget_usd:
-                # allow small over if policy budget_tolerance
-                tol = float(policy.get("budget_tolerance") or 0)
-                if tol <= 0 or new_cost > user.budget_usd * (1 + tol):
-                    continue
+
             base = (
                 effective_cost / a.credits
                 if a.credits
                 else _base_score(a, bool(user.prefer_live))
             )
-            adj = _policy_adjustments(
-                a, policy, provider_counts, remaining - total_credits
-            )
+            adj = _policy_adjustments(a, policy, provider_counts, remaining_needed)
             score = max(0.0, base + adj)
             topic = getattr(a, "_topic_tag", None)
             if topic is None:
                 topic = _infer_topic(a)
                 a._topic_tag = topic
 
-            if mode_key == "variety":
+            if mode_key == "balanced":
                 if effective_cost == 0.0:
                     score += 0.6
                 provider = (a.provider or "").lower()
@@ -781,40 +833,41 @@ def build_plan_with_policy(
                 topic_w = float(config.get("topic_diversity_w") or 0.0)
                 if topic_w:
                     score += topic_w * topic_counts.get(topic, 0)
+                if config.get("subscription_penalty") and _is_subscription(a):
+                    score += float(config.get("subscription_penalty") or 0.0)
+            else:
+                if config.get("subscription_penalty") and _is_subscription(a):
+                    score += float(config.get("subscription_penalty") or 0.0)
+
             safety_activity = _is_patient_safety_activity(a)
             sa_activity = _is_sa_cme_activity(a)
             pip_activity = _is_pip_activity(a)
             if patient_safety_pending:
-                if safety_activity:
-                    score -= 200.0
-                else:
-                    score += 5.0
+                score += -200.0 if safety_activity else 5.0
             if sa_needed > 0:
-                if sa_activity:
-                    score -= 120.0 * min(a.credits or 0.0, sa_needed)
-                else:
-                    score += 3.0
+                score += (
+                    -120.0 * min(a.credits or 0.0, sa_needed) if sa_activity else 3.0
+                )
             if pip_needed > 0:
-                if pip_activity:
-                    score -= 500.0
-                else:
-                    score += 200.0
+                score += -500.0 if pip_activity else 200.0
+
             if score < best_score:
                 best_score = score
                 best = a
                 best_context = pricing
                 best_topic = topic
+
         if not best:
             break
+
         chosen.append(best)
-        total_credits += best.credits
+        total_credits += best.credits or 0.0
         if best_context is None:
             cache_key = best.id or id(best)
             best_context = pricing_cache.get(cache_key) or pricing_context_for_user(
                 user, best
             )
         total_cost += float(best_context.get("cost") or best.cost_usd or 0.0)
-        best._pricing_context = best_context
         requirement_tags = set(getattr(best, "requirement_tags", []) or [])
         if _is_patient_safety_activity(best):
             requirement_tags.add("patient_safety")
@@ -825,22 +878,23 @@ def build_plan_with_policy(
         best._requirement_tags = requirement_tags
         if best.modality == "live":
             days_used += best.days_required
-        key = (best.provider or "").lower()
-        provider_counts[key] = provider_counts.get(key, 0) + 1
-        if mode_key == "variety":
-            modality = (best.modality or "").lower()
-            modality_counts[modality] = modality_counts.get(modality, 0) + 1
-            topic_key = (
-                best_topic or getattr(best, "_topic_tag", None) or _infer_topic(best)
-            )
-            topic_counts[topic_key] = topic_counts.get(topic_key, 0) + 1
+
+        provider = (best.provider or "").lower()
+        modality = (best.modality or "").lower()
+        provider_counts[provider] = provider_counts.get(provider, 0) + 1
+        modality_counts[modality] = modality_counts.get(modality, 0) + 1
+        topic_key = (
+            best_topic or getattr(best, "_topic_tag", None) or _infer_topic(best)
+        )
+        topic_counts[topic_key] = topic_counts.get(topic_key, 0) + 1
+
         if patient_safety_pending and "patient_safety" in requirement_tags:
             patient_safety_pending = False
         if sa_needed > 0 and "sa_cme" in requirement_tags:
             sa_needed = max(sa_needed - float(best.credits or 0.0), 0.0)
         if pip_needed > 0 and "pip" in requirement_tags:
             pip_needed = max(pip_needed - 1, 0)
-        # Remove picked to avoid duplicates
+
         activities.remove(best)
 
     return (chosen, total_credits, total_cost, days_used)

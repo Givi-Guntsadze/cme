@@ -17,9 +17,14 @@ CONFIG_PATH = Path(__file__).parent / "config" / "abpn_psychiatry_requirements.j
 
 SA_CME_KEYWORDS = [
     "sa-cme",
+    "sa cme",
     "self assessment",
     "self-assessment",
+    "self assessment cme",
+    "self-assessment cme",
     "knowledge self-assessment",
+    "moc self-assessment",
+    "moc self assessment",
     "ksa",
     "self assessment module",
     "sam",
@@ -269,6 +274,163 @@ def pip_activity_count(claims: List[Claim]) -> int:
         if is_pip_claim(claim):
             count += 1
     return count
+
+
+def _status_for_gap(shortfall: float, warn_threshold: float = 1.0) -> str:
+    if shortfall <= 0:
+        return "ok"
+    if shortfall < warn_threshold:
+        return "warn"
+    return "fail"
+
+
+def _clinically_inactive(user: User) -> bool:
+    stage = str(getattr(user, "professional_stage", "") or "").lower()
+    return stage in {"non_clinical", "inactive", "retired", "non-clinical"}
+
+
+def _pip_complete_from_claims(claims: List[Claim]) -> tuple[bool, str | None]:
+    topics = {str(claim.topic or "").lower() for claim in claims}
+    if "pip_complete" in topics or "pip completion" in topics:
+        return True, "Documented pip_complete claim"
+    if {"pip_step_a", "pip_step_c"}.issubset(topics):
+        return True, "PIP steps A and C logged"
+    if pip_activity_count(claims) > 0:
+        return True, "PIP activity logged"
+    return False, None
+
+
+def validate_full_cc(
+    user: User,
+    claims: List[Claim],
+    req: dict,
+    pip_status: Optional[dict] = None,
+) -> dict:
+    rules = requirements_rules(req)
+    target_total = int(
+        rules.get("total_credits") or rules.get("cme_total_per_cycle") or 0
+    )
+    if getattr(user, "target_credits", 0) and user.target_credits > 0:
+        target_total = int(user.target_credits)
+
+    earned_total = sum(float(c.credits or 0.0) for c in claims)
+    short_total = max(target_total - earned_total, 0.0)
+    total_status = _status_for_gap(target_total - earned_total)
+    pillars = {
+        "cme": {
+            "label": "CME Total",
+            "earned": earned_total,
+            "target": target_total,
+            "status": total_status,
+            "detail": (
+                f"{earned_total:.1f} of {target_total} CME credits earned"
+                if target_total > 0
+                else f"{earned_total:.1f} CME credits logged"
+            ),
+        }
+    }
+
+    gaps: List[str] = []
+    if total_status != "ok" and target_total > 0:
+        gaps.append(f"CME short by {short_total:.1f}")
+
+    sa_min = float(rules.get("sa_cme_min_per_cycle") or 0.0)
+    sa_total = sa_cme_credit_sum(claims)
+    short_sa = max(sa_min - sa_total, 0.0)
+    sa_status = "ok" if sa_min <= 0 else _status_for_gap(sa_min - sa_total)
+    pillars["sa_cme"] = {
+        "label": "Self-Assessment CME",
+        "earned": sa_total,
+        "target": sa_min,
+        "status": sa_status,
+        "detail": (
+            f"{sa_total:.1f} of {sa_min:.1f} SA-CME credits documented"
+            if sa_min > 0
+            else f"{sa_total:.1f} SA-CME credits logged"
+        ),
+    }
+    if sa_status != "ok" and sa_min > 0:
+        gaps.append(f"SA-CME short by {short_sa:.1f}")
+
+    pip_required = int(rules.get("pip_required_per_cycle") or 0)
+    pip_complete = bool(pip_status.get("complete")) if pip_status else False
+    pip_reason = None
+    if not pip_complete:
+        pip_complete, pip_reason = _pip_complete_from_claims(claims)
+    if not pip_complete and _clinically_inactive(user):
+        pip_complete = True
+        pip_reason = "Clinically inactive"
+
+    if pip_status and pip_status.get("reason") and pip_complete:
+        pip_reason = pip_status.get("reason")
+
+    if pip_required <= 0:
+        pip_status_label = "ok"
+        pip_detail = "PIP not required for this cycle"
+    else:
+        pip_status_label = "ok" if pip_complete else "fail"
+        if pip_complete:
+            pip_detail = pip_reason or "Performance Improvement documented"
+        else:
+            pip_detail = f"Need {pip_required} completed PIP activity"
+
+    pillars["pip"] = {
+        "label": "Performance Improvement (PIP)",
+        "earned": 1 if pip_complete else 0,
+        "target": pip_required,
+        "status": pip_status_label,
+        "detail": pip_detail,
+    }
+    if pip_status_label != "ok" and pip_required > 0:
+        gaps.append("PIP missing")
+
+    safety_block = rules.get("patient_safety_activity")
+    safety_required = bool(
+        isinstance(safety_block, dict) and safety_block.get("required")
+    )
+    safety_completed = False
+    if safety_required:
+        for claim in claims:
+            if classify_topic(claim) == "safety":
+                safety_completed = True
+                break
+
+    if not safety_required:
+        safety_status = "ok"
+        safety_detail = "Patient safety activity not required"
+    else:
+        safety_status = "ok" if safety_completed else "fail"
+        safety_detail = (
+            "Patient safety activity logged"
+            if safety_completed
+            else "No patient safety activity logged yet"
+        )
+
+    pillars["patient_safety"] = {
+        "label": "Patient Safety Activity",
+        "earned": 1 if safety_completed else 0,
+        "target": 1 if safety_required else 0,
+        "status": safety_status,
+        "detail": safety_detail,
+    }
+    if safety_status != "ok" and safety_required:
+        gaps.append("Patient safety activity pending")
+
+    return {
+        "summary": {
+            "target_total": target_total,
+            "earned_total": earned_total,
+            "remaining_total": max(target_total - earned_total, 0.0),
+        },
+        "pillars": pillars,
+        "gaps": gaps,
+        "meta": {
+            "version": requirements_version(req),
+            "board": req.get("board", SAFE_DEFAULT.board),
+            "specialty": req.get("specialty", SAFE_DEFAULT.specialty),
+            "sources": requirements_sources(req),
+        },
+    }
 
 
 def _annual_credits(claims: List[Claim]) -> Dict[int, float]:

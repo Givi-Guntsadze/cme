@@ -2,6 +2,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import List, Optional
 from sqlalchemy import Column
+from sqlalchemy.types import Boolean
 from sqlalchemy.types import JSON
 from sqlmodel import SQLModel, Field
 
@@ -77,7 +78,7 @@ class Claim(SQLModel, table=True):
 class PlanRun(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id")
-    mode: str = "variety"
+    mode: str = "balanced"
     generated_at: datetime = Field(default_factory=utcnow)
     status: str = "active"  # active | stale | superseded
     reason: Optional[str] = None
@@ -96,7 +97,7 @@ class PlanItem(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.id")
     activity_id: int = Field(foreign_key="activity.id")
     plan_run_id: Optional[int] = Field(default=None, foreign_key="planrun.id")
-    mode: str = "variety"
+    mode: str = "balanced"
     position: int = 0
     chosen: bool = True
     pricing_snapshot: Optional[dict] = Field(
@@ -108,6 +109,7 @@ class PlanItem(SQLModel, table=True):
     eligibility_status: Optional[str] = None
     notes: Optional[str] = None
     generated_at: datetime = Field(default_factory=utcnow)
+    committed: bool = Field(default=False, sa_column=Column(Boolean, default=False))
 
 
 class AssistantMessage(SQLModel, table=True):

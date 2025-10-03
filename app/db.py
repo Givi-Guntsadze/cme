@@ -194,6 +194,13 @@ def _apply_migrations() -> None:
             pass
 
         try:
+            conn.execute(
+                text("UPDATE planrun SET mode='balanced' WHERE mode='variety'")
+            )
+        except Exception:
+            pass
+
+        try:
             cols_pi = conn.execute(text("PRAGMA table_info(planitem)")).fetchall()
         except Exception:
             cols_pi = []
@@ -207,8 +214,12 @@ def _apply_migrations() -> None:
                 conn.execute(text("ALTER TABLE planitem ADD COLUMN mode TEXT"))
                 conn.execute(
                     text(
-                        "UPDATE planitem SET mode='variety' WHERE mode IS NULL OR mode=''"
+                        "UPDATE planitem SET mode='balanced' WHERE mode IS NULL OR mode=''"
                     )
+                )
+            else:
+                conn.execute(
+                    text("UPDATE planitem SET mode='balanced' WHERE mode='variety'")
                 )
             if "position" not in pi_names:
                 conn.execute(text("ALTER TABLE planitem ADD COLUMN position INTEGER"))
@@ -243,6 +254,11 @@ def _apply_migrations() -> None:
                 conn.execute(
                     text("ALTER TABLE planitem ADD COLUMN generated_at TIMESTAMP")
                 )
+            if "committed" not in pi_names:
+                conn.execute(text("ALTER TABLE planitem ADD COLUMN committed BOOLEAN"))
+            conn.execute(
+                text("UPDATE planitem SET committed=0 WHERE committed IS NULL")
+            )
 
 
 def purge_seed_activities() -> None:

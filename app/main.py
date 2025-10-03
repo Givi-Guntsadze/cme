@@ -4,15 +4,19 @@ import json
 import logging
 import re
 import asyncio
+import time
+from difflib import SequenceMatcher
 from textwrap import dedent
 from types import SimpleNamespace
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Form, Query
+from datetime import date, datetime
+
+from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import func
 from sqlmodel import select
-from datetime import date, datetime
 
 from .db import create_db_and_tables, get_session
 from .models import (
@@ -20,11 +24,13 @@ from .models import (
     Claim,
     AssistantMessage,
     Activity,
+    PlanItem,
     CompletedActivity,
 )
 from .requirements import (
     load_abpn_psychiatry_requirements,
     validate_against_requirements,
+    validate_full_cc,
 )
 from .parser import parse_message
 from .ingest import ingest_psychiatry_online_ai, safe_json_loads
@@ -37,6 +43,8 @@ from .services.plan import (
     load_policy_bundle,
     policy_for_mode,
 )
+from .prompt import build_system_prompt
+from .planner import pricing_context_for_user, is_eligible
 
 
 @asynccontextmanager
@@ -119,6 +127,262 @@ def _parse_membership_input(raw: object | None) -> list[str]:
         if cleaned:
             members.append(cleaned)
     return members
+
+
+AFFIRMATIVE_REPLIES = {
+    "yes",
+    "y",
+    "yep",
+    "yeah",
+    "sure",
+    "ok",
+    "okay",
+    "please do",
+    "do it",
+    "sounds good",
+    "lets do it",
+    "let's do it",
+    "absolutely",
+    "definitely",
+    "sure thing",
+    "yes please",
+    "please",
+}
+
+NEGATIVE_REPLIES = {
+    "no",
+    "nah",
+    "nope",
+    "not now",
+    "not today",
+    "dont",
+    "don't",
+    "stop",
+    "cancel",
+    "no thanks",
+    "no thank you",
+}
+
+
+def _normalize_response_text(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", text.lower()).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
+def _is_affirmative(text: str) -> bool:
+    if not text:
+        return False
+    cleaned = _normalize_response_text(text)
+    if not cleaned:
+        return False
+    if cleaned in AFFIRMATIVE_REPLIES:
+        return True
+    first_word = cleaned.split(" ")[0]
+    return first_word in AFFIRMATIVE_REPLIES
+
+
+def _is_negative(text: str) -> bool:
+    if not text:
+        return False
+    cleaned = _normalize_response_text(text)
+    if not cleaned:
+        return False
+    if cleaned in NEGATIVE_REPLIES:
+        return True
+    first_word = cleaned.split(" ")[0]
+    return first_word in NEGATIVE_REPLIES
+
+
+def _match_score(search: str, title: str) -> float:
+    title_lower = (title or "").lower()
+    if not title_lower:
+        return 0.0
+    ratio = SequenceMatcher(None, search, title_lower).ratio()
+    if search in title_lower:
+        ratio += 0.75
+    if title_lower.startswith(search):
+        ratio += 0.25
+    tokens = [t for t in search.split(" ") if t]
+    if tokens:
+        hits = sum(1 for token in tokens if token in title_lower)
+        ratio += 0.1 * hits
+    return ratio
+
+
+MIN_MATCH_SCORE = 0.25
+
+
+def _activity_cost_and_days(
+    user: User, activity: Activity, snapshot: dict | None = None
+) -> tuple[float, int, dict]:
+    pricing_context = pricing_context_for_user(user, activity)
+    combined = dict(snapshot or {})
+    combined.update({k: v for k, v in pricing_context.items() if v is not None})
+    cost_value = combined.get("cost")
+    if cost_value is None:
+        cost_value = combined.get("base_cost")
+    if cost_value is None:
+        cost_value = activity.cost_usd
+    cost = float(cost_value or 0.0)
+    days_needed = (
+        activity.days_required if (activity.modality or "").lower() == "live" else 0
+    )
+    return cost, days_needed, combined
+
+
+def find_activity_by_title(session, user: User, text: str) -> Activity | None:
+    search = (text or "").strip().lower()
+    if not search:
+        return None
+
+    plan_manager = PlanManager(session)
+    policy_bundle = load_policy_bundle(session, user)
+    run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+
+    candidates: list[tuple[int, float, int, Activity]] = []
+    seen_ids: set[int] = set()
+
+    if run:
+        plan_items = list(
+            session.exec(
+                select(PlanItem)
+                .where(PlanItem.plan_run_id == run.id)
+                .order_by(PlanItem.position.asc())
+            )
+        )
+        for item in plan_items:
+            activity = session.get(Activity, item.activity_id)
+            if not activity or not activity.title:
+                continue
+            score = _match_score(search, activity.title)
+            if score < MIN_MATCH_SCORE:
+                continue
+            priority = 0 if item.committed else 1
+            candidates.append((priority, -score, item.position, activity))
+            seen_ids.add(activity.id)
+
+    catalog_stmt = select(Activity)
+    for activity in session.exec(catalog_stmt):
+        if activity.id in seen_ids:
+            continue
+        if not activity.title:
+            continue
+        score = _match_score(search, activity.title)
+        if score < MIN_MATCH_SCORE:
+            continue
+        candidates.append((2, -score, len(activity.title or ""), activity))
+
+    if not candidates:
+        return None
+
+    candidates.sort()
+    best_activity = candidates[0][3]
+    best_score = -candidates[0][1]
+    if best_score < MIN_MATCH_SCORE:
+        return None
+    return best_activity
+
+
+def propose_substitute(
+    session, user: User, removed: Activity | None
+) -> Activity | None:
+    plan_manager = PlanManager(session)
+    policy_bundle = load_policy_bundle(session, user)
+    run = plan_manager.ensure_plan(
+        user,
+        "balanced",
+        policy_bundle,
+        force_refresh=True,
+        reason="substitute_search",
+    )
+
+    plan_items = list(
+        session.exec(
+            select(PlanItem)
+            .where(PlanItem.plan_run_id == run.id)
+            .order_by(PlanItem.position.asc())
+        )
+    )
+
+    committed_items = [item for item in plan_items if item.committed]
+    committed_ids = {item.activity_id for item in committed_items}
+    if removed and removed.id:
+        committed_ids.add(removed.id)
+
+    used_budget = 0.0
+    used_days = 0
+    for item in committed_items:
+        activity = session.get(Activity, item.activity_id)
+        if not activity:
+            continue
+        cost, days_needed, _ = _activity_cost_and_days(
+            user, activity, item.pricing_snapshot
+        )
+        used_budget += cost
+        used_days += days_needed
+
+    available_budget = max(float(user.budget_usd or 0.0) - used_budget, 0.0)
+    available_days = max(int(getattr(user, "days_off", 0) or 0) - used_days, 0)
+
+    best_choice: tuple[tuple[float, float, int], Activity] | None = None
+
+    for item in plan_items:
+        if item.committed:
+            continue
+        if removed and item.activity_id == removed.id:
+            continue
+        activity = session.get(Activity, item.activity_id)
+        if not activity:
+            continue
+        if not user.allow_live and (activity.modality or "").lower() == "live":
+            continue
+        cost, days_needed, pricing = _activity_cost_and_days(
+            user, activity, item.pricing_snapshot
+        )
+        if cost > available_budget + 1e-6:
+            continue
+        if days_needed > available_days:
+            continue
+        if not is_eligible(user, activity):
+            continue
+        removed_credits = float(removed.credits or 0.0) if removed else 0.0
+        credits = float(activity.credits or 0.0)
+        delta = abs(credits - removed_credits) if removed else credits
+        cost_per_credit = cost / credits if credits else float("inf")
+        key = (delta, cost_per_credit, item.position)
+        if best_choice is None or key < best_choice[0]:
+            best_choice = (key, activity)
+
+    if best_choice:
+        return best_choice[1]
+
+    return None
+
+
+def _get_latest_internal_message(
+    session, user_id: int, prefix: str
+) -> AssistantMessage | None:
+    stmt = (
+        select(AssistantMessage)
+        .where(AssistantMessage.user_id == user_id)
+        .order_by(AssistantMessage.created_at.desc())
+    )
+    for message in session.exec(stmt):
+        content = (message.content or "").strip()
+        if content.startswith(prefix):
+            return message
+    return None
+
+
+def _pop_internal_message(
+    session, user_id: int, prefix: str
+) -> AssistantMessage | None:
+    message = _get_latest_internal_message(session, user_id, prefix)
+    if message:
+        session.delete(message)
+        session.flush()
+    return message
 
 
 def _apply_patch_to_user(patch: dict, session, user: User) -> list[str]:
@@ -314,8 +578,8 @@ def _state_snapshot(session, user: User) -> dict[str, object]:
 
     plan_manager = PlanManager(session)
     policy_bundle = load_policy_bundle(session, user)
-    run = plan_manager.ensure_plan(user, "variety", policy_bundle)
-    plan_entries, _, _ = plan_manager.serialize_plan(run, user)
+    run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+    plan_entries, plan_summary, _ = plan_manager.serialize_plan(run, user)
     top = []
     for entry in plan_entries[:6]:
         top.append(
@@ -330,6 +594,7 @@ def _state_snapshot(session, user: User) -> dict[str, object]:
                 "modality": entry.get("modality"),
                 "city": entry.get("city"),
                 "hybrid_available": entry.get("hybrid_available"),
+                "committed": entry.get("committed", False),
             }
         )
 
@@ -358,6 +623,7 @@ def _state_snapshot(session, user: User) -> dict[str, object]:
         "remaining": remaining,
         "user": snapshot_user,
         "top_plan": top,
+        "plan_summary": plan_summary or {},
         "requirements": {
             "summary": validation.get("summary", {}),
             "checks": validation.get("checks", []),
@@ -507,7 +773,7 @@ def _derive_controls(
             "default"?: OBJECT,
             "by_mode"?: {
               "cheapest"?: OBJECT,
-              "variety"?: OBJECT
+              "balanced"?: OBJECT
             }
           }
         }
@@ -563,7 +829,7 @@ def _derive_controls(
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    plan_mode = "variety"
+    plan_mode = "balanced"
 
     policy_status_entries: list[dict[str, object]] = []
 
@@ -652,6 +918,19 @@ def home(request: Request):
         )
         requirements_data = load_abpn_psychiatry_requirements()
         validation = validate_against_requirements(user, claims, requirements_data)
+
+        pip_status = {"complete": False, "reason": None}
+        for claim in claims:
+            topic = (claim.topic or "").lower()
+            if topic in {"pip_complete", "pip completion"}:
+                pip_status = {
+                    "complete": True,
+                    "reason": "Documented pip_complete claim",
+                }
+                break
+
+        validation_full = validate_full_cc(user, claims, requirements_data, pip_status)
+
         claims = list(session.exec(select(Claim).where(Claim.user_id == user.id)))
         return templates.TemplateResponse(
             "index.html",
@@ -664,8 +943,10 @@ def home(request: Request):
                 "claims": claims,
                 "assistant_messages": msgs,
                 "validation": validation,
+                "validation_full": validation_full,
                 "active_policy": active_policy,
                 "policy_status": policy_status_entries,
+                "plan_mode": plan_mode,
                 "is_dev": bool(
                     os.getenv("ENV") in ("dev", "development")
                     or str(os.getenv("DEBUG")) in ("1", "true", "True")
@@ -675,8 +956,9 @@ def home(request: Request):
 
 
 @app.get("/fragment/plan", response_class=HTMLResponse)
-def plan_fragment(request: Request, plan_mode: str = Query("variety")):
-    plan_mode = "variety"
+def plan_fragment(request: Request):
+    requested_mode = request.query_params.get("mode", "balanced").lower()
+    plan_mode = "cheapest" if requested_mode == "cheapest" else "balanced"
     with get_session() as session:
         user = session.exec(select(User)).first()
         if not user:
@@ -708,6 +990,109 @@ def plan_fragment(request: Request, plan_mode: str = Query("variety")):
                 "plan_requirements": plan_requirements,
                 "plan_mode": plan_mode,
             },
+        )
+
+
+def _refresh_plan_fragment_response(
+    request: Request,
+    session,
+    user: User,
+    plan_mode: str = "balanced",
+    force_refresh: bool = True,
+    reason: str | None = None,
+):
+    plan_manager = PlanManager(session)
+    policy_bundle = load_policy_bundle(session, user)
+    plan_run = plan_manager.ensure_plan(
+        user,
+        plan_mode,
+        policy_bundle,
+        force_refresh=force_refresh,
+        reason=reason,
+    )
+    plan, plan_summary, plan_requirements = plan_manager.serialize_plan(plan_run, user)
+    return templates.TemplateResponse(
+        "_plan.html",
+        {
+            "request": request,
+            "user": user,
+            "plan": plan,
+            "plan_summary": plan_summary,
+            "plan_requirements": plan_requirements,
+            "plan_mode": plan_mode,
+        },
+    )
+
+
+@app.post("/plan/commit/{activity_id}", response_class=HTMLResponse)
+def plan_commit(request: Request, activity_id: int):
+    with get_session() as session:
+        user = session.exec(select(User)).first()
+        if not user:
+            return HTMLResponse("", status_code=204)
+        plan_manager = PlanManager(session)
+        policy_bundle = load_policy_bundle(session, user)
+        run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+        item = session.exec(
+            select(PlanItem)
+            .where(
+                PlanItem.plan_run_id == run.id,
+                PlanItem.activity_id == activity_id,
+            )
+            .limit(1)
+        ).first()
+        if not item:
+            return _refresh_plan_fragment_response(
+                request, session, user, plan_mode="balanced", force_refresh=True
+            )
+        if not item.committed:
+            item.committed = True
+            session.add(item)
+        PlanManager.invalidate_user_plans(session, user.id, reason="commit_toggle")
+        session.commit()
+    with get_session() as session:
+        user = session.exec(select(User)).first()
+        return _refresh_plan_fragment_response(
+            request,
+            session,
+            user,
+            plan_mode="balanced",
+            force_refresh=True,
+            reason="commit_toggle",
+        )
+
+
+@app.post("/plan/uncommit/{activity_id}", response_class=HTMLResponse)
+def plan_uncommit(request: Request, activity_id: int):
+    with get_session() as session:
+        user = session.exec(select(User)).first()
+        if not user:
+            return HTMLResponse("", status_code=204)
+        plan_manager = PlanManager(session)
+        policy_bundle = load_policy_bundle(session, user)
+        run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+        item = session.exec(
+            select(PlanItem)
+            .where(
+                PlanItem.plan_run_id == run.id,
+                PlanItem.activity_id == activity_id,
+            )
+            .limit(1)
+        ).first()
+        if item and item.committed:
+            item.committed = False
+            session.add(item)
+        PlanManager.invalidate_user_plans(session, user.id, reason="commit_toggle")
+        session.commit()
+    with get_session() as session:
+        user = session.exec(select(User)).first()
+        return _refresh_plan_fragment_response(
+            request,
+            session,
+            user,
+            plan_mode="balanced",
+            force_refresh=True,
+            reason="commit_toggle",
         )
 
 
@@ -819,7 +1204,7 @@ def log(request: Request):
             "plan": [],
             "claims": claims,
             "assistant_messages": msgs,
-            "plan_mode": request.query_params.get("plan_mode", "variety"),
+            "plan_mode": request.query_params.get("mode", "balanced"),
             "validation": validation,
             "policy_status": policy_status_entries,
             "is_dev": bool(
@@ -896,7 +1281,7 @@ def assist():
             return JSONResponse({"error": "no_user"}, status_code=400)
         plan_manager = PlanManager(session)
         policy_bundle = load_policy_bundle(session, user)
-        run = plan_manager.ensure_plan(user, "variety", policy_bundle)
+        run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
         plan_entries, _, _ = plan_manager.serialize_plan(run, user)
         plan = [
             {
@@ -1270,6 +1655,8 @@ def chat_send(request: Request, text: str = Form(...)):
                 session.refresh(user)
 
             plan_manager = PlanManager(session)
+            plan_update_needed = False
+            action_requested = False
             user_message = AssistantMessage(
                 user_id=user.id, role="user", content=text.strip()[:4000]
             )
@@ -1282,6 +1669,475 @@ def chat_send(request: Request, text: str = Form(...)):
             note_text = _maybe_complete_activity_from_text(user, text, session)
             if note_text:
                 pending_notes.append(note_text)
+
+            if "keep this plan" in normalized_text:
+                policy_bundle = load_policy_bundle(session, user)
+                run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+                plan_items = list(
+                    session.exec(
+                        select(PlanItem)
+                        .where(PlanItem.plan_run_id == run.id)
+                        .order_by(PlanItem.position.asc())
+                    )
+                )
+                newly_committed = 0
+                for item in plan_items:
+                    if not item.committed:
+                        item.committed = True
+                        session.add(item)
+                        newly_committed += 1
+                if newly_committed:
+                    PlanManager.invalidate_user_plans(
+                        session, user.id, reason="commit_all"
+                    )
+                session.commit()
+
+                refreshed_run = plan_manager.ensure_plan(
+                    user,
+                    "balanced",
+                    load_policy_bundle(session, user),
+                    force_refresh=True,
+                    reason="commit_all" if newly_committed else None,
+                )
+                plan, plan_summary, _ = plan_manager.serialize_plan(refreshed_run, user)
+                confirmation_text = (
+                    f"Locked in {len(plan)} activities; I'll keep them fixed while we fill remaining gaps."
+                    if newly_committed
+                    else "Everything in the current plan was already committed."
+                )
+                confirmation = AssistantMessage(
+                    user_id=user.id,
+                    role="assistant",
+                    content=confirmation_text[:4000],
+                )
+                session.add(confirmation)
+
+                item_count = len(plan)
+                total_cost_value = None
+                if isinstance(plan_summary, dict):
+                    total_cost_value = plan_summary.get("total_cost")
+                cost_phrase = (
+                    f"${total_cost_value:,.0f}"
+                    if isinstance(total_cost_value, (int, float))
+                    else "$0"
+                )
+                remaining_value = float(user.remaining_credits or 0.0)
+                plan_note = AssistantMessage(
+                    user_id=user.id,
+                    role="assistant",
+                    content=(
+                        f"Plan updated ({item_count} items, {cost_phrase} total, "
+                        f"{remaining_value:.1f} remaining)."
+                    ),
+                )
+                session.add(plan_note)
+                session.commit()
+
+                messages_to_render = [
+                    SimpleNamespace(
+                        role=user_message.role, content=user_message.content
+                    ),
+                    SimpleNamespace(
+                        role=confirmation.role, content=confirmation.content
+                    ),
+                    SimpleNamespace(role=plan_note.role, content=plan_note.content),
+                ]
+
+                time.sleep(1.2)
+                response = templates.TemplateResponse(
+                    "_chat_messages_append.html",
+                    {"request": request, "messages": messages_to_render},
+                )
+                response.headers["HX-Trigger"] = json.dumps({"plan-refresh": True})
+                return response
+
+            user_text_trimmed = text.strip()
+            if user_text_trimmed.lower().startswith("remove "):
+                target_text = user_text_trimmed[7:].strip().strip(".!")
+                activity = find_activity_by_title(session, user, target_text)
+
+                if not activity:
+                    miss_msg = AssistantMessage(
+                        user_id=user.id,
+                        role="assistant",
+                        content=(
+                            "I couldn't find that activity in the current plan. "
+                            "Double-check the title and I'll remove it."
+                        ),
+                    )
+                    session.add(miss_msg)
+                    session.commit()
+                    messages_to_render = [
+                        SimpleNamespace(
+                            role=user_message.role, content=user_message.content
+                        ),
+                        SimpleNamespace(role=miss_msg.role, content=miss_msg.content),
+                    ]
+                    time.sleep(1.2)
+                    return templates.TemplateResponse(
+                        "_chat_messages_append.html",
+                        {"request": request, "messages": messages_to_render},
+                    )
+
+                policy_bundle = load_policy_bundle(session, user)
+                run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+                plan_items = list(
+                    session.exec(
+                        select(PlanItem)
+                        .where(
+                            PlanItem.plan_run_id == run.id,
+                            PlanItem.activity_id == activity.id,
+                        )
+                        .order_by(PlanItem.position.asc())
+                    )
+                )
+
+                for item in plan_items:
+                    if item.committed:
+                        item.committed = False
+                        session.add(item)
+
+                removal_payload = json.dumps({"remove_titles": [activity.title]})
+                apply_policy_payloads(
+                    [removal_payload],
+                    user,
+                    session,
+                    invalidate=False,
+                    record_message=False,
+                )
+
+                PlanManager.invalidate_user_plans(
+                    session, user.id, reason="remove_activity"
+                )
+                session.commit()
+
+                refreshed_run = plan_manager.ensure_plan(
+                    user,
+                    "balanced",
+                    load_policy_bundle(session, user),
+                    force_refresh=True,
+                    reason="remove_activity",
+                )
+                plan, plan_summary, _ = plan_manager.serialize_plan(refreshed_run, user)
+
+                cost_phrase = "$0"
+                if isinstance(plan_summary, dict):
+                    total_cost_value = plan_summary.get("total_cost")
+                    if isinstance(total_cost_value, (int, float)):
+                        cost_phrase = f"${total_cost_value:,.0f}"
+
+                remaining_value = float(user.remaining_credits or 0.0)
+
+                removal_msg = AssistantMessage(
+                    user_id=user.id,
+                    role="assistant",
+                    content=(f"Removed {activity.title}. Shall I find a substitute?"),
+                )
+                session.add(removal_msg)
+                session.add(
+                    AssistantMessage(
+                        user_id=user.id,
+                        role="assistant",
+                        content=f"INTERNAL:SUBSTITUTE_REQUEST:{activity.id}",
+                    )
+                )
+
+                plan_note = AssistantMessage(
+                    user_id=user.id,
+                    role="assistant",
+                    content=(
+                        f"Plan updated ({len(plan)} items, {cost_phrase} total, "
+                        f"{remaining_value:.1f} remaining)."
+                    ),
+                )
+                session.add(plan_note)
+                session.commit()
+
+                messages_to_render = [
+                    SimpleNamespace(
+                        role=user_message.role, content=user_message.content
+                    ),
+                    SimpleNamespace(role=removal_msg.role, content=removal_msg.content),
+                    SimpleNamespace(role=plan_note.role, content=plan_note.content),
+                ]
+
+                time.sleep(1.2)
+                response = templates.TemplateResponse(
+                    "_chat_messages_append.html",
+                    {"request": request, "messages": messages_to_render},
+                )
+                response.headers["HX-Trigger"] = json.dumps({"plan-refresh": True})
+                return response
+
+            affirmative = _is_affirmative(text)
+            negative = _is_negative(text)
+
+            if affirmative:
+                candidate_msg = _pop_internal_message(
+                    session, user.id, "INTERNAL:SUBSTITUTE_CANDIDATE:"
+                )
+                if candidate_msg:
+                    try:
+                        candidate_id = int(candidate_msg.content.split(":", 2)[-1])
+                    except Exception:
+                        candidate_id = None
+
+                    candidate_activity = (
+                        session.get(Activity, candidate_id) if candidate_id else None
+                    )
+                    if not candidate_activity:
+                        error_msg = AssistantMessage(
+                            user_id=user.id,
+                            role="assistant",
+                            content="I couldn't locate that option anymore, but I can search again if you'd like.",
+                        )
+                        session.add(error_msg)
+                        session.commit()
+                        messages_to_render = [
+                            SimpleNamespace(
+                                role=user_message.role, content=user_message.content
+                            ),
+                            SimpleNamespace(
+                                role=error_msg.role, content=error_msg.content
+                            ),
+                        ]
+                        time.sleep(1.2)
+                        return templates.TemplateResponse(
+                            "_chat_messages_append.html",
+                            {"request": request, "messages": messages_to_render},
+                        )
+
+                    policy_bundle = load_policy_bundle(session, user)
+                    run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+                    plan_item = session.exec(
+                        select(PlanItem)
+                        .where(
+                            PlanItem.plan_run_id == run.id,
+                            PlanItem.activity_id == candidate_activity.id,
+                        )
+                        .limit(1)
+                    ).first()
+
+                    if plan_item is None:
+                        current_max = session.exec(
+                            select(func.max(PlanItem.position)).where(
+                                PlanItem.plan_run_id == run.id
+                            )
+                        ).first()
+                        next_position = int(current_max or 0) + 1
+                        cost, _, pricing = _activity_cost_and_days(
+                            user, candidate_activity
+                        )
+                        plan_item = PlanItem(
+                            user_id=user.id,
+                            activity_id=candidate_activity.id,
+                            plan_run_id=run.id,
+                            mode="balanced",
+                            position=next_position,
+                            chosen=True,
+                            pricing_snapshot={
+                                "cost": cost,
+                                "base_cost": pricing.get("base_cost"),
+                                "deadline_text": pricing.get("deadline_text"),
+                                "deadline_urgency": pricing.get("deadline_urgency"),
+                                "price_label": pricing.get("price_label"),
+                                "notes": pricing.get("notes"),
+                                "hybrid_available": pricing.get("hybrid_available"),
+                            },
+                            requirement_snapshot={
+                                "tags": [],
+                                "requirement_priority": False,
+                            },
+                            eligibility_status=(
+                                "eligible"
+                                if is_eligible(user, candidate_activity)
+                                else "uncertain"
+                            ),
+                            notes=pricing.get("notes"),
+                            committed=True,
+                        )
+                        session.add(plan_item)
+                    else:
+                        if not plan_item.committed:
+                            plan_item.committed = True
+                            session.add(plan_item)
+
+                    PlanManager.invalidate_user_plans(
+                        session, user.id, reason="commit_substitute"
+                    )
+                    session.commit()
+
+                    refreshed_run = plan_manager.ensure_plan(
+                        user,
+                        "balanced",
+                        load_policy_bundle(session, user),
+                        force_refresh=True,
+                        reason="commit_substitute",
+                    )
+                    plan, plan_summary, _ = plan_manager.serialize_plan(
+                        refreshed_run, user
+                    )
+
+                    cost_phrase = "$0"
+                    if isinstance(plan_summary, dict):
+                        total_cost_value = plan_summary.get("total_cost")
+                        if isinstance(total_cost_value, (int, float)):
+                            cost_phrase = f"${total_cost_value:,.0f}"
+
+                    remaining_value = float(user.remaining_credits or 0.0)
+
+                    ack = AssistantMessage(
+                        user_id=user.id,
+                        role="assistant",
+                        content=(
+                            f"Added {candidate_activity.title} to your plan. Anything else you'd like to adjust?"
+                        ),
+                    )
+                    session.add(ack)
+
+                    plan_note = AssistantMessage(
+                        user_id=user.id,
+                        role="assistant",
+                        content=(
+                            f"Plan updated ({len(plan)} items, {cost_phrase} total, "
+                            f"{remaining_value:.1f} remaining)."
+                        ),
+                    )
+                    session.add(plan_note)
+                    session.commit()
+
+                    messages_to_render = [
+                        SimpleNamespace(
+                            role=user_message.role, content=user_message.content
+                        ),
+                        SimpleNamespace(role=ack.role, content=ack.content),
+                        SimpleNamespace(role=plan_note.role, content=plan_note.content),
+                    ]
+
+                    time.sleep(1.2)
+                    response = templates.TemplateResponse(
+                        "_chat_messages_append.html",
+                        {"request": request, "messages": messages_to_render},
+                    )
+                    response.headers["HX-Trigger"] = json.dumps({"plan-refresh": True})
+                    return response
+
+                request_msg = _pop_internal_message(
+                    session, user.id, "INTERNAL:SUBSTITUTE_REQUEST:"
+                )
+                if request_msg:
+                    try:
+                        removed_id = int(request_msg.content.split(":", 2)[-1])
+                    except Exception:
+                        removed_id = None
+                    removed_activity = (
+                        session.get(Activity, removed_id) if removed_id else None
+                    )
+                    candidate = propose_substitute(session, user, removed_activity)
+                    if candidate:
+                        cost, _, pricing = _activity_cost_and_days(user, candidate)
+                        cost_phrase = f"${cost:,.0f}" if cost else "Free"
+                        message_text = (
+                            f"I found {candidate.title} ({candidate.credits:.1f} cr, {cost_phrase}). "
+                            "Add it to the plan?"
+                        )
+                        suggestion = AssistantMessage(
+                            user_id=user.id,
+                            role="assistant",
+                            content=message_text[:4000],
+                        )
+                        session.add(suggestion)
+                        session.add(
+                            AssistantMessage(
+                                user_id=user.id,
+                                role="assistant",
+                                content=f"INTERNAL:SUBSTITUTE_CANDIDATE:{candidate.id}",
+                            )
+                        )
+                        session.commit()
+                        messages_to_render = [
+                            SimpleNamespace(
+                                role=user_message.role, content=user_message.content
+                            ),
+                            SimpleNamespace(
+                                role=suggestion.role, content=suggestion.content
+                            ),
+                        ]
+                        time.sleep(1.2)
+                        return templates.TemplateResponse(
+                            "_chat_messages_append.html",
+                            {"request": request, "messages": messages_to_render},
+                        )
+                    else:
+                        no_sub_msg = AssistantMessage(
+                            user_id=user.id,
+                            role="assistant",
+                            content=(
+                                "I didn't find a good substitute yet, but I can broaden the search whenever you like."
+                            ),
+                        )
+                        session.add(no_sub_msg)
+                        session.commit()
+                        messages_to_render = [
+                            SimpleNamespace(
+                                role=user_message.role, content=user_message.content
+                            ),
+                            SimpleNamespace(
+                                role=no_sub_msg.role, content=no_sub_msg.content
+                            ),
+                        ]
+                        time.sleep(1.2)
+                        return templates.TemplateResponse(
+                            "_chat_messages_append.html",
+                            {"request": request, "messages": messages_to_render},
+                        )
+
+            if negative:
+                candidate_msg = _pop_internal_message(
+                    session, user.id, "INTERNAL:SUBSTITUTE_CANDIDATE:"
+                )
+                if candidate_msg:
+                    decline = AssistantMessage(
+                        user_id=user.id,
+                        role="assistant",
+                        content="No problem—I'll leave that slot open. Let me know if you want other ideas.",
+                    )
+                    session.add(decline)
+                    session.commit()
+                    messages_to_render = [
+                        SimpleNamespace(
+                            role=user_message.role, content=user_message.content
+                        ),
+                        SimpleNamespace(role=decline.role, content=decline.content),
+                    ]
+                    time.sleep(1.2)
+                    return templates.TemplateResponse(
+                        "_chat_messages_append.html",
+                        {"request": request, "messages": messages_to_render},
+                    )
+
+                request_msg = _pop_internal_message(
+                    session, user.id, "INTERNAL:SUBSTITUTE_REQUEST:"
+                )
+                if request_msg:
+                    decline = AssistantMessage(
+                        user_id=user.id,
+                        role="assistant",
+                        content="Got it—I’ll keep that slot empty for now.",
+                    )
+                    session.add(decline)
+                    session.commit()
+                    messages_to_render = [
+                        SimpleNamespace(
+                            role=user_message.role, content=user_message.content
+                        ),
+                        SimpleNamespace(role=decline.role, content=decline.content),
+                    ]
+                    time.sleep(1.2)
+                    return templates.TemplateResponse(
+                        "_chat_messages_append.html",
+                        {"request": request, "messages": messages_to_render},
+                    )
 
             if normalized_text in {"clear policy", "clear policies", "reset policy"}:
                 cleared = clear_policies(session, user)
@@ -1296,7 +2152,7 @@ def chat_send(request: Request, text: str = Form(...)):
                 session.add(confirm)
                 plan_manager = PlanManager(session)
                 policy_bundle = load_policy_bundle(session, user)
-                summary_text, variety_count, cheapest_count = (
+                summary_text, balanced_count, cheapest_count = (
                     plan_manager.summarize_modes(
                         user, policy_bundle, force_refresh=True
                     )
@@ -1310,7 +2166,7 @@ def chat_send(request: Request, text: str = Form(...)):
                     user_id=user.id,
                     role="assistant",
                     content=(
-                        f"Plan updated ({variety_count} variety items, "
+                        f"Plan updated ({balanced_count} balanced items, "
                         f"{cheapest_count} cheapest)."
                     ),
                 )
@@ -1331,44 +2187,7 @@ def chat_send(request: Request, text: str = Form(...)):
                 )
 
             snapshot = _state_snapshot(session, user)
-
-            system_prompt = dedent(
-                """
-                You are a CME planning assistant for a board-certified US physician.
-
-                Behavior:
-
-                Be concise and helpful.
-
-                Explain why the top plan activities were selected (cost per credit, budget, days_off, allow_live).
-
-                Ask at most 1–2 clarifying questions only when genuinely useful.
-
-                When the user expresses preference updates (e.g., “online only”, “budget 200”, “days off 1”, “target 30”):
-
-                Acknowledge briefly in natural language.
-
-                Append a single machine-readable line:
-                PATCH: {"only_changed_fields_here": "..."}
-                • Only include keys among: budget_usd, days_off, allow_live, city, specialty,
-                  target_credits, professional_stage, residency_completion_year, memberships
-                • Use correct JSON types (numbers for budgets/targets, booleans for allow_live, strings for city/specialty)
-                • memberships should be an array of strings when provided
-                • No backticks, no code fences, no extra text on that line
-
-                If the user indicates remaining credits explicitly (e.g., “remaining 17”
-                or “I have 12 left”), still reply normally; no patch is needed for this.
-                (The system will adjust remaining by logging a claim.)
-
-                If you suggest plan policies, you may optionally add another machine line:
-                POLICY: {"plan_mode":"variety","notes":"avoid subscriptions",
-                "weights":{"diversity":0.4}}
-                Keep policies compact and only if you actually changed them.
-
-                Never lead with raw control JSON. First provide the human explanation, then append control lines if needed.
-                Do not repeat the PATCH or POLICY content in prose. Do not wrap control lines in code fences.
-                """
-            ).strip()
+            system_prompt = build_system_prompt(snapshot)
 
             user_payload = f"User said: {text}\n\nCurrent state snapshot:\n{json.dumps(snapshot, default=str)}"
 
@@ -1393,6 +2212,7 @@ def chat_send(request: Request, text: str = Form(...)):
 
             patch_payloads: list[str] = []
             policy_payloads: list[str] = []
+            action_command: str | None = None
             visible_lines: list[str] = []
             for line in reply.splitlines():
                 stripped = line.strip()
@@ -1406,11 +2226,21 @@ def chat_send(request: Request, text: str = Form(...)):
                     if payload:
                         policy_payloads.append(payload)
                     continue
+                if stripped.startswith("ACTION:"):
+                    action_command = (
+                        stripped.removeprefix("ACTION:").strip().lower() or None
+                    )
+                    if action_command in {"discover", "ingest", "refresh"}:
+                        action_requested = True
+                    continue
                 visible_lines.append(line)
 
             visible_reply = "\n".join(visible_lines).strip()
             if not visible_reply:
                 visible_reply = "Updated the plan to match your request."
+
+            if action_command in {"discover", "ingest", "refresh"}:
+                should_ingest = True
 
             if not patch_payloads and not policy_payloads:
                 derived_patch, derived_policy = _derive_controls(text, snapshot)
@@ -1423,6 +2253,8 @@ def chat_send(request: Request, text: str = Form(...)):
             session.add(assistant_message)
 
             extra_messages = _apply_patch_if_present(patch_payloads, user, session)
+            if extra_messages:
+                plan_update_needed = True
             apply_policy_payloads(policy_payloads, user, session)
 
             confirmations: list[AssistantMessage] = []
@@ -1440,6 +2272,7 @@ def chat_send(request: Request, text: str = Form(...)):
                         changed = _apply_patch_to_user(patch, session, user)
                         if changed:
                             should_ingest = True
+                            plan_update_needed = True
                             confirm = AssistantMessage(
                                 role="assistant",
                                 content=(
@@ -1493,33 +2326,40 @@ def chat_send(request: Request, text: str = Form(...)):
                         session, user.id, reason="ingest_refresh"
                     )
 
-            policy_bundle = load_policy_bundle(session, user)
-            plan_summary, variety_count, cheapest_count = plan_manager.summarize_modes(
-                user, policy_bundle, force_refresh=ingest_success
-            )
+            if action_requested or ingest_success:
+                plan_update_needed = True
 
-            if should_ingest:
-                assistant_message.content = plan_summary[:4000]
-            else:
-                assistant_message.content = (
-                    (assistant_message.content or "").rstrip() + "\n\n" + plan_summary
-                )[:4000]
-
-            plan_note_needed = bool(
-                confirmations or extra_messages or patch_payloads or should_ingest
-            )
-            if plan_note_needed:
-                plan_note = AssistantMessage(
+            if plan_update_needed:
+                policy_bundle = load_policy_bundle(session, user)
+                plan_run = plan_manager.ensure_plan(
+                    user,
+                    "balanced",
+                    policy_bundle,
+                    force_refresh=ingest_success,
+                    reason="chat_refresh" if ingest_success else None,
+                )
+                plan_items, plan_summary, _ = plan_manager.serialize_plan(
+                    plan_run, user
+                )
+                item_count = len(plan_items)
+                total_cost_value = None
+                if isinstance(plan_summary, dict):
+                    total_cost_value = plan_summary.get("total_cost")
+                if isinstance(total_cost_value, (int, float)):
+                    cost_phrase = f"${total_cost_value:,.0f}"
+                else:
+                    cost_phrase = "$0"
+                remaining_value = float(user.remaining_credits or 0.0)
+                plan_note_message = AssistantMessage(
                     user_id=user.id,
                     role="assistant",
                     content=(
-                        f"Plan updated ({variety_count} variety items, "
-                        f"{cheapest_count} cheapest)."
+                        f"Plan updated ({item_count} items, {cost_phrase} total, "
+                        f"{remaining_value:.1f} remaining)."
                     ),
                 )
-                session.add(plan_note)
-                confirmations.append(plan_note)
-
+                session.add(plan_note_message)
+                confirmations.append(plan_note_message)
             messages_to_render = [
                 SimpleNamespace(role=m.role, content=m.content)
                 for m in [
@@ -1532,6 +2372,7 @@ def chat_send(request: Request, text: str = Form(...)):
 
             session.commit()
 
+        time.sleep(1.2)
         return templates.TemplateResponse(
             "_chat_messages_append.html",
             {"request": request, "messages": messages_to_render},
@@ -1544,37 +2385,62 @@ def chat_send(request: Request, text: str = Form(...)):
         )
 
 
-@app.post("/plan/remove")
-def plan_remove(title: str = Form(...)):
-    # Append the title to policy.remove_titles and save as a new POLICY message
+@app.post("/plan/remove", response_class=HTMLResponse)
+def plan_remove(request: Request, title: str = Form(...)):
     with get_session() as session:
         user = session.exec(select(User)).first()
         if not user:
-            return RedirectResponse("/", status_code=303)
-        msgs = list(
+            return HTMLResponse("", status_code=204)
+
+        activity = find_activity_by_title(session, user, title)
+        if not activity:
+            return _refresh_plan_fragment_response(
+                request,
+                session,
+                user,
+                plan_mode="balanced",
+                force_refresh=False,
+            )
+
+        plan_manager = PlanManager(session)
+        policy_bundle = load_policy_bundle(session, user)
+        run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+        plan_items = list(
             session.exec(
-                select(AssistantMessage).where(AssistantMessage.user_id == user.id)
+                select(PlanItem)
+                .where(
+                    PlanItem.plan_run_id == run.id,
+                    PlanItem.activity_id == activity.id,
+                )
+                .order_by(PlanItem.position.asc())
             )
         )
-        policy = {}
-        for m in reversed(msgs):
-            if isinstance(m.content, str) and m.content.startswith("POLICY:"):
-                try:
-                    policy = json.loads(m.content.removeprefix("POLICY:")) or {}
-                except Exception:
-                    policy = {}
-                break
-        remove_list = list(policy.get("remove_titles") or [])
-        if title not in remove_list:
-            remove_list.append(title)
-        policy["remove_titles"] = remove_list
-        session.add(
-            AssistantMessage(user_id=user.id, content="POLICY:" + json.dumps(policy))
+
+        for item in plan_items:
+            if item.committed:
+                item.committed = False
+                session.add(item)
+
+        removal_payload = json.dumps({"remove_titles": [activity.title]})
+        apply_policy_payloads(
+            [removal_payload],
+            user,
+            session,
+            invalidate=False,
+            record_message=False,
         )
-        session.add(AssistantMessage(user_id=user.id, content=f"Removed: {title}"))
+
         PlanManager.invalidate_user_plans(session, user.id, reason="plan_remove")
         session.commit()
-    return RedirectResponse("/", status_code=303)
+
+        return _refresh_plan_fragment_response(
+            request,
+            session,
+            user,
+            plan_mode="balanced",
+            force_refresh=True,
+            reason="plan_remove",
+        )
 
 
 @app.get("/health")
@@ -1606,7 +2472,7 @@ def policy_clear(request: Request):
         session.add(note)
         plan_manager = PlanManager(session)
         policy_bundle = load_policy_bundle(session, user)
-        summary_text, variety_count, cheapest_count = plan_manager.summarize_modes(
+        summary_text, balanced_count, cheapest_count = plan_manager.summarize_modes(
             user, policy_bundle, force_refresh=True
         )
         summary_msg = AssistantMessage(
@@ -1618,7 +2484,7 @@ def policy_clear(request: Request):
             user_id=user.id,
             role="assistant",
             content=(
-                f"Plan updated ({variety_count} variety items, {cheapest_count} cheapest)."
+                f"Plan updated ({balanced_count} balanced items, {cheapest_count} cheapest)."
             ),
         )
         session.add(summary_msg)

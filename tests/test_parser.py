@@ -19,6 +19,14 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(topic, "safety")
         self.assertIsInstance(parsed_date, date)
 
+    def test_preference_statement_skips_claim(self) -> None:
+        credits, topic, parsed_date = parse_message(
+            "I'd rather attend one conference and get 45 credits"
+        )
+        self.assertEqual(credits, 0.0)
+        self.assertEqual(topic, None)
+        self.assertIsInstance(parsed_date, date)
+
 
 if __name__ == "__main__":
     unittest.main()
