@@ -482,8 +482,6 @@ def build_plan(
         if remaining_override is not None
         else max(float(user.remaining_credits or 0.0), 0.0)
     )
-    if remaining_target <= 0:
-        return ([], 0.0, 0.0, 0)
 
     budget_cap = (
         float(budget_override)
@@ -529,6 +527,18 @@ def build_plan(
     pip_needed = int(req_ctx.get("pip_needed") or 0)
     if pip_needed > 0 and not any(_is_pip_activity(a) for a in activities):
         pip_needed = 0
+
+    requirement_floor = remaining_target
+    if sa_needed > 0:
+        requirement_floor = max(requirement_floor, sa_needed)
+    if patient_safety_pending:
+        requirement_floor = max(requirement_floor, 1.0)
+    if pip_needed > 0:
+        requirement_floor = max(requirement_floor, 5.0 * pip_needed)
+
+    remaining_target = requirement_floor
+    if remaining_target <= 0:
+        return ([], 0.0, 0.0, 0)
 
     chosen: List[Activity] = []
     total_credits = 0.0

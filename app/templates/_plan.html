@@ -10,11 +10,7 @@
       type="button"
     >Discover</button>
   </div>
-  {% if plan_mode == 'cheapest' %}
-    <p class="meta" style="margin-top: -4px;">Cheapest plan view. Your committed picks stay fixed while we surface lower-cost fillers.</p>
-  {% else %}
-    <p class="meta" style="margin-top: -4px;">Balanced plan shown. Ask for a "cheapest plan" if you prefer maximum savings.</p>
-  {% endif %}
+  <p class="meta" style="margin-top: -4px;">Balanced plan shown. Ask if you'd like more discovery or a cheaper mix.</p>
   {% if plan_summary %}
     <div class="meta plan-summary">
       {{ plan_summary.item_count }} {{ 'activity' if plan_summary.item_count == 1 else 'activities' }}
@@ -94,30 +90,28 @@
               {% endfor %}
             </div>
           {% endif %}
-          {% if plan_mode == 'balanced' %}
-            <div class="plan-actions">
-              {% if p.committed %}
-                <span class="badge committed">Committed</span>
-                <button
-                  type="button"
-                  class="linklike"
-                  hx-post="/plan/uncommit/{{ p.activity_id }}"
-                  hx-target="#plan-card"
-                  hx-swap="innerHTML"
-                  title="Release this activity so the planner can suggest alternatives"
-                >Remove from plan</button>
-              {% else %}
-                <button
-                  type="button"
-                  class="linklike"
-                  hx-post="/plan/commit/{{ p.activity_id }}"
-                  hx-target="#plan-card"
-                  hx-swap="innerHTML"
-                  title="Lock this activity into your plan"
-                >Keep</button>
-              {% endif %}
-            </div>
-          {% endif %}
+          <div class="plan-actions">
+            {% if p.committed %}
+              <span class="badge committed">Committed</span>
+              <button
+                type="button"
+                class="linklike"
+                hx-post="/plan/uncommit/{{ p.activity_id }}"
+                hx-target="#plan-card"
+                hx-swap="innerHTML"
+                title="Release this activity so the planner can suggest alternatives"
+              >Remove from plan</button>
+            {% else %}
+              <button
+                type="button"
+                class="linklike"
+                hx-post="/plan/commit/{{ p.activity_id }}"
+                hx-target="#plan-card"
+                hx-swap="innerHTML"
+                title="Lock this activity into your plan"
+              >Keep</button>
+            {% endif %}
+          </div>
         </li>
       {% endfor %}
     </ul>

@@ -54,6 +54,14 @@
             {{ p.mode|capitalize }}{% if p.hours_left is not none %} (expires in {{ p.hours_left }}h){% endif %}
           </span>
         {% endfor %}
+        <button
+          hx-post="/policy/clear"
+          hx-swap="none"
+          hx-on::after-request="window.location.reload()"
+          class="button"
+          style="margin-left:8px;"
+          type="button"
+        >Clear policy</button>
         <form hx-post="/policy/clear" hx-target="#chat-window" hx-swap="beforeend" hx-on::after-request="const el=document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }" style="display:inline; margin-left:8px;">
           <button type="submit" class="linklike">Clear</button>
         </form>
@@ -113,43 +121,26 @@
       {% include '_plan.html' %}
     </div>
 
-    {% if validation %}
-      <section class="card">
-        <h2>Requirements ({{ validation.meta.board }} — {{ validation.meta.specialty }})</h2>
-        <div class="meta">Version: {{ validation.meta.version }}</div>
-        <div class="meta">Totals: {{ '%.1f' % validation.summary.earned_total }} / {{ validation.summary.target_total }} (remaining {{ '%.1f' % validation.summary.remaining_total }})</div>
-        <ul class="checks">
-          {% for chk in validation.checks %}
-            <li>
-              {% if chk.status == 'ok' %}✅{% elif chk.status == 'warn' %}⚠️{% else %}❌{% endif %}
-              <strong>{{ chk.label }}</strong> — {{ chk.detail }}
-            </li>
-          {% endfor %}
-        </ul>
-        <div class="meta">Sources:
-          {% for s in validation.meta.sources %}
-            <a href="{{ s }}" target="_blank" rel="noopener">{{ s }}</a>{% if not loop.last %}, {% endif %}
-          {% endfor %}
-        </div>
-        {% if validation_full %}
-          <div class="meta" style="margin-top:12px;">Comprehensive CC Checklist</div>
-          <ul class="checks">
-            {% for key in ['cme', 'sa_cme', 'pip', 'patient_safety'] %}
-              {% set pillar = validation_full.pillars.get(key) %}
-              {% if pillar %}
-                <li>
-                  {% if pillar.status == 'ok' %}✅{% elif pillar.status == 'warn' %}⚠️{% else %}❌{% endif %}
-                  <strong>{{ pillar.label }}</strong> — {{ pillar.detail }}
-                </li>
-              {% endif %}
-            {% endfor %}
-          </ul>
-          {% if validation_full.gaps %}
-            <div class="meta">Gaps: {{ validation_full.gaps | join(', ') }}</div>
-          {% endif %}
-        {% endif %}
-      </section>
-    {% endif %}
+{% if validation %}
+  <section class="card">
+    <h2>Requirements ({{ validation.meta.board }} — {{ validation.meta.specialty }})</h2>
+    <div class="meta">Version: {{ validation.meta.version }}</div>
+    <div class="meta">Totals: {{ '%.1f' % validation.summary.earned_total }} / {{ validation.summary.target_total }} (remaining {{ '%.1f' % validation.summary.remaining_total }})</div>
+    <ul class="checks">
+      {% for chk in validation.checks %}
+        <li>
+          {% if chk.status == 'ok' %}✅{% elif chk.status == 'warn' %}⚠️{% else %}❌{% endif %}
+          <strong>{{ chk.label }}</strong> — {{ chk.detail }}
+        </li>
+      {% endfor %}
+    </ul>
+    <div class="meta">Sources:
+      {% for s in validation.meta.sources %}
+        <a href="{{ s }}" target="_blank" rel="noopener">{{ s }}</a>{% if not loop.last %}, {% endif %}
+      {% endfor %}
+    </div>
+  </section>
+{% endif %}
 
     <section class="card">
       <h2>Activity Log</h2>

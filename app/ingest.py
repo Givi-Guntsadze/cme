@@ -1,5 +1,4 @@
 # app/ingest.py
-import os
 import re
 import json
 import logging
@@ -14,6 +13,8 @@ from sqlmodel import select
 from .db import get_session
 from .models import Activity, User
 from .requirements import infer_requirement_tags_from_text
+from .env import get_secret
+from .openai_helpers import call_responses, response_text
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +86,7 @@ def html_to_text(html: str) -> str:
 
 async def ai_extract_from_text(text: str, url: str) -> Optional[dict]:
     try:
-        from openai import OpenAI
-
-        client = OpenAI()
+        client = _openai_client()
         schema = (
             "Return STRICT JSON only with keys: title, provider, credits (number), cost_usd (number|null), "
             "modality ('online'|'live'), city (string|null), start_date (YYYY-MM-DD|null), end_date (YYYY-MM-DD|null), "
@@ -101,15 +100,17 @@ async def ai_extract_from_text(text: str, url: str) -> Optional[dict]:
             f"Extract CME info from the following page text. {schema} URL: {url}. "
             "If provider isn't explicit, use the page domain as provider."
         )
-        resp = client.responses.create(
+        resp = call_responses(
+            client,
             model="gpt-4o-mini",
-            input=[
+            messages=[
                 {"role": "user", "content": prompt},
                 {"role": "user", "content": text},
             ],
             temperature=0,
+            max_output_tokens=1000,
         )
-        data = safe_json_loads(getattr(resp, "output_text", "") or "")
+        data = safe_json_loads(response_text(resp))
         return data or None
     except Exception:
         logger.exception("ai_extract_from_text failed for %s", _redact_key(url))
@@ -164,7 +165,8 @@ def is_valid_record(r: Dict[str, Any]) -> bool:
 def _openai_client():
     from openai import OpenAI
 
-    return OpenAI()
+    api_key = get_secret("OPENAI_API_KEY")
+    return OpenAI(api_key=api_key) if api_key else OpenAI()
 
 
 # --- Google Programmable Search (Primary) ---
@@ -173,8 +175,8 @@ def _openai_client():
 def fetch_google_cse(
     query: str, num: int = 10, start: Optional[int] = None
 ) -> List[dict]:
-    key = os.getenv("GOOGLE_API_KEY")
-    cx = os.getenv("GOOGLE_CSE_ID")
+    key = get_secret("GOOGLE_API_KEY")
+    cx = get_secret("GOOGLE_CSE_ID")
     if not (key and cx):
         raise RuntimeError("Google CSE not configured")
 
@@ -609,7 +611,7 @@ def _extract_with_openai_from_candidates(
     if not candidates:
         return []
     # If no API key, skip this pass and let deepfetch handle it
-    if not os.getenv("OPENAI_API_KEY"):
+    if not get_secret("OPENAI_API_KEY"):
         logger.info("OPENAI_API_KEY not set; skipping first-pass AI extraction")
         return []
     client = _openai_client()
@@ -624,8 +626,14 @@ def _extract_with_openai_from_candidates(
             f"Limit to about {count}. Candidates JSON follows.\n"
             f"{json.dumps(candidates, ensure_ascii=False)}"
         )
-        resp = client.responses.create(model="gpt-4o-mini", input=content)
-        text = getattr(resp, "output_text", "") or ""
+        resp = call_responses(
+            client,
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": content}],
+            temperature=0,
+            max_output_tokens=1200,
+        )
+        text = response_text(resp)
         data = safe_json_loads(text)
         if not data:
             logger.warning("AI extraction JSON parse failed; skipping.")
@@ -726,9 +734,13 @@ def _fallback_with_openai_web_search(count: int) -> List[dict]:
             "eligible_groups (array|null), membership_required (string|null), open_to_public (boolean|null)."
         )
         resp = client.responses.create(
-            model="gpt-4o-mini", tools=[{"type": "web_search"}], input=prompt
+            model="gpt-4o-mini",
+            input=prompt,
+            tools=[{"type": "web_search"}],
+            temperature=0,
+            max_output_tokens=1200,
         )
-        text = getattr(resp, "output_text", "") or ""
+        text = response_text(resp)
         data = safe_json_loads(text) or {}
         items = data.get("items") or []
         if not isinstance(items, list):
@@ -776,7 +788,7 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
     # Google phase: candidates
     candidates: List[dict] = []
     try:
-        if os.getenv("GOOGLE_API_KEY") and os.getenv("GOOGLE_CSE_ID"):
+        if get_secret("GOOGLE_API_KEY") and get_secret("GOOGLE_CSE_ID"):
             queries = _build_queries_for_user(user)
             for q in queries:
                 try:
@@ -837,7 +849,7 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
                 continue
 
     # Deep fetch pass for partials
-    max_deepfetch = int(os.getenv("INGEST_MAX_DEEPFETCH", "20"))
+    max_deepfetch = int(get_secret("INGEST_MAX_DEEPFETCH") or "20")
     deepfetch_budget = max_deepfetch
     improved: List[dict] = []
 
@@ -915,7 +927,7 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
     )
 
     # Fallback if still below target
-    min_results = int(os.getenv("INGEST_MIN_RESULTS", str(count)))
+    min_results = int(get_secret("INGEST_MIN_RESULTS") or str(count))
     if total_added < min_results:
         used_fallback = True
         logger.info("Fallback triggered: OpenAI web_search")

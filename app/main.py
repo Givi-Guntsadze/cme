@@ -45,6 +45,11 @@ from .services.plan import (
 )
 from .prompt import build_system_prompt
 from .planner import pricing_context_for_user, is_eligible
+from .openai_helpers import call_responses, response_text
+from .env import get_secret
+
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -60,9 +65,9 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-DEFAULT_ASSISTANT_MODEL = os.getenv("OPENAI_ASSISTANT_MODEL", "gpt-4o-mini")
+DEFAULT_ASSISTANT_MODEL = get_secret("OPENAI_ASSISTANT_MODEL") or "gpt-4o-mini"
 
 # Matches a line like:  PATCH: {"budget_usd": 200, "allow_live": false}
 PATCH_RE = re.compile(r"PATCH:\s*(\{.*\})", re.DOTALL)
@@ -161,6 +166,25 @@ NEGATIVE_REPLIES = {
     "cancel",
     "no thanks",
     "no thank you",
+}
+
+REMOVAL_ACTION_KEYWORDS = {
+    "delete",
+    "remove",
+    "clear",
+    "erase",
+    "undo",
+    "drop",
+    "reset",
+    "wipe",
+    "strip",
+    "subtract",
+    "take off",
+    "take out",
+    "roll back",
+    "rollback",
+    "correct",
+    "fix",
 }
 
 
@@ -493,6 +517,77 @@ def _recalculate_remaining(user: User, session) -> None:
     session.flush()
 
 
+def _maybe_remove_claim_from_text(
+    user: User, user_text: str, session
+) -> tuple[str | None, bool]:
+    text = (user_text or "").strip()
+    if not text:
+        return (None, False)
+    lowered = text.lower()
+    if not any(keyword in lowered for keyword in REMOVAL_ACTION_KEYWORDS):
+        return (None, False)
+
+    claims = list(session.exec(select(Claim).where(Claim.user_id == user.id)))
+    if not claims:
+        if "credit" in lowered or "log" in lowered:
+            return ("No logged credits to remove.", False)
+        return (None, False)
+
+    amount_matches = re.findall(
+        r"(\d+(?:\.\d+)?)\s*(?:credit|credits|cr|hrs|hours)", lowered
+    )
+    removed: list[Claim] = []
+    remaining_pool = sorted(
+        claims,
+        key=lambda c: (
+            c.date or date.today(),
+            c.id or 0,
+        ),
+        reverse=True,
+    )
+
+    if amount_matches:
+        for amt_text in amount_matches:
+            try:
+                target = float(amt_text)
+            except ValueError:
+                continue
+            candidate = None
+            for claim in remaining_pool:
+                if abs(float(claim.credits or 0.0) - target) < 0.01:
+                    candidate = claim
+                    break
+            if candidate:
+                session.delete(candidate)
+                removed.append(candidate)
+                remaining_pool.remove(candidate)
+        if removed:
+            session.flush()
+            _recalculate_remaining(user, session)
+            PlanManager.invalidate_user_plans(session, user.id, reason="claim_removed")
+            session.commit()
+            total_removed = sum(float(c.credits or 0.0) for c in removed)
+            entry_label = "entries" if len(removed) != 1 else "entry"
+            return (
+                f"Removed {len(removed)} logged credit {entry_label} ({total_removed:.1f} credits).",
+                True,
+            )
+        return ("I couldn't find a logged credit entry with that amount.", False)
+
+    if "activity log" in lowered or "all credits" in lowered or "entire log" in lowered:
+        for claim in claims:
+            session.delete(claim)
+        session.flush()
+        _recalculate_remaining(user, session)
+        PlanManager.invalidate_user_plans(session, user.id, reason="claim_removed")
+        session.commit()
+        count = len(claims)
+        entry_label = "entries" if count != 1 else "entry"
+        return (f"Cleared {count} logged credit {entry_label}.", True)
+
+    return (None, False)
+
+
 def _maybe_log_claim_from_text(user: User, user_text: str, session) -> str | None:
     credits, topic, claim_date = parse_message(user_text)
     if credits <= 0:
@@ -791,19 +886,26 @@ def _derive_controls(
     }
 
     try:
-        response = openai_client.chat.completions.create(
+        messages = [
+            {"role": "system", "content": control_system},
+            {"role": "user", "content": json.dumps(user_payload, default=str)},
+        ]
+        reasoning_effort = (
+            "medium" if DEFAULT_ASSISTANT_MODEL.startswith("gpt-5") else None
+        )
+        response = call_responses(
+            openai_client,
             model=DEFAULT_ASSISTANT_MODEL,
+            messages=messages,
             temperature=0,
-            messages=[
-                {"role": "system", "content": control_system},
-                {"role": "user", "content": json.dumps(user_payload, default=str)},
-            ],
+            max_output_tokens=800,
+            reasoning_effort=reasoning_effort,
         )
     except Exception:
         logging.exception("control derivation failed")
         return ([], [])
 
-    text = (response.choices[0].message.content or "").strip()
+    text = response_text(response)
     if not text:
         return ([], [])
 
@@ -1218,8 +1320,8 @@ def log(request: Request):
 @app.api_route("/ingest", methods=["GET", "POST"])
 async def ingest(request: Request = None):
     logger = logging.getLogger(__name__)
-    has_google_key = bool(os.getenv("GOOGLE_API_KEY"))
-    has_google_cx = bool(os.getenv("GOOGLE_CSE_ID"))
+    has_google_key = bool(get_secret("GOOGLE_API_KEY"))
+    has_google_cx = bool(get_secret("GOOGLE_CSE_ID"))
     logger.info(
         "ingest called. env GOOGLE_API_KEY=%s GOOGLE_CSE_ID=%s",
         has_google_key,
@@ -1227,7 +1329,7 @@ async def ingest(request: Request = None):
     )
     try:
         # threshold from env (optional)
-        min_results = int(os.getenv("INGEST_MIN_RESULTS", "12"))
+        min_results = int(get_secret("INGEST_MIN_RESULTS") or "12")
         debug = False
         if request is not None:
             qp = dict(request.query_params)
@@ -1270,11 +1372,12 @@ async def ingest(request: Request = None):
 
 @app.post("/assist")
 def assist():
-    if not os.getenv("OPENAI_API_KEY"):
+    api_key = get_secret("OPENAI_API_KEY")
+    if not api_key:
         return JSONResponse({"error": "missing OPENAI_API_KEY"}, status_code=400)
     from openai import OpenAI
 
-    client = OpenAI()
+    client = OpenAI(api_key=api_key)
     with get_session() as session:
         user = session.exec(select(User)).first()
         if not user:
@@ -1333,17 +1436,35 @@ def assist():
         ],
     }
 
-    resp = client.responses.create(
+    resp = call_responses(
+        client,
         model="gpt-5",
-        input=[
+        messages=[
             {"role": "system", "content": sys},
             {"role": "user", "content": json.dumps(u)},
         ],
+        temperature=0,
+        max_output_tokens=700,
+        reasoning_effort="medium",
     )
-    text = getattr(resp, "output_text", "") or ""
+    text = response_text(resp)
 
     with get_session() as session:
         user = session.exec(select(User)).first()
+        if not user:
+            user = User(
+                name="Doctor",
+                specialty="Psychiatry",
+                target_credits=30.0,
+                remaining_credits=30.0,
+            )
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+        elif user.id is None:
+            session.add(user)
+            session.commit()
+            session.refresh(user)
         msg = AssistantMessage(user_id=user.id, content=text.strip()[:4000])
         session.add(msg)
         session.commit()
@@ -1353,12 +1474,13 @@ def assist():
 
 @app.post("/assist/reply")
 def assist_reply(answer: str = Form(...)):
-    if not os.getenv("OPENAI_API_KEY"):
+    api_key = get_secret("OPENAI_API_KEY")
+    if not api_key:
         return JSONResponse({"error": "missing OPENAI_API_KEY"}, status_code=400)
 
     from openai import OpenAI
 
-    client = OpenAI()
+    client = OpenAI(api_key=api_key)
     with get_session() as session:
         user = session.exec(select(User)).first()
         if not user:
@@ -1386,14 +1508,18 @@ def assist_reply(answer: str = Form(...)):
         "reply": answer,
     }
 
-    resp = client.responses.create(
+    resp = call_responses(
+        client,
         model="gpt-5",
-        input=[
+        messages=[
             {"role": "system", "content": sys},
             {"role": "user", "content": json.dumps(user_msg)},
         ],
+        temperature=0,
+        max_output_tokens=600,
+        reasoning_effort="medium",
     )
-    text = getattr(resp, "output_text", "") or ""
+    text = response_text(resp)
     data = safe_json_loads(text) or {}
 
     updated_fields = []
@@ -1536,11 +1662,12 @@ def favicon():
 
 @app.post("/assist/command")
 def assist_command(command: str = Form(...)):
-    if not os.getenv("OPENAI_API_KEY"):
+    api_key = get_secret("OPENAI_API_KEY")
+    if not api_key:
         return JSONResponse({"error": "missing OPENAI_API_KEY"}, status_code=400)
     from openai import OpenAI
 
-    client = OpenAI()
+    client = OpenAI(api_key=api_key)
 
     # Ask model to produce a compact policy JSON
     sys = (
@@ -1550,14 +1677,18 @@ def assist_command(command: str = Form(...)):
         "max_per_activity_fraction (number 0..1), prefer_live_override (true|false|null), budget_tolerance (number 0..0.3)."
     )
     try:
-        resp = client.responses.create(
+        resp = call_responses(
+            client,
             model="gpt-5",
-            input=[
+            messages=[
                 {"role": "system", "content": sys},
                 {"role": "user", "content": command},
             ],
+            temperature=0,
+            max_output_tokens=600,
+            reasoning_effort="medium",
         )
-        text = getattr(resp, "output_text", "") or ""
+        text = response_text(resp)
         data = safe_json_loads(text) or {}
         # Sanitize types and defaults
         policy = {
@@ -1592,7 +1723,12 @@ def assist_command(command: str = Form(...)):
         user = session.exec(select(User)).first()
         if not user:
             return RedirectResponse("/", status_code=303)
-        apply_policy_payloads([json.dumps(policy)], user, session)
+        apply_policy_payloads(
+            [json.dumps(policy)],
+            user,
+            session,
+            record_message=False,
+        )
 
     return RedirectResponse("/?policy=1", status_code=303)
 
@@ -1635,37 +1771,47 @@ def chat_send(request: Request, text: str = Form(...)):
         )
 
     try:
-        keywords_trigger = {
-            "discover",
-            "add more",
-            "find more",
-            "update plan",
-            "add activities",
-            "more activities",
-        }
         normalized_text = text.strip().lower()
-        should_ingest = any(k in normalized_text for k in keywords_trigger)
+        should_ingest = False
+        plan_update_needed = False
+        ingest_success = False
+        action_command: str | None = None
 
         with get_session() as session:
             user = session.exec(select(User)).first()
             if not user:
-                user = User()
+                user = User(
+                    name="Doctor",
+                    specialty="Psychiatry",
+                    target_credits=30.0,
+                    remaining_credits=30.0,
+                )
+                session.add(user)
+                session.commit()
+                session.refresh(user)
+            elif user.id is None:
                 session.add(user)
                 session.commit()
                 session.refresh(user)
 
             plan_manager = PlanManager(session)
-            plan_update_needed = False
-            action_requested = False
             user_message = AssistantMessage(
                 user_id=user.id, role="user", content=text.strip()[:4000]
             )
             session.add(user_message)
 
             pending_notes: list[str] = []
+            removal_note, removal_changed = _maybe_remove_claim_from_text(
+                user, text, session
+            )
+            if removal_note:
+                pending_notes.append(removal_note)
+            if removal_changed:
+                plan_update_needed = True
             note_text = _maybe_log_claim_from_text(user, text, session)
             if note_text:
                 pending_notes.append(note_text)
+                plan_update_needed = True
             note_text = _maybe_complete_activity_from_text(user, text, session)
             if note_text:
                 pending_notes.append(note_text)
@@ -2141,38 +2287,57 @@ def chat_send(request: Request, text: str = Form(...)):
 
             if normalized_text in {"clear policy", "clear policies", "reset policy"}:
                 cleared = clear_policies(session, user)
-                response_text = (
+                policy_message = (
                     "Policy cleared. Planner reset."
                     if cleared
                     else "No active policy to clear."
                 )
                 confirm = AssistantMessage(
-                    user_id=user.id, role="assistant", content=response_text
+                    user_id=user.id, role="assistant", content=policy_message
                 )
                 session.add(confirm)
-                plan_manager = PlanManager(session)
+
                 policy_bundle = load_policy_bundle(session, user)
-                summary_text, balanced_count, cheapest_count = (
-                    plan_manager.summarize_modes(
-                        user, policy_bundle, force_refresh=True
-                    )
+                plan_run = plan_manager.ensure_plan(
+                    user,
+                    "balanced",
+                    policy_bundle,
+                    force_refresh=True,
+                    reason="policy_cleared",
                 )
+                plan_items, plan_summary, _ = plan_manager.serialize_plan(
+                    plan_run, user
+                )
+                item_count = len(plan_items)
+                total_cost_value = (
+                    plan_summary.get("total_cost")
+                    if isinstance(plan_summary, dict)
+                    else None
+                )
+                cost_phrase = (
+                    f"${total_cost_value:,.0f}"
+                    if isinstance(total_cost_value, (int, float))
+                    else "$0"
+                )
+                remaining_value = float(user.remaining_credits or 0.0)
+
                 summary_msg = AssistantMessage(
                     user_id=user.id,
                     role="assistant",
-                    content=summary_text[:4000],
+                    content="Balanced plan refreshed.",
                 )
                 plan_note = AssistantMessage(
                     user_id=user.id,
                     role="assistant",
                     content=(
-                        f"Plan updated ({balanced_count} balanced items, "
-                        f"{cheapest_count} cheapest)."
+                        f"Plan updated ({item_count} items, {cost_phrase} total, "
+                        f"{remaining_value:.1f} remaining)."
                     ),
                 )
                 session.add(summary_msg)
                 session.add(plan_note)
                 session.commit()
+
                 messages_to_render = [
                     SimpleNamespace(
                         role=user_message.role, content=user_message.content
@@ -2181,10 +2346,13 @@ def chat_send(request: Request, text: str = Form(...)):
                     SimpleNamespace(role=summary_msg.role, content=summary_msg.content),
                     SimpleNamespace(role=plan_note.role, content=plan_note.content),
                 ]
-                return templates.TemplateResponse(
+                response = templates.TemplateResponse(
                     "_chat_messages_append.html",
                     {"request": request, "messages": messages_to_render},
                 )
+                response.headers["HX-Trigger"] = json.dumps({"plan-refresh": True})
+                time.sleep(1.2)
+                return response
 
             snapshot = _state_snapshot(session, user)
             system_prompt = build_system_prompt(snapshot)
@@ -2199,20 +2367,25 @@ def chat_send(request: Request, text: str = Form(...)):
             }:
                 model_name = "gpt-5"
 
-            response = openai_client.chat.completions.create(
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_payload},
+            ]
+            reasoning_effort = "medium" if model_name.startswith("gpt-5") else None
+            response = call_responses(
+                openai_client,
                 model=model_name,
+                messages=messages,
                 temperature=0,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_payload},
-                ],
+                max_output_tokens=1200,
+                reasoning_effort=reasoning_effort,
             )
 
-            reply = (response.choices[0].message.content or "").strip()
+            reply = response_text(response)
 
             patch_payloads: list[str] = []
             policy_payloads: list[str] = []
-            action_command: str | None = None
+            action_command = None
             visible_lines: list[str] = []
             for line in reply.splitlines():
                 stripped = line.strip()
@@ -2231,7 +2404,7 @@ def chat_send(request: Request, text: str = Form(...)):
                         stripped.removeprefix("ACTION:").strip().lower() or None
                     )
                     if action_command in {"discover", "ingest", "refresh"}:
-                        action_requested = True
+                        should_ingest = True
                     continue
                 visible_lines.append(line)
 
@@ -2241,6 +2414,26 @@ def chat_send(request: Request, text: str = Form(...)):
 
             if action_command in {"discover", "ingest", "refresh"}:
                 should_ingest = True
+
+            if removal_changed:
+                removal_ack = "Cleared the logged credits you flagged and refreshed the plan around the remaining gaps."
+                deny_phrases = (
+                    "can't",
+                    "cannot",
+                    "unable",
+                    "don't have the capability",
+                    "do not have the capability",
+                    "can't modify",
+                    "cannot modify",
+                    "can't delete",
+                    "cannot delete",
+                    "unable to delete",
+                )
+                reply_lower = visible_reply.lower()
+                if any(phrase in reply_lower for phrase in deny_phrases):
+                    visible_reply = removal_ack
+                elif removal_ack.lower() not in reply_lower:
+                    visible_reply = f"{visible_reply}\n\n{removal_ack}"
 
             if not patch_payloads and not policy_payloads:
                 derived_patch, derived_policy = _derive_controls(text, snapshot)
@@ -2255,7 +2448,14 @@ def chat_send(request: Request, text: str = Form(...)):
             extra_messages = _apply_patch_if_present(patch_payloads, user, session)
             if extra_messages:
                 plan_update_needed = True
-            apply_policy_payloads(policy_payloads, user, session)
+            if policy_payloads:
+                apply_policy_payloads(
+                    policy_payloads,
+                    user,
+                    session,
+                    record_message=False,
+                )
+                plan_update_needed = True
 
             confirmations: list[AssistantMessage] = []
             for note_text in pending_notes:
@@ -2271,9 +2471,9 @@ def chat_send(request: Request, text: str = Form(...)):
                     if isinstance(patch, dict):
                         changed = _apply_patch_to_user(patch, session, user)
                         if changed:
-                            should_ingest = True
                             plan_update_needed = True
                             confirm = AssistantMessage(
+                                user_id=user.id,
                                 role="assistant",
                                 content=(
                                     "Applied: "
@@ -2291,7 +2491,7 @@ def chat_send(request: Request, text: str = Form(...)):
                 note = _maybe_set_remaining_from_text(user, text, session)
                 if note:
                     adjustment_message = AssistantMessage(
-                        role="assistant", content=note
+                        user_id=user.id, role="assistant", content=note
                     )
                     session.add(adjustment_message)
                     session.commit()
@@ -2299,8 +2499,11 @@ def chat_send(request: Request, text: str = Form(...)):
             except Exception:
                 logging.exception("Remaining adjustment failed")
 
-            ingest_success = False
             if should_ingest:
+                trigger_reason = action_command or "keyword"
+                logger.info(
+                    "chat_send: triggering discovery (reason=%s)", trigger_reason
+                )
                 try:
                     try:
                         loop = asyncio.get_running_loop()
@@ -2325,11 +2528,13 @@ def chat_send(request: Request, text: str = Form(...)):
                     PlanManager.invalidate_user_plans(
                         session, user.id, reason="ingest_refresh"
                     )
-
-            if action_requested or ingest_success:
                 plan_update_needed = True
 
             if plan_update_needed:
+                logger.info(
+                    "chat_send: refreshing balanced plan (ingest_success=%s)",
+                    ingest_success,
+                )
                 policy_bundle = load_policy_bundle(session, user)
                 plan_run = plan_manager.ensure_plan(
                     user,
@@ -2372,11 +2577,14 @@ def chat_send(request: Request, text: str = Form(...)):
 
             session.commit()
 
-        time.sleep(1.2)
-        return templates.TemplateResponse(
+        response = templates.TemplateResponse(
             "_chat_messages_append.html",
             {"request": request, "messages": messages_to_render},
         )
+        if plan_update_needed:
+            response.headers["HX-Trigger"] = json.dumps({"plan-refresh": True})
+        time.sleep(1.2)
+        return response
     except Exception as exc:
         logging.exception("chat_send failed")
         return HTMLResponse(
@@ -2456,47 +2664,38 @@ def requirements_sync():
     )
 
 
-@app.post("/policy/clear", response_class=HTMLResponse)
-def policy_clear(request: Request):
+def _policy_clear_impl() -> list[dict[str, object]]:
     with get_session() as session:
-        user = session.exec(select(User)).first()
-        if not user:
-            return HTMLResponse("", status_code=204)
-        cleared = clear_policies(session, user)
-        message = (
-            "Policy cleared. Planner reset."
-            if cleared
-            else "No active policy to clear."
+        notes = list(
+            session.exec(
+                select(AssistantMessage).where(
+                    AssistantMessage.content.ilike("%POLICY:%")
+                )
+            )
         )
-        note = AssistantMessage(user_id=user.id, role="assistant", content=message)
-        session.add(note)
-        plan_manager = PlanManager(session)
-        policy_bundle = load_policy_bundle(session, user)
-        summary_text, balanced_count, cheapest_count = plan_manager.summarize_modes(
-            user, policy_bundle, force_refresh=True
-        )
-        summary_msg = AssistantMessage(
-            user_id=user.id,
-            role="assistant",
-            content=summary_text[:4000],
-        )
-        plan_note = AssistantMessage(
-            user_id=user.id,
-            role="assistant",
-            content=(
-                f"Plan updated ({balanced_count} balanced items, {cheapest_count} cheapest)."
-            ),
-        )
-        session.add(summary_msg)
-        session.add(plan_note)
+        payload = [
+            {
+                "id": n.id,
+                "role": n.role,
+                "content": n.content,
+                "created_at": n.created_at,
+            }
+            for n in notes
+        ]
+        for n in notes:
+            session.delete(n)
         session.commit()
+    logger.info("policy_clear: cleared=%d", len(payload))
+    return payload
 
-    messages = [
-        SimpleNamespace(role=note.role, content=note.content),
-        SimpleNamespace(role=summary_msg.role, content=summary_msg.content),
-        SimpleNamespace(role=plan_note.role, content=plan_note.content),
-    ]
-    return templates.TemplateResponse(
-        "_chat_messages_append.html",
-        {"request": request, "messages": messages},
-    )
+
+@app.post("/policy/clear")
+def policy_clear_post():
+    payload = _policy_clear_impl()
+    return JSONResponse({"cleared": len(payload), "preview": payload[:3]})
+
+
+@app.get("/policy/clear")
+def policy_clear_get():
+    _policy_clear_impl()
+    return RedirectResponse("/", status_code=303)

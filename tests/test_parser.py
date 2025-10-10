@@ -27,6 +27,20 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(topic, None)
         self.assertIsInstance(parsed_date, date)
 
+    def test_delete_request_skips_claim(self) -> None:
+        credits, topic, parsed_date = parse_message(
+            "Please delete the mistaken 112.5 credits entry from my log"
+        )
+        self.assertEqual(credits, 0.0)
+        self.assertIsInstance(parsed_date, date)
+
+    def test_negated_completion_skips_claim(self) -> None:
+        credits, topic, parsed_date = parse_message(
+            "I didn't actually complete those 5 credits yet"
+        )
+        self.assertEqual(credits, 0.0)
+        self.assertIsInstance(parsed_date, date)
+
 
 if __name__ == "__main__":
     unittest.main()

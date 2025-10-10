@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -32,6 +31,7 @@ from ..planner import (
 )
 from ..requirements import REQUIREMENT_LABELS
 from ..ingest import ingest_psychiatry_online_ai
+from ..env import get_secret
 
 
 DISCOVERY_IN_FLIGHT: set[int] = set()
@@ -155,7 +155,7 @@ def apply_policy_payloads(
     user: User,
     session,
     invalidate: bool = True,
-    record_message: bool = True,
+    record_message: bool = False,
 ) -> None:
     payload_list = [p for p in payloads if p]
     if not payload_list:
@@ -896,7 +896,7 @@ class PlanManager:
             )
             return False
 
-        if not (os.getenv("GOOGLE_API_KEY") and os.getenv("GOOGLE_CSE_ID")):
+        if not (get_secret("GOOGLE_API_KEY") and get_secret("GOOGLE_CSE_ID")):
             LOGGER.info("Auto discovery skipped: Google CSE not configured")
             return False
 
