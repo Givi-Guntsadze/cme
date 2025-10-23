@@ -1,5 +1,5 @@
 [flake8]
 max-line-length = 150
-extend-ignore = B008
+extend-ignore = B008, E203
 per-file-ignores =
     app/__init__.py:F401

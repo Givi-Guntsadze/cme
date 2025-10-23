@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import threading
@@ -77,6 +76,30 @@ def _compute_plan_context(session, user: User) -> PlanContext:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _merge_policy_payload(
+    existing: Dict[str, Any], new_payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    merged = dict(existing or {})
+    for key, value in (new_payload or {}).items():
+        if value is None:
+            merged.pop(key, None)
+            continue
+        if isinstance(value, list):
+            current = merged.get(key)
+            if not isinstance(current, list):
+                current = []
+            merged[key] = list(dict.fromkeys([*current, *value]))
+            continue
+        if isinstance(value, dict):
+            current_dict = merged.get(key)
+            if not isinstance(current_dict, dict):
+                current_dict = {}
+            merged[key] = {**current_dict, **value}
+            continue
+        merged[key] = value
+    return merged
 
 
 def _source_label(source: Optional[str]) -> str:
@@ -198,16 +221,34 @@ def apply_policy_payloads(
             )
         )
     )
-    for row in active_policies:
-        row.active = False
-        session.add(row)
+    active_by_mode: Dict[str, UserPolicy] = {
+        (row.mode or "default"): row for row in active_policies
+    }
+
+    if invalidate:
+        for row in active_policies:
+            row.active = False
+            session.add(row)
+        active_by_mode = {}
 
     for mode, payload in entries:
+        mode_key = (mode or "default") or "default"
+        mode_key = mode_key.lower()
+        payload_dict = payload or {}
+        if not invalidate and mode_key in active_by_mode:
+            existing = active_by_mode[mode_key]
+            merged_payload = _merge_policy_payload(existing.payload or {}, payload_dict)
+            existing.payload = merged_payload
+            existing.active = True
+            existing.created_at = now
+            existing.expires_at = now + ttl
+            session.add(existing)
+            continue
         session.add(
             UserPolicy(
                 user_id=user.id,
-                mode=mode or "default",
-                payload=payload or {},
+                mode=mode_key,
+                payload=payload_dict,
                 ttl_days=1,
                 active=True,
                 created_at=now,
@@ -917,7 +958,7 @@ class PlanManager:
                     user_id,
                     specialty or "psychiatry",
                 )
-                asyncio.run(ingest_psychiatry_online_ai(count=20))
+                ingest_psychiatry_online_ai(count=20)
             except Exception:
                 LOGGER.exception("Auto discovery ingest failed for user %s", user_id)
             finally:

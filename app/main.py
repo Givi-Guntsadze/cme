@@ -33,7 +33,11 @@ from .requirements import (
     validate_full_cc,
 )
 from .parser import parse_message
-from .ingest import ingest_psychiatry_online_ai, safe_json_loads
+from .ingest import (
+    ingest_psychiatry_online_ai,
+    safe_json_loads,
+    discover_activity_by_title,
+)
 from openai import OpenAI
 from .services.plan import (
     PlanManager,
@@ -187,6 +191,180 @@ REMOVAL_ACTION_KEYWORDS = {
     "fix",
 }
 
+REMOVE_BLOCK_RE = re.compile(r"\bremove\b\s+([^.;!?]+)", re.I)
+REMOVE_SPLIT_RE = re.compile(
+    r"\s*(?:,|and|&|plus|as well as|along with|/|\band\b)\s*", re.I
+)
+GENERIC_TAIL_RE = re.compile(
+    r"\b(activity|event|course|conference|session|module|plan|details?)\b$", re.I
+)
+LEADING_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.I)
+DETAIL_TAIL_RE = re.compile(r"\b(details?|info|information)\b$", re.I)
+TITLE_TOKEN_RE = re.compile(r"[a-zA-Z0-9]+")
+TITLE_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "with",
+    "for",
+    "and",
+    "event",
+    "conference",
+    "meeting",
+    "cme",
+    "annual",
+    "update",
+    "institute",
+    "activity",
+    "course",
+    "plan",
+    "session",
+    "workshop",
+    "hybrid",
+    "primary",
+}
+ADD_PATTERNS = [
+    re.compile(
+        (
+            r"\b(?:instead\s+)?(?:i\s+)?"
+            r"(?:want|would like|plan|planning|going)\s+to\s+"
+            r"(?:add(?:ing)?|include|attend(?:ing)?|go(?:ing)?\s+to|register(?:ing)?\s+for)\s+"
+            r"(?P<title>[^.;!?]+)"
+        ),
+        re.I,
+    ),
+    re.compile(
+        (
+            r"\b(?:add(?:ing)?|include|slot\s+in|schedule|book)\s+(?:in\s+)?"
+            r"(?P<title>[^.;!?]+)"
+        ),
+        re.I,
+    ),
+    re.compile(
+        (
+            r"\b(?:attend(?:ing)?|register(?:ing)?\s+for|go(?:ing)?\s+to|join(?:ing)?)\s+"
+            r"(?P<title>[^.;!?]+)"
+        ),
+        re.I,
+    ),
+]
+
+
+def _clean_title_fragment(fragment: str) -> str:
+    cleaned = fragment.strip(" \t\r\n.,;:!\"'()[]{}")
+    cleaned = LEADING_ARTICLE_RE.sub("", cleaned)
+    trimmed = cleaned
+    # remove trailing generic descriptors
+    for _ in range(3):
+        new_trim = GENERIC_TAIL_RE.sub("", trimmed).strip(" \t\r\n.,;:!\"'")
+        if new_trim == trimmed:
+            break
+        trimmed = new_trim
+    trimmed = DETAIL_TAIL_RE.sub("", trimmed).strip(" \t\r\n.,;:!\"'")
+    return trimmed
+
+
+def _extract_remove_targets(text: str) -> list[str]:
+    if not text:
+        return []
+    results: list[str] = []
+    for match in REMOVE_BLOCK_RE.finditer(text):
+        block = match.group(1)
+        if not block:
+            continue
+        block = re.split(r"\b(?:but|instead|however|so|then)\b", block, maxsplit=1)[0]
+        parts = REMOVE_SPLIT_RE.split(block)
+        for part in parts:
+            cleaned = _clean_title_fragment(part)
+            if not cleaned or cleaned.lower() in {"it", "them", "those"}:
+                continue
+            results.append(cleaned)
+    # Deduplicate while preserving order
+    deduped: list[str] = []
+    seen = set()
+    for item in results:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _extract_add_targets(text: str) -> list[str]:
+    if not text:
+        return []
+    results: list[str] = []
+    for pattern in ADD_PATTERNS:
+        for match in pattern.finditer(text):
+            raw = match.group("title")
+            if not raw:
+                continue
+            candidate = re.split(
+                r"\b(?:but|instead|however|so|then|and then)\b",
+                raw,
+                maxsplit=1,
+            )[0]
+            cleaned = _clean_title_fragment(candidate)
+            if not cleaned or cleaned.lower() in {"it", "them", "those"}:
+                continue
+            normalized = cleaned.lower()
+            if not any(
+                keyword in normalized
+                for keyword in (
+                    "conference",
+                    "meeting",
+                    "cme",
+                    "summit",
+                    "symposium",
+                    "course",
+                    "event",
+                    "institute",
+                    "update",
+                )
+            ):
+                if len(cleaned.split()) < 2:
+                    continue
+            results.append(cleaned)
+    deduped: list[str] = []
+    seen = set()
+    for item in results:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _title_tokens(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for match in TITLE_TOKEN_RE.finditer(text or ""):
+        token = match.group(0).lower()
+        if not token:
+            continue
+        if token in TITLE_STOPWORDS and len(token) < 5:
+            continue
+        if token.isdigit() and len(token) < 4:
+            continue
+        tokens.add(token)
+    return tokens
+
+
+def _is_candidate_match(candidate_title: str, query_tokens: set[str]) -> bool:
+    if not candidate_title or not query_tokens:
+        return False
+    candidate_tokens = _title_tokens(candidate_title)
+    if not candidate_tokens:
+        return False
+    overlap = query_tokens & candidate_tokens
+    if not overlap:
+        return False
+    if len(query_tokens) <= 3:
+        return overlap == query_tokens
+    overlap_threshold = max(2, len(query_tokens) // 2)
+    return len(overlap) >= overlap_threshold
+
 
 def _normalize_response_text(text: str) -> str:
     cleaned = re.sub(r"[^a-z0-9\s]", " ", text.lower()).strip()
@@ -283,7 +461,15 @@ def find_activity_by_title(session, user: User, text: str) -> Activity | None:
             if score < MIN_MATCH_SCORE:
                 continue
             priority = 0 if item.committed else 1
-            candidates.append((priority, -score, item.position, activity))
+            candidates.append(
+                (
+                    priority,
+                    -score,
+                    item.position,
+                    activity.id or 0,
+                    activity,
+                )
+            )
             seen_ids.add(activity.id)
 
     catalog_stmt = select(Activity)
@@ -295,13 +481,21 @@ def find_activity_by_title(session, user: User, text: str) -> Activity | None:
         score = _match_score(search, activity.title)
         if score < MIN_MATCH_SCORE:
             continue
-        candidates.append((2, -score, len(activity.title or ""), activity))
+        candidates.append(
+            (
+                2,
+                -score,
+                len(activity.title or ""),
+                activity.id or 0,
+                activity,
+            )
+        )
 
     if not candidates:
         return None
 
     candidates.sort()
-    best_activity = candidates[0][3]
+    best_activity = candidates[0][4]
     best_score = -candidates[0][1]
     if best_score < MIN_MATCH_SCORE:
         return None
@@ -1334,7 +1528,9 @@ async def ingest(request: Request = None):
         if request is not None:
             qp = dict(request.query_params)
             debug = str(qp.get("debug", "0")) in ("1", "true", "True")
-        result = await ingest_psychiatry_online_ai(count=min_results, debug=debug)
+        result = await asyncio.to_thread(
+            ingest_psychiatry_online_ai, count=min_results, debug=debug
+        )
         if isinstance(result, dict):
             # debug mode returns counters dict
             return JSONResponse(result)
@@ -1776,6 +1972,8 @@ def chat_send(request: Request, text: str = Form(...)):
         plan_update_needed = False
         ingest_success = False
         action_command: str | None = None
+        force_plan_refresh = False
+        activities_to_commit: set[int] = set()
 
         with get_session() as session:
             user = session.exec(select(User)).first()
@@ -1816,13 +2014,130 @@ def chat_send(request: Request, text: str = Form(...)):
             if note_text:
                 pending_notes.append(note_text)
 
+            policy_bundle = None
+            plan_run = None
+
+            removal_targets = _extract_remove_targets(text)
+            if removal_targets:
+                removal_hits: list[Activity] = []
+                missing_removals: list[str] = []
+                for target in removal_targets:
+                    activity = find_activity_by_title(session, user, target)
+                    if activity:
+                        removal_hits.append(activity)
+                    else:
+                        missing_removals.append(target)
+                if removal_hits:
+                    if policy_bundle is None:
+                        policy_bundle = load_policy_bundle(session, user)
+                    if plan_run is None:
+                        plan_run = plan_manager.ensure_plan(
+                            user, "balanced", policy_bundle
+                        )
+                    plan_items = list(
+                        session.exec(
+                            select(PlanItem).where(PlanItem.plan_run_id == plan_run.id)
+                        )
+                    )
+                    plan_item_lookup = {
+                        item.activity_id: item
+                        for item in plan_items
+                        if item.activity_id
+                    }
+                    for activity in removal_hits:
+                        item = plan_item_lookup.get(activity.id)
+                        if item and item.committed:
+                            item.committed = False
+                            session.add(item)
+                    removal_payload = json.dumps(
+                        {"remove_titles": [activity.title for activity in removal_hits]}
+                    )
+                    apply_policy_payloads(
+                        [removal_payload],
+                        user,
+                        session,
+                        invalidate=False,
+                        record_message=False,
+                    )
+                    session.flush()
+                    PlanManager.invalidate_user_plans(
+                        session, user.id, reason="plan_remove"
+                    )
+                    plan_update_needed = True
+                    force_plan_refresh = True
+                    removed_titles = ", ".join(
+                        activity.title for activity in removal_hits
+                    )
+                    pending_notes.append(f"Removed from plan: {removed_titles}.")
+                    plan_run = None
+                    policy_bundle = None
+                    pending_notes = [
+                        note
+                        for note in pending_notes
+                        if note != "No logged credits to remove."
+                    ]
+                if missing_removals:
+                    pending_notes.append(
+                        "I couldn't find "
+                        + ", ".join(missing_removals)
+                        + " in the current plan—double-check the titles and I'll remove them."
+                    )
+
+            addition_targets = _extract_add_targets(text)
+            if addition_targets:
+                added_titles: list[str] = []
+                missing_additions: list[str] = []
+                for target in addition_targets:
+                    pending_notes.append(f"Searching for details on {target}…")
+                for target in addition_targets:
+                    query_tokens = _title_tokens(target)
+                    candidate = find_activity_by_title(session, user, target)
+                    if not candidate:
+                        try:
+                            inserted = discover_activity_by_title(user, target)
+                            if inserted > 0:
+                                ingest_success = True
+                        except Exception:
+                            logging.exception(
+                                "targeted discovery failed for %s", target
+                            )
+                        PlanManager.invalidate_user_plans(
+                            session, user.id, reason="ingest_focus"
+                        )
+                        force_plan_refresh = True
+                        plan_run = None
+                        policy_bundle = None
+                        candidate = find_activity_by_title(session, user, target)
+                    if candidate:
+                        if _is_candidate_match(candidate.title or "", query_tokens):
+                            added_titles.append(candidate.title or target)
+                            activities_to_commit.add(candidate.id)
+                            plan_update_needed = True
+                            force_plan_refresh = True
+                        else:
+                            missing_additions.append(target)
+                    else:
+                        missing_additions.append(target)
+                if added_titles:
+                    pending_notes.append(
+                        "Added to plan: " + ", ".join(added_titles) + "."
+                    )
+                if missing_additions:
+                    pending_notes.append(
+                        "I couldn’t locate details for "
+                        + ", ".join(missing_additions)
+                        + " yet—share a link or more info and I’ll add it."
+                    )
+
             if "keep this plan" in normalized_text:
-                policy_bundle = load_policy_bundle(session, user)
-                run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+                if policy_bundle is None:
+                    policy_bundle = load_policy_bundle(session, user)
+                if plan_run is None:
+                    plan_run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
                 plan_items = list(
                     session.exec(
                         select(PlanItem)
-                        .where(PlanItem.plan_run_id == run.id)
+                        .where(PlanItem.plan_run_id == plan_run.id)
                         .order_by(PlanItem.position.asc())
                     )
                 )
@@ -2505,22 +2820,7 @@ def chat_send(request: Request, text: str = Form(...)):
                     "chat_send: triggering discovery (reason=%s)", trigger_reason
                 )
                 try:
-                    try:
-                        loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        loop = None
-                    if loop and loop.is_running():
-                        new_loop = asyncio.new_event_loop()
-                        try:
-                            asyncio.set_event_loop(new_loop)
-                            new_loop.run_until_complete(
-                                ingest_psychiatry_online_ai(count=10, debug=False)
-                            )
-                        finally:
-                            asyncio.set_event_loop(loop)
-                            new_loop.close()
-                    else:
-                        asyncio.run(ingest_psychiatry_online_ai(count=10, debug=False))
+                    ingest_psychiatry_online_ai(count=10, debug=False)
                     ingest_success = True
                 except Exception:
                     logging.exception("ingest during chat failed")
@@ -2540,9 +2840,95 @@ def chat_send(request: Request, text: str = Form(...)):
                     user,
                     "balanced",
                     policy_bundle,
-                    force_refresh=ingest_success,
-                    reason="chat_refresh" if ingest_success else None,
+                    force_refresh=ingest_success or force_plan_refresh,
+                    reason=(
+                        "chat_refresh"
+                        if (ingest_success or force_plan_refresh)
+                        else None
+                    ),
                 )
+                if activities_to_commit:
+                    plan_items_db = list(
+                        session.exec(
+                            select(PlanItem).where(PlanItem.plan_run_id == plan_run.id)
+                        )
+                    )
+                    commit_changed = False
+                    plan_item_lookup = {
+                        item.activity_id: item
+                        for item in plan_items_db
+                        if item.activity_id
+                    }
+                    missing_activity_ids = [
+                        activity_id
+                        for activity_id in activities_to_commit
+                        if activity_id not in plan_item_lookup
+                    ]
+                    if missing_activity_ids:
+                        current_max = session.exec(
+                            select(func.max(PlanItem.position)).where(
+                                PlanItem.plan_run_id == plan_run.id
+                            )
+                        ).first()
+                        next_position = int(current_max or 0) + 1
+                        for activity_id in missing_activity_ids:
+                            activity = session.get(Activity, activity_id)
+                            if not activity:
+                                continue
+                            cost, _, pricing = _activity_cost_and_days(user, activity)
+                            new_item = PlanItem(
+                                user_id=user.id,
+                                activity_id=activity.id,
+                                plan_run_id=plan_run.id,
+                                mode="balanced",
+                                position=next_position,
+                                chosen=True,
+                                pricing_snapshot={
+                                    "cost": cost,
+                                    "base_cost": pricing.get("base_cost"),
+                                    "deadline_text": pricing.get("deadline_text"),
+                                    "deadline_urgency": pricing.get("deadline_urgency"),
+                                    "price_label": pricing.get("price_label"),
+                                    "notes": pricing.get("notes"),
+                                    "hybrid_available": pricing.get("hybrid_available"),
+                                },
+                                requirement_snapshot={
+                                    "tags": [],
+                                    "requirement_priority": False,
+                                },
+                                eligibility_status=(
+                                    "eligible"
+                                    if is_eligible(user, activity)
+                                    else "uncertain"
+                                ),
+                                notes=pricing.get("notes"),
+                                committed=True,
+                            )
+                            session.add(new_item)
+                            next_position += 1
+                            commit_changed = True
+                    for item in plan_items_db:
+                        if (
+                            item.activity_id in activities_to_commit
+                            and not item.committed
+                        ):
+                            item.committed = True
+                            session.add(item)
+                            commit_changed = True
+                    if commit_changed:
+                        session.commit()
+                        PlanManager.invalidate_user_plans(
+                            session, user.id, reason="commit_additions"
+                        )
+                        policy_bundle = load_policy_bundle(session, user)
+                        plan_run = plan_manager.ensure_plan(
+                            user,
+                            "balanced",
+                            policy_bundle,
+                            force_refresh=True,
+                            reason="commit_additions",
+                        )
+
                 plan_items, plan_summary, _ = plan_manager.serialize_plan(
                     plan_run, user
                 )

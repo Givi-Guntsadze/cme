@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 # In-memory page cache for a single ingest run
 _page_cache: Dict[str, str] = {}
+PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
+DEFAULT_DISCOVERY_MODEL = get_secret("OPENAI_ASSISTANT_MODEL") or "gpt-4o-mini"
 
 
 def _infer_requirement_tags(
@@ -84,7 +86,7 @@ def html_to_text(html: str) -> str:
         return ""
 
 
-async def ai_extract_from_text(text: str, url: str) -> Optional[dict]:
+def ai_extract_from_text(text: str, url: str) -> Optional[dict]:
     try:
         client = _openai_client()
         schema = (
@@ -378,10 +380,19 @@ def _normalize_pricing_options(raw: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
-def _build_queries_for_user(user: Optional[User]) -> List[str]:
+def _build_queries_for_user(
+    user: Optional[User], focus_title: Optional[str] = None
+) -> List[str]:
     base = "psychiatry CME AMA PRA Category 1 credit"
     city = user.city if user and user.city else None
     queries: List[str] = []
+    if focus_title:
+        focus = focus_title.strip()
+        if focus:
+            queries.append(focus)
+            queries.append(f"{focus} CME")
+            queries.append(f"{focus} AMA PRA Category 1 Credits")
+            queries.append(f"{focus} psychiatry CME")
     queries.append(base + " online OR webinar OR on-demand")
     queries.append(base + " site:ama-assn.org OR site:accme.org OR site:medscape.org")
     if user and user.allow_live:
@@ -399,6 +410,157 @@ def _build_queries_for_user(user: Optional[User]) -> List[str]:
             uniq.append(q)
             seen.add(q)
     return uniq
+
+
+def _generate_focus_queries(
+    user: Optional[User], focus_title: Optional[str]
+) -> List[str]:
+    heuristics = _build_queries_for_user(user, focus_title=focus_title)
+    if not focus_title:
+        return heuristics
+    prompt = {
+        "title": focus_title,
+        "city": getattr(user, "city", None),
+        "allow_live": bool(getattr(user, "allow_live", False)),
+        "specialty": getattr(user, "specialty", None),
+        "memberships": getattr(user, "memberships", []),
+        "existing_queries": heuristics,
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You expand CME discovery queries. Return STRICT JSON with keys "
+                '{"queries": ["..."], "keywords": ["..."]}. Include 3-5 precise queries '
+                "for the provided activity title, covering acronyms, full names, and upcoming year/month. "
+                "Never include explanations."
+            ),
+        },
+        {"role": "user", "content": json.dumps(prompt, default=str)},
+    ]
+    try:
+        client = _openai_client()
+        response = call_responses(
+            client,
+            model=DEFAULT_DISCOVERY_MODEL,
+            messages=messages,
+            temperature=0,
+            max_output_tokens=400,
+        )
+        text = response_text(response)
+        data = safe_json_loads(text) or {}
+        query_list = [
+            str(q).strip()
+            for q in data.get("queries") or []
+            if isinstance(q, (str, int, float))
+        ]
+        merged: List[str] = []
+        seen = set()
+        for q in [*query_list, *heuristics]:
+            if not q:
+                continue
+            if q in seen:
+                continue
+            seen.add(q)
+            merged.append(q)
+        return merged
+    except Exception:
+        logger.exception("query generation failed; falling back to heuristics")
+        return heuristics
+
+
+def _perplexity_search(title: str, queries: List[str]) -> List[dict]:
+    api_key = get_secret("PERPLEXITY_API_KEY")
+    if not api_key:
+        return []
+    payload = {
+        "model": "sonar-medium",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You return CME activity info as JSON. Use the provided queries to locate the activity. "
+                    "Respond ONLY with JSON using this schema: "
+                    '{"items":[{"title":str,"provider":str,"credits":number,'
+                    '"cost_usd":number|null,"modality":"online"|"live","city":str|null,'
+                    '"start_date":"YYYY-MM-DD"|null,"end_date":"YYYY-MM-DD"|null,'
+                    '"days_required":0|1|2|null,"url":str,"summary":str|null,'
+                    '"hybrid_available":bool|null,"pricing_options":array|null,'
+                    '"eligible_institutions":array|null,"eligible_groups":array|null,'
+                    '"membership_required":str|null,"open_to_public":bool|null}]}'
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "title": title,
+                        "queries": queries,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 600,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = httpx.post(
+            PERPLEXITY_API_URL, headers=headers, json=payload, timeout=30.0
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return []
+        content = choices[0].get("message", {}).get("content", "")
+        parsed = safe_json_loads(content) or {}
+        items = parsed.get("items") or []
+        if not isinstance(items, list):
+            return []
+        cleaned: List[dict] = []
+        for item in items:
+            if isinstance(item, dict):
+                cleaned.append(item)
+        return cleaned
+    except Exception:
+        logger.exception("Perplexity search failed for %s", title)
+        return []
+
+
+def discover_activity_by_title(
+    user: Optional[User], focus_title: str, min_results: int = 6
+) -> int:
+    if not focus_title:
+        return 0
+    generated_queries = _generate_focus_queries(user, focus_title)
+    total_inserted = 0
+    for chunk_start in range(0, len(generated_queries), 3):
+        chunk = generated_queries[chunk_start : chunk_start + 3]
+        if not chunk:
+            continue
+        items = _perplexity_search(focus_title, chunk)
+        if items:
+            inserted, _ = _insert_items(items)
+            total_inserted += inserted
+            if total_inserted >= min_results:
+                break
+    if total_inserted < min_results:
+        result = ingest_psychiatry_online_ai(
+            count=max(min_results, 10), debug=False, focus_title=focus_title
+        )
+        try:
+            if isinstance(result, tuple):
+                total_inserted += int(result[0])
+            else:
+                total_inserted += int(result or 0)
+        except Exception:
+            pass
+    return total_inserted
 
 
 def _insert_items(items: List[dict]) -> tuple[int, Dict[str, int]]:
@@ -763,12 +925,17 @@ def _fallback_with_openai_web_search(count: int) -> List[dict]:
         return []
 
 
-async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
+def ingest_psychiatry_online_ai(
+    count: int = 10,
+    debug: bool = False,
+    focus_title: Optional[str] = None,
+):
     """Ingest CME using Google CSE (primary) with AI extraction; deep-fetch pages when snippets lack credits.
     Falls back to AI web_search only if still below threshold.
 
     Returns (ingested_count, used_fallback) by default, or a debug dict when debug=True.
     """
+    _page_cache.clear()
     total_added = 0
     used_fallback = False
 
@@ -789,7 +956,7 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
     candidates: List[dict] = []
     try:
         if get_secret("GOOGLE_API_KEY") and get_secret("GOOGLE_CSE_ID"):
-            queries = _build_queries_for_user(user)
+            queries = _build_queries_for_user(user, focus_title=focus_title)
             for q in queries:
                 try:
                     batch = fetch_google_cse_multi(q, total=count * 2)
@@ -883,7 +1050,7 @@ async def ingest_psychiatry_online_ai(count: int = 10, debug: bool = False):
             text = html_to_text(html)
             if not text:
                 continue
-            r2 = await ai_extract_from_text(text, url=url)
+            r2 = ai_extract_from_text(text, url=url)
             if r2 and is_valid_record(r2):
                 if not r2.get("eligibility_text"):
                     r2["eligibility_text"] = it.get("eligibility_text") or it.get(
