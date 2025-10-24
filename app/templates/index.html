@@ -79,7 +79,7 @@
         id="chat-window"
         class="chat-window"
         hx-get="/chat"
-        hx-trigger="load"
+        hx-trigger="load, chat-refresh from:body"
         hx-swap="innerHTML"
         hx-on::after-settle="this.scrollTop = this.scrollHeight"
       >

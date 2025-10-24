@@ -91,12 +91,13 @@ def ai_extract_from_text(text: str, url: str) -> Optional[dict]:
         client = _openai_client()
         schema = (
             "Return STRICT JSON only with keys: title, provider, credits (number), cost_usd (number|null), "
-            "modality ('online'|'live'), city (string|null), start_date (YYYY-MM-DD|null), end_date (YYYY-MM-DD|null), "
-            "days_required (integer|null), url (string), hybrid_available (boolean|null), "
+            "modality ('online'|'live'|'hybrid'), city (string|null), start_date (YYYY-MM-DD|null), "
+            "end_date (YYYY-MM-DD|null), days_required (integer|null), url (string), hybrid_available (boolean|null), "
             "pricing_options (array of objects with label, cost_usd, deadline (YYYY-MM-DD|null), "
-            "conditions {membership, stage, max_years_post_residency}), "
+            "notes (string|null), conditions {membership, stage, max_years_post_residency}), "
             "eligible_institutions (array of strings|null), eligible_groups (array of strings|null), "
-            "membership_required (string|null), open_to_public (boolean|null)."
+            "membership_required (string|null), eligibility_text (string|null), open_to_public (boolean|null), "
+            "is_self_paced (boolean|null)."
         )
         prompt = (
             f"Extract CME info from the following page text. {schema} URL: {url}. "
@@ -152,12 +153,14 @@ def is_valid_record(r: Dict[str, Any]) -> bool:
             except (TypeError, ValueError):
                 return False
         if not cost_known:
-            return False
-        if (r.get("modality") or "").lower() == "online" and r.get("days_required") in (
-            None,
-            "",
-        ):
+            r["cost_usd"] = None
+        modality, hybrid_flag = _normalize_modality(r.get("modality"))
+        r["modality"] = modality
+        if hybrid_flag:
+            r["hybrid_available"] = True
+        if modality == "online" and r.get("days_required") in (None, ""):
             r["days_required"] = 0
+        _ensure_default_pricing(r)
         return True
     except Exception:
         return False
@@ -360,11 +363,17 @@ def _normalize_pricing_options(raw: Any) -> List[Dict[str, Any]]:
         except (TypeError, ValueError):
             max_years_val = None
 
+        notes_val = opt.get("notes") or opt.get("note") or opt.get("description")
+        notes_text = None
+        if isinstance(notes_val, str):
+            notes_text = notes_val.strip() or None
+
         normalized.append(
             {
                 "label": label,
                 "cost_usd": cost_val,
                 "deadline": deadline_iso,
+                "notes": notes_text,
                 "conditions": {
                     k: v
                     for k, v in {
@@ -410,6 +419,233 @@ def _build_queries_for_user(
             uniq.append(q)
             seen.add(q)
     return uniq
+
+
+def _normalize_modality(value: Optional[str]) -> tuple[str, bool]:
+    if not value:
+        return ("online", False)
+    text = str(value).strip().lower()
+    hybrid = False
+    if "hybrid" in text or "in-person and online" in text or "live/virtual" in text:
+        hybrid = True
+        return ("live", hybrid)
+    if text in {"in-person", "conference", "onsite"}:
+        return ("live", hybrid)
+    if "live" in text:
+        return ("live", hybrid)
+    if "self-paced" in text or "on-demand" in text or "virtual" in text:
+        return ("online", hybrid)
+    if text in {"online", "digital", "web", "webinar"}:
+        return ("online", hybrid)
+    return ("online", hybrid)
+
+
+def _merge_records(primary: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(primary or {})
+    for key, value in (update or {}).items():
+        if value in (None, "", [], {}):
+            continue
+        if key == "pricing_options":
+            existing = merged.get("pricing_options") or []
+            merged_opts = existing if isinstance(existing, list) else []
+            for opt in value:
+                if not isinstance(opt, dict):
+                    continue
+                opt = dict(opt)
+                if "label" not in opt and "tier" in opt:
+                    opt["label"] = str(opt.pop("tier") or "").strip()
+                if "cost_usd" not in opt and "price" in opt:
+                    opt["cost_usd"] = opt.pop("price")
+                if "deadline" not in opt and "early_bird_deadline" in opt:
+                    opt["deadline"] = opt.pop("early_bird_deadline")
+                label = str(opt.get("label") or "").strip()
+                try:
+                    cost = float(opt.get("cost_usd"))
+                except (TypeError, ValueError):
+                    cost = None
+                duplicate = False
+                for current in merged_opts:
+                    if not isinstance(current, dict):
+                        continue
+                    current_label = str(current.get("label") or "").strip().lower()
+                    current_cost = None
+                    try:
+                        current_cost = float(current.get("cost_usd"))
+                    except (TypeError, ValueError):
+                        current_cost = None
+                    if current_label == label.lower() and current_cost == cost:
+                        duplicate = True
+                        if not current.get("notes") and opt.get("notes"):
+                            current["notes"] = opt.get("notes")
+                        if isinstance(current.get("conditions"), dict) and isinstance(
+                            opt.get("conditions"), dict
+                        ):
+                            current["conditions"] = {
+                                **current.get("conditions"),
+                                **opt.get("conditions"),
+                            }
+                        break
+                if not duplicate:
+                    merged_opts.append(opt)
+            merged["pricing_options"] = merged_opts
+        else:
+            merged[key] = value
+    return merged
+
+
+def _ensure_default_pricing(record: Dict[str, Any]) -> None:
+    options = record.get("pricing_options")
+    try:
+        cost_val = float(record.get("cost_usd"))
+    except (TypeError, ValueError):
+        cost_val = None
+    if not options or not isinstance(options, list):
+        if cost_val is not None:
+            record["pricing_options"] = [
+                {
+                    "label": "Standard rate",
+                    "cost_usd": cost_val,
+                    "deadline": None,
+                    "notes": None,
+                    "conditions": {},
+                }
+            ]
+        else:
+            record["pricing_options"] = [
+                {
+                    "label": "Pricing TBD",
+                    "cost_usd": None,
+                    "deadline": None,
+                    "notes": "Registration fees not yet published",
+                    "conditions": {},
+                }
+            ]
+    else:
+        normalized_opts: List[Dict[str, Any]] = []
+        for opt in options:
+            entry = dict(opt)
+            if "notes" not in entry:
+                entry["notes"] = None
+            if "conditions" not in entry or not isinstance(
+                entry.get("conditions"), dict
+            ):
+                entry["conditions"] = {}
+            normalized_opts.append(entry)
+        record["pricing_options"] = normalized_opts
+
+
+def _record_needs_enrichment(record: Dict[str, Any]) -> bool:
+    if not record.get("url"):
+        return False
+    modality = (record.get("modality") or "").strip().lower()
+    cost = record.get("cost_usd")
+    pricing = record.get("pricing_options") or []
+    eligibility_present = bool(
+        record.get("eligibility_text")
+        or record.get("eligible_institutions")
+        or record.get("eligible_groups")
+        or record.get("membership_required")
+    )
+    if modality not in {"online", "live", "hybrid"}:
+        return True
+    if cost in (None, ""):
+        return True
+    if not pricing:
+        return True
+    if not eligibility_present:
+        return True
+    if modality in {"live", "hybrid"} and not (
+        record.get("start_date")
+        or record.get("end_date")
+        or record.get("is_self_paced") is True
+    ):
+        return True
+    return False
+
+
+def _finalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    modality, hybrid_flag = _normalize_modality(record.get("modality"))
+    record["modality"] = modality
+    if hybrid_flag:
+        record["hybrid_available"] = True
+    if record.get("is_self_paced") and modality == "online":
+        record.setdefault("start_date", None)
+        record.setdefault("end_date", None)
+    if isinstance(record.get("eligible_institutions"), str):
+        record["eligible_institutions"] = _split_list(
+            record.get("eligible_institutions")
+        )
+    if isinstance(record.get("eligible_groups"), str):
+        record["eligible_groups"] = _split_list(record.get("eligible_groups"))
+    _ensure_default_pricing(record)
+    if record.get("pricing_options"):
+        numeric_costs: List[float] = []
+        for opt in record.get("pricing_options") or []:
+            if not isinstance(opt, dict):
+                continue
+            try:
+                val = float(opt.get("cost_usd"))
+            except (TypeError, ValueError):
+                continue
+            if val >= 0:
+                numeric_costs.append(val)
+        if numeric_costs:
+            # Prefer the highest cost (non-member) as default budget estimate
+            record["cost_usd"] = max(numeric_costs)
+    if record.get("cost_usd") in (None, ""):
+        record["cost_usd"] = 0.0
+    if not record.get("eligibility_text"):
+        snippets = []
+        if record.get("eligible_institutions"):
+            snippets.append(
+                "Institutions: " + ", ".join(record.get("eligible_institutions"))
+            )
+        if record.get("eligible_groups"):
+            snippets.append("Groups: " + ", ".join(record.get("eligible_groups")))
+        if record.get("membership_required"):
+            snippets.append(f"Membership: {record.get('membership_required')}")
+        if snippets:
+            record["eligibility_text"] = "; ".join(snippets)
+    return record
+
+
+def _enrich_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(record or {})
+    queries = merged.pop("_queries", None)
+    if not merged.get("url"):
+        merged = _finalize_record(merged)
+        return merged
+
+    # Deep fetch pass
+    html = fetch_page(merged["url"])
+    if html:
+        text = html_to_text(html)
+        if text:
+            extracted = ai_extract_from_text(text, url=merged["url"])
+            if extracted:
+                merged = _merge_records(merged, extracted)
+
+    if _record_needs_enrichment(merged):
+        detail = _perplexity_detail_lookup(merged.get("title", ""), queries)
+        if detail:
+            merged = _merge_records(merged, detail)
+
+    merged = _finalize_record(merged)
+    return merged
+
+
+def _enrich_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    enriched: List[Dict[str, Any]] = []
+    for record in records:
+        try:
+            enriched.append(_enrich_record(record))
+        except Exception:
+            logger.exception(
+                "record enrichment failed for %s",
+                _redact_key(str(record.get("url") or record.get("title") or "")),
+            )
+            enriched.append(record)
+    return enriched
 
 
 def _generate_focus_queries(
@@ -473,63 +709,169 @@ def _perplexity_search(title: str, queries: List[str]) -> List[dict]:
     api_key = get_secret("PERPLEXITY_API_KEY")
     if not api_key:
         return []
-    payload = {
-        "model": "sonar-medium",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You return CME activity info as JSON. Use the provided queries to locate the activity. "
-                    "Respond ONLY with JSON using this schema: "
-                    '{"items":[{"title":str,"provider":str,"credits":number,'
-                    '"cost_usd":number|null,"modality":"online"|"live","city":str|null,'
-                    '"start_date":"YYYY-MM-DD"|null,"end_date":"YYYY-MM-DD"|null,'
-                    '"days_required":0|1|2|null,"url":str,"summary":str|null,'
-                    '"hybrid_available":bool|null,"pricing_options":array|null,'
-                    '"eligible_institutions":array|null,"eligible_groups":array|null,'
-                    '"membership_required":str|null,"open_to_public":bool|null}]}'
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "title": title,
-                        "queries": queries,
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-        "temperature": 0,
-        "max_tokens": 600,
-    }
+    model_preference = [
+        "sonar-pro",
+        "sonar",
+        "sonar-reasoning",
+    ]
+
+    def _build_payload(model: str) -> dict:
+        return {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You return CME activity info as JSON. Use the provided queries to locate the activity. "
+                        "Respond ONLY with JSON using this schema: "
+                        '{"items":[{"title":str,"provider":str,"credits":number,'
+                        '"cost_usd":number|null,"modality":"online"|"live","city":str|null,'
+                        '"start_date":"YYYY-MM-DD"|null,"end_date":"YYYY-MM-DD"|null,'
+                        '"days_required":0|1|2|null,"url":str,"summary":str|null,'
+                        '"hybrid_available":bool|null,"pricing_options":array|null,'
+                        '"eligible_institutions":array|null,"eligible_groups":array|null,'
+                        '"membership_required":str|null,"open_to_public":bool|null}]}'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "title": title,
+                            "queries": queries,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "max_tokens": 600,
+        }
+
+    last_error = None
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    try:
-        resp = httpx.post(
-            PERPLEXITY_API_URL, headers=headers, json=payload, timeout=30.0
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
-            return []
-        content = choices[0].get("message", {}).get("content", "")
-        parsed = safe_json_loads(content) or {}
-        items = parsed.get("items") or []
-        if not isinstance(items, list):
-            return []
-        cleaned: List[dict] = []
-        for item in items:
-            if isinstance(item, dict):
-                cleaned.append(item)
-        return cleaned
-    except Exception:
-        logger.exception("Perplexity search failed for %s", title)
-        return []
+
+    for model in model_preference:
+        payload = _build_payload(model)
+        try:
+            resp = httpx.post(
+                PERPLEXITY_API_URL, headers=headers, json=payload, timeout=30.0
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            content = choices[0].get("message", {}).get("content", "")
+            parsed = safe_json_loads(content) or {}
+            items = parsed.get("items") or []
+            if not isinstance(items, list):
+                continue
+            cleaned: List[dict] = []
+            for item in items:
+                if isinstance(item, dict):
+                    merged_item = dict(item)
+                    merged_item.setdefault("_queries", queries)
+                    cleaned.append(merged_item)
+            if cleaned:
+                return _enrich_records(cleaned)
+        except httpx.HTTPStatusError as exc:
+            last_error = exc
+            logger.warning(
+                "Perplexity model %s failed (%s): %s",
+                model,
+                exc.response.status_code,
+                exc.response.text[:200],
+            )
+            continue
+        except Exception as exc:
+            last_error = exc
+            logger.exception("Perplexity search failed for %s using %s", title, model)
+            continue
+    if last_error:
+        logger.error("Perplexity search exhausted all models for %s", title)
+    return []
+
+
+def _perplexity_detail_lookup(
+    title: str, queries: Optional[List[str]] = None
+) -> Optional[Dict[str, Any]]:
+    api_key = get_secret("PERPLEXITY_API_KEY")
+    if not api_key:
+        return None
+    model_preference = ["sonar-pro", "sonar"]
+    detail_queries = queries or []
+    if not detail_queries:
+        detail_queries = [
+            f"{title} registration fees",
+            f"{title} pricing",
+            f"{title} early bird deadline",
+            f"{title} eligibility requirements",
+        ]
+
+    def _payload(model: str) -> dict:
+        return {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are compiling authoritative CME event details. Respond ONLY with JSON matching this schema: "
+                        '{"items":[{"title":str,"provider":str|null,"url":str|null,'
+                        '"cost_usd":number|null,"pricing_options":array,'
+                        '"eligibility_text":str|null,"eligible_institutions":array|null,'
+                        '"eligible_groups":array|null,"membership_required":str|null,'
+                        '"open_to_public":bool|null,"modality":str|null,'
+                        '"start_date":"YYYY-MM-DD"|null,"end_date":"YYYY-MM-DD"|null,'
+                        '"days_required":0|1|2|null}]}'
+                        " Ensure pricing_options is an array of objects with fields label, cost_usd, "
+                        "deadline (YYYY-MM-DD|null), notes (string|null), and conditions (object). "
+                        "Populate cost_usd with numeric values when possible and include member-only, "
+                        "trainee, and early-bird tiers with deadlines when available."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"title": title, "queries": detail_queries},
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "max_tokens": 800,
+        }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    for model in model_preference:
+        try:
+            resp = httpx.post(
+                PERPLEXITY_API_URL, headers=headers, json=_payload(model), timeout=30.0
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            content = choices[0].get("message", {}).get("content", "")
+            parsed = safe_json_loads(content) or {}
+            items = parsed.get("items") or []
+            if not isinstance(items, list) or not items:
+                continue
+            first = items[0]
+            if isinstance(first, dict):
+                return first
+        except Exception as exc:
+            logger.warning("Perplexity detail lookup failed (%s): %s", model, exc)
+            continue
+    return None
 
 
 def discover_activity_by_title(
@@ -577,7 +919,11 @@ def _insert_items(items: List[dict]) -> tuple[int, Dict[str, int]]:
                 url = (it.get("url") or "").strip() or None
                 # Fallback provider to domain if missing
                 provider = provider_in or (urlparse(url).netloc if url else "")
-                credits = float(it.get("credits") or 0)
+                credits_raw = it.get("credits")
+                try:
+                    credits = float(credits_raw or 0)
+                except (TypeError, ValueError):
+                    credits = 0.0
                 modality = (it.get("modality") or "online").lower()
                 try:
                     cost = (
@@ -622,18 +968,6 @@ def _insert_items(items: List[dict]) -> tuple[int, Dict[str, int]]:
 
                 if not hybrid_available and "hybrid" in modality:
                     hybrid_available = True
-
-                # Validation
-                if not title or not provider or credits <= 0:
-                    continue
-
-                exists = s.exec(
-                    select(Activity).where(
-                        Activity.title == title, Activity.provider == provider
-                    )
-                ).first()
-                if exists:
-                    continue
 
                 def _coerce_list(value) -> List[str]:
                     if not value:
@@ -701,6 +1035,78 @@ def _insert_items(items: List[dict]) -> tuple[int, Dict[str, int]]:
                     eligibility_text_value = None
 
                 source_val = (it.get("source") or "web").strip().lower() or "web"
+
+                exists = s.exec(
+                    select(Activity).where(
+                        Activity.title == title, Activity.provider == provider
+                    )
+                ).first()
+
+                # Validation
+                if not title or not provider:
+                    continue
+                if credits <= 0:
+                    if exists and exists.credits:
+                        credits = float(exists.credits)
+                    else:
+                        continue
+
+                if exists:
+                    changed = False
+                    if pricing_options and (
+                        not exists.pricing_options
+                        or len(pricing_options) > len(exists.pricing_options or [])
+                    ):
+                        exists.pricing_options = pricing_options
+                        changed = True
+                    if cost and (exists.cost_usd or 0) != cost:
+                        exists.cost_usd = cost
+                        changed = True
+                    if hybrid_available and not getattr(
+                        exists, "hybrid_available", False
+                    ):
+                        exists.hybrid_available = True
+                        changed = True
+                    if eligibility_text_value and (
+                        not exists.eligibility_text
+                        or len(eligibility_text_value)
+                        > len(exists.eligibility_text or "")
+                    ):
+                        exists.eligibility_text = eligibility_text_value
+                        changed = True
+                    if eligibility_data["eligible_institutions"]:
+                        exists.eligible_institutions = eligibility_data[
+                            "eligible_institutions"
+                        ]
+                        changed = True
+                    if eligibility_data["eligible_groups"]:
+                        exists.eligible_groups = eligibility_data["eligible_groups"]
+                        changed = True
+                    if eligibility_data["membership_required"]:
+                        exists.membership_required = eligibility_data[
+                            "membership_required"
+                        ]
+                        changed = True
+                    if url and not exists.url:
+                        exists.url = url
+                        changed = True
+                    if summary and (
+                        not exists.summary or len(summary) > len(exists.summary or "")
+                    ):
+                        exists.summary = summary
+                        changed = True
+                    if start_date and not exists.start_date:
+                        exists.start_date = start_date
+                        changed = True
+                    if end_date and not exists.end_date:
+                        exists.end_date = end_date
+                        changed = True
+                    if days_required and not exists.days_required:
+                        exists.days_required = days_required
+                        changed = True
+                    if changed:
+                        s.add(exists)
+                    continue
 
                 extra_texts: list[str] = [
                     raw_eligibility,

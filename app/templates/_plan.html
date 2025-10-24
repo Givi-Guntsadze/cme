@@ -20,6 +20,22 @@
         • {{ plan_summary.days_used }} days off
       {% endif %}
     </div>
+    <div class="plan-global-actions">
+      <button
+        type="button"
+        class="button"
+        hx-post="/plan/accept_all"
+        hx-target="#plan-card"
+        hx-swap="innerHTML"
+      >Accept Plan</button>
+      <button
+        type="button"
+        class="button"
+        hx-post="/plan/reject_all"
+        hx-target="#plan-card"
+        hx-swap="innerHTML"
+      >Reject Plan</button>
+    </div>
   {% endif %}
   {% if plan_requirements and plan_requirements.messages %}
     <div class="requirement-banner">
@@ -72,44 +88,50 @@
           {% if p.summary %}
             <div class="meta">{{ p.summary }}</div>
           {% endif %}
-          {% if p.requirement_tags %}
-            <div class="meta">
-              {% for tag in p.requirement_tags %}
-                <span class="badge requirement{% if tag.pending %} warn{% endif %}">
-                  {{ tag.label }}
-                  {% if tag.pending and tag.key == 'sa_cme' and tag.value %}
-                    ({{ '%.1f' % tag.value }} cr needed)
-                  {% elif tag.pending and tag.key == 'pip' and tag.value %}
-                    ({{ tag.value }} remaining)
-                  {% elif tag.pending and tag.key == 'patient_safety' %}
-                    (required)
-                  {% elif not tag.pending %}
-                    (covered)
-                  {% endif %}
-                </span>
-              {% endfor %}
-            </div>
-          {% endif %}
           <div class="plan-actions">
             {% if p.committed %}
-              <span class="badge committed">Committed</span>
+              <span class="badge committed">Accepted</span>
               <button
                 type="button"
                 class="linklike"
-                hx-post="/plan/uncommit/{{ p.activity_id }}"
+                hx-post="/plan/reject/{{ p.activity_id }}"
                 hx-target="#plan-card"
                 hx-swap="innerHTML"
-                title="Release this activity so the planner can suggest alternatives"
-              >Remove from plan</button>
+                title="Remove this activity from the plan"
+              >Remove</button>
+              <button
+                type="button"
+                class="linklike"
+                hx-post="/plan/reject_with_substitute/{{ p.activity_id }}"
+                hx-target="#plan-card"
+                hx-swap="innerHTML"
+                title="Remove this activity and ask the assistant to find alternatives"
+              >Remove &amp; find substitute</button>
             {% else %}
               <button
                 type="button"
                 class="linklike"
-                hx-post="/plan/commit/{{ p.activity_id }}"
+                hx-post="/plan/accept/{{ p.activity_id }}"
                 hx-target="#plan-card"
                 hx-swap="innerHTML"
-                title="Lock this activity into your plan"
-              >Keep</button>
+                title="Accept this activity into your plan"
+              >Accept</button>
+              <button
+                type="button"
+                class="linklike"
+                hx-post="/plan/reject/{{ p.activity_id }}"
+                hx-target="#plan-card"
+                hx-swap="innerHTML"
+                title="Reject this suggestion"
+              >Reject</button>
+              <button
+                type="button"
+                class="linklike"
+                hx-post="/plan/reject_with_substitute/{{ p.activity_id }}"
+                hx-target="#plan-card"
+                hx-swap="innerHTML"
+                title="Reject and ask the assistant to find a substitute"
+              >Reject &amp; find substitute</button>
             {% endif %}
           </div>
         </li>

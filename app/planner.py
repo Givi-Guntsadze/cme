@@ -214,13 +214,16 @@ def requirements_gap_summary(session, user: User) -> dict[str, object]:
 
 def pricing_context_for_user(user: User, activity: Activity) -> Dict[str, Any]:
     options = getattr(activity, "pricing_options", []) or []
-    base_cost = float(activity.cost_usd or 0.0)
+    try:
+        base_cost = float(activity.cost_usd)
+    except (TypeError, ValueError):
+        base_cost = None
     today = date.today()
     user_memberships = _user_memberships(user)
     stage = _normalize_stage_value(getattr(user, "professional_stage", None))
     years_since = _years_since_residency(user)
 
-    selected_cost = base_cost if base_cost > 0 else None
+    selected_cost = base_cost if (base_cost is not None and base_cost > 0) else None
     selected_label: Optional[str] = None
     selected_deadline: Optional[date] = None
     discount_notes: List[str] = []
@@ -329,7 +332,7 @@ def pricing_context_for_user(user: User, activity: Activity) -> Dict[str, Any]:
     context: Dict[str, Any] = {
         "cost": selected_cost,
         "label": selected_label,
-        "base_cost": base_cost if base_cost else selected_cost,
+        "base_cost": base_cost if base_cost is not None else selected_cost,
         "deadline": selected_deadline,
         "notes": "; ".join(discount_notes) if discount_notes else "",
         "missing_membership_data": missing_membership_info,
@@ -735,9 +738,6 @@ def build_plan_with_policy(
         if remaining_override is not None
         else max(float(user.remaining_credits or 0.0), 0.0)
     )
-    if remaining_target <= 0:
-        return ([], 0.0, 0.0, 0)
-
     budget_cap = (
         float(budget_override)
         if budget_override is not None
@@ -783,6 +783,18 @@ def build_plan_with_policy(
     pip_needed = int(req_ctx.get("pip_needed") or 0)
     if pip_needed > 0 and not any(_is_pip_activity(a) for a in activities):
         pip_needed = 0
+
+    requirement_floor = remaining_target
+    if sa_needed > 0:
+        requirement_floor = max(requirement_floor, sa_needed)
+    if patient_safety_pending:
+        requirement_floor = max(requirement_floor, 1.0)
+    if pip_needed > 0:
+        requirement_floor = max(requirement_floor, 5.0 * pip_needed)
+
+    remaining_target = requirement_floor
+    if remaining_target <= 0:
+        return ([], 0.0, 0.0, 0)
 
     chosen: List[Activity] = []
     total_credits = 0.0

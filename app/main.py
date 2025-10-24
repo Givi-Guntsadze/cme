@@ -56,6 +56,120 @@ from .env import get_secret
 logger = logging.getLogger(__name__)
 
 
+def _compose_requirement_gap_message(
+    requirements: dict[str, object] | None
+) -> tuple[str, str] | tuple[None, None]:
+    if not requirements:
+        return (None, None)
+    pending_flags = requirements.get("pending") or {}
+    pending_values = requirements.get("values") or {}
+    if not isinstance(pending_flags, dict):
+        pending_flags = {}
+    if not isinstance(pending_values, dict):
+        pending_values = {}
+
+    gaps: list[str] = []
+    focus_terms: list[str] = []
+
+    if pending_flags.get("sa_cme"):
+        needed = pending_values.get("sa_cme")
+        try:
+            needed = float(needed)
+        except Exception:
+            needed = None
+        if needed and needed > 0.1:
+            gaps.append(f"{needed:.1f} SA-CME credits")
+            focus_terms.append("SA-CME")
+
+    if pending_flags.get("patient_safety"):
+        gaps.append("a patient safety activity")
+        focus_terms.append("patient safety")
+
+    pip_needed = pending_values.get("pip")
+    pip_flag = pending_flags.get("pip")
+    if pip_flag or (isinstance(pip_needed, (int, float)) and pip_needed):
+        try:
+            pip_count = int(float(pip_needed))
+        except Exception:
+            pip_count = 1 if pip_flag else 0
+        if pip_flag or pip_count > 0:
+            noun = "project" if pip_count == 1 else "projects"
+            clause = f"{pip_count} PIP {noun}" if pip_count else "a PIP project"
+            gaps.append(clause)
+            focus_terms.append("PIP")
+
+    if not gaps:
+        return (None, None)
+
+    gap_text = ", ".join(gaps[:-1]) + (" and " + gaps[-1] if len(gaps) > 1 else gaps[0])
+    prompt = (
+        f"We still need {gap_text}. What should I prioritize next "
+        "— a national conference block, on-demand modules, or something else?"
+    )
+    return (prompt, ", ".join(focus_terms) or gap_text)
+
+
+def _maybe_nudge_requirements(
+    session, user: User, requirements: dict[str, object] | None
+) -> bool:
+    prompt, fingerprint = _compose_requirement_gap_message(requirements)
+    if not prompt:
+        return False
+
+    recent = list(
+        session.exec(
+            select(AssistantMessage)
+            .where(AssistantMessage.user_id == user.id)
+            .order_by(AssistantMessage.created_at.desc())
+            .limit(8)
+        )
+    )
+    for msg in recent:
+        content = (msg.content or "").strip()
+        if not content:
+            continue
+        if fingerprint and fingerprint in content:
+            return False
+        if content == prompt:
+            return False
+
+    session.add(AssistantMessage(user_id=user.id, role="assistant", content=prompt))
+    return True
+
+
+def _queue_substitute_prompt(session, user: User, activity: Activity) -> None:
+    title = activity.title or "that activity"
+    prompt = (
+        f"Removed {title}. To swap it out, what matters most — covering ABPN gaps, "
+        "keeping travel light, staying under a budget, or something else? "
+        "I can tap national CME listings and recent conference calendars once you point me in the right direction."
+    )
+    session.add(AssistantMessage(user_id=user.id, role="assistant", content=prompt))
+    session.add(
+        AssistantMessage(
+            user_id=user.id,
+            role="assistant",
+            content=f"INTERNAL:SUBSTITUTE_REQUEST:{activity.id}",
+        )
+    )
+
+
+def _queue_plan_reset_prompt(session, user: User, titles: list[str]) -> None:
+    cleaned = [t for t in titles if t]
+    preview = ", ".join(cleaned[:3])
+    if len(cleaned) > 3:
+        preview += ", and others"
+    if preview:
+        prefix = f"Cleared the previous recommendations ({preview})."
+    else:
+        prefix = "Cleared the previous recommendations."
+    prompt = (
+        f"{prefix} What should I scout next — national conferences, on-demand bundles, "
+        "or something targeted like patient safety or SA-CME modules?"
+    )
+    session.add(AssistantMessage(user_id=user.id, role="assistant", content=prompt))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -1259,40 +1373,27 @@ def plan_fragment(request: Request):
         user = session.exec(select(User)).first()
         if not user:
             return HTMLResponse("", status_code=204)
-        plan_manager = PlanManager(session)
-        policy_bundle = load_policy_bundle(session, user)
         force_refresh = request.query_params.get("refresh", "0").lower() in {
             "1",
             "true",
             "yes",
         }
-        plan_run = plan_manager.ensure_plan(
+        response, _ = _prepare_plan_fragment(
+            request,
+            session,
             user,
-            plan_mode,
-            policy_bundle,
+            plan_mode=plan_mode,
             force_refresh=force_refresh,
             reason="fragment_refresh" if force_refresh else None,
         )
-        plan, plan_summary, plan_requirements = plan_manager.serialize_plan(
-            plan_run, user
-        )
-        return templates.TemplateResponse(
-            "_plan.html",
-            {
-                "request": request,
-                "user": user,
-                "plan": plan,
-                "plan_summary": plan_summary,
-                "plan_requirements": plan_requirements,
-                "plan_mode": plan_mode,
-            },
-        )
+        return response
 
 
-def _refresh_plan_fragment_response(
+def _prepare_plan_fragment(
     request: Request,
     session,
     user: User,
+    *,
     plan_mode: str = "balanced",
     force_refresh: bool = True,
     reason: str | None = None,
@@ -1307,7 +1408,7 @@ def _refresh_plan_fragment_response(
         reason=reason,
     )
     plan, plan_summary, plan_requirements = plan_manager.serialize_plan(plan_run, user)
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         "_plan.html",
         {
             "request": request,
@@ -1318,10 +1419,31 @@ def _refresh_plan_fragment_response(
             "plan_mode": plan_mode,
         },
     )
+    return response, plan_requirements
 
 
+def _refresh_plan_fragment_response(
+    request: Request,
+    session,
+    user: User,
+    plan_mode: str = "balanced",
+    force_refresh: bool = True,
+    reason: str | None = None,
+):
+    response, _ = _prepare_plan_fragment(
+        request,
+        session,
+        user,
+        plan_mode=plan_mode,
+        force_refresh=force_refresh,
+        reason=reason,
+    )
+    return response
+
+
+@app.post("/plan/accept/{activity_id}", response_class=HTMLResponse)
 @app.post("/plan/commit/{activity_id}", response_class=HTMLResponse)
-def plan_commit(request: Request, activity_id: int):
+def plan_accept(request: Request, activity_id: int):
     with get_session() as session:
         user = session.exec(select(User)).first()
         if not user:
@@ -1348,7 +1470,7 @@ def plan_commit(request: Request, activity_id: int):
         session.commit()
     with get_session() as session:
         user = session.exec(select(User)).first()
-        return _refresh_plan_fragment_response(
+        response, plan_requirements = _prepare_plan_fragment(
             request,
             session,
             user,
@@ -1356,10 +1478,32 @@ def plan_commit(request: Request, activity_id: int):
             force_refresh=True,
             reason="commit_toggle",
         )
+        chat_refresh = _maybe_nudge_requirements(session, user, plan_requirements)
+        if chat_refresh:
+            session.commit()
+            response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
+        return response
 
 
 @app.post("/plan/uncommit/{activity_id}", response_class=HTMLResponse)
 def plan_uncommit(request: Request, activity_id: int):
+    return _handle_plan_reject(request, activity_id, find_substitute=False)
+
+
+@app.post("/plan/reject/{activity_id}", response_class=HTMLResponse)
+def plan_reject(request: Request, activity_id: int):
+    return _handle_plan_reject(request, activity_id, find_substitute=False)
+
+
+@app.post("/plan/reject_with_substitute/{activity_id}", response_class=HTMLResponse)
+def plan_reject_with_substitute(request: Request, activity_id: int):
+    return _handle_plan_reject(request, activity_id, find_substitute=True)
+
+
+def _handle_plan_reject(
+    request: Request, activity_id: int, *, find_substitute: bool
+) -> HTMLResponse:
+    chat_refresh = False
     with get_session() as session:
         user = session.exec(select(User)).first()
         if not user:
@@ -1375,21 +1519,140 @@ def plan_uncommit(request: Request, activity_id: int):
             )
             .limit(1)
         ).first()
-        if item and item.committed:
+        if not item:
+            return _refresh_plan_fragment_response(
+                request, session, user, plan_mode="balanced", force_refresh=True
+            )
+        activity = session.get(Activity, activity_id)
+        if item.committed:
             item.committed = False
             session.add(item)
-        PlanManager.invalidate_user_plans(session, user.id, reason="commit_toggle")
+        if activity and activity.title:
+            payload = json.dumps({"remove_titles": [activity.title]})
+            apply_policy_payloads(
+                [payload],
+                user,
+                session,
+                invalidate=False,
+                record_message=False,
+            )
+        PlanManager.invalidate_user_plans(session, user.id, reason="plan_reject")
+        if find_substitute and activity:
+            _queue_substitute_prompt(session, user, activity)
+            chat_refresh = True
         session.commit()
     with get_session() as session:
         user = session.exec(select(User)).first()
-        return _refresh_plan_fragment_response(
+        response, plan_requirements = _prepare_plan_fragment(
             request,
             session,
             user,
             plan_mode="balanced",
             force_refresh=True,
-            reason="commit_toggle",
+            reason="plan_reject",
         )
+        nudged = _maybe_nudge_requirements(session, user, plan_requirements)
+        if nudged:
+            session.commit()
+            chat_refresh = True
+        if chat_refresh:
+            response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
+        return response
+
+
+@app.post("/plan/accept_all", response_class=HTMLResponse)
+def plan_accept_all(request: Request):
+    with get_session() as session:
+        user = session.exec(select(User)).first()
+        if not user:
+            return HTMLResponse("", status_code=204)
+        plan_manager = PlanManager(session)
+        policy_bundle = load_policy_bundle(session, user)
+        run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+        items = list(
+            session.exec(
+                select(PlanItem)
+                .where(PlanItem.plan_run_id == run.id)
+                .order_by(PlanItem.position.asc())
+            )
+        )
+        changed = False
+        for item in items:
+            if not item.committed:
+                item.committed = True
+                session.add(item)
+                changed = True
+        if changed:
+            PlanManager.invalidate_user_plans(session, user.id, reason="accept_all")
+        session.commit()
+    with get_session() as session:
+        user = session.exec(select(User)).first()
+        response, plan_requirements = _prepare_plan_fragment(
+            request,
+            session,
+            user,
+            plan_mode="balanced",
+            force_refresh=True,
+            reason="accept_all",
+        )
+        nudged = _maybe_nudge_requirements(session, user, plan_requirements)
+        if nudged:
+            session.commit()
+            response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
+        return response
+
+
+@app.post("/plan/reject_all", response_class=HTMLResponse)
+def plan_reject_all(request: Request):
+    with get_session() as session:
+        user = session.exec(select(User)).first()
+        if not user:
+            return HTMLResponse("", status_code=204)
+        plan_manager = PlanManager(session)
+        policy_bundle = load_policy_bundle(session, user)
+        run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+        items = list(
+            session.exec(
+                select(PlanItem)
+                .where(PlanItem.plan_run_id == run.id)
+                .order_by(PlanItem.position.asc())
+            )
+        )
+        titles: list[str] = []
+        for item in items:
+            activity = session.get(Activity, item.activity_id)
+            if activity and activity.title:
+                titles.append(activity.title)
+            if item.committed:
+                item.committed = False
+                session.add(item)
+        if titles:
+            payload = json.dumps({"remove_titles": titles})
+            apply_policy_payloads(
+                [payload],
+                user,
+                session,
+                invalidate=False,
+                record_message=False,
+            )
+        PlanManager.invalidate_user_plans(session, user.id, reason="reject_all")
+        _queue_plan_reset_prompt(session, user, titles)
+        session.commit()
+    with get_session() as session:
+        user = session.exec(select(User)).first()
+        response, plan_requirements = _prepare_plan_fragment(
+            request,
+            session,
+            user,
+            plan_mode="balanced",
+            force_refresh=True,
+            reason="reject_all",
+        )
+        nudged = _maybe_nudge_requirements(session, user, plan_requirements)
+        if nudged:
+            session.commit()
+        response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
+        return response
 
 
 @app.post("/setup")

@@ -102,6 +102,50 @@ def _merge_policy_payload(
     return merged
 
 
+def _dedupe_titles(*title_lists: Iterable[str]) -> List[str]:
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for titles in title_lists:
+        if not titles:
+            continue
+        for item in titles:
+            if not isinstance(item, str):
+                continue
+            cleaned = item.strip()
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(cleaned)
+    return ordered
+
+
+def _extract_remove_titles(payload: Any) -> List[str]:
+    if not isinstance(payload, dict):
+        return []
+
+    collected: List[str] = []
+    stack: List[Dict[str, Any]] = [payload]
+
+    while stack:
+        current = stack.pop()
+        values = current.get("remove_titles")
+        if isinstance(values, list):
+            collected = _dedupe_titles(collected, values)
+        nested_default = current.get("default")
+        if isinstance(nested_default, dict):
+            stack.append(nested_default)
+        nested_modes = current.get("by_mode")
+        if isinstance(nested_modes, dict):
+            for nested in nested_modes.values():
+                if isinstance(nested, dict):
+                    stack.append(nested)
+
+    return collected
+
+
 def _source_label(source: Optional[str]) -> str:
     if not source:
         return "Curated"
@@ -224,12 +268,44 @@ def apply_policy_payloads(
     active_by_mode: Dict[str, UserPolicy] = {
         (row.mode or "default"): row for row in active_policies
     }
+    preserved_remove_titles: List[str] = []
+    if invalidate and active_policies:
+        preserved_remove_titles = _dedupe_titles(
+            *[_extract_remove_titles(row.payload or {}) for row in active_policies]
+        )
 
     if invalidate:
         for row in active_policies:
             row.active = False
             session.add(row)
         active_by_mode = {}
+        if preserved_remove_titles:
+            adjusted_entries: List[Tuple[str, Dict[str, Any]]] = []
+            for mode, payload in entries:
+                if isinstance(payload, dict):
+                    payload_copy = dict(payload)
+                    if "remove_titles" not in payload_copy:
+                        payload_copy["remove_titles"] = preserved_remove_titles
+                    else:
+                        current = payload_copy.get("remove_titles")
+                        if current is None:
+                            payload_copy["remove_titles"] = preserved_remove_titles
+                        elif isinstance(current, list):
+                            if current:
+                                payload_copy["remove_titles"] = _dedupe_titles(
+                                    current, preserved_remove_titles
+                                )
+                            else:
+                                payload_copy["remove_titles"] = []
+                        else:
+                            payload_copy["remove_titles"] = preserved_remove_titles
+                    adjusted_entries.append((mode, payload_copy))
+                else:
+                    adjusted_entries.append((mode, payload))
+            if adjusted_entries:
+                entries = adjusted_entries
+            else:
+                entries = [("default", {"remove_titles": preserved_remove_titles})]
 
     for mode, payload in entries:
         mode_key = (mode or "default") or "default"
@@ -792,12 +868,32 @@ class PlanManager:
             cost_value = pricing.get("cost")
             if cost_value is None and item.pricing_snapshot:
                 cost_value = item.pricing_snapshot.get("cost")
-            if cost_value is None:
-                cost_value = activity.cost_usd
+            raw_activity_cost = getattr(activity, "cost_usd", None)
+            if cost_value is None and raw_activity_cost not in (None, ""):
+                cost_value = raw_activity_cost
+
+            pricing_options = getattr(activity, "pricing_options", []) or []
+
+            def _options_have_numeric(options: List[dict]) -> bool:
+                for opt in options:
+                    if not isinstance(opt, dict):
+                        continue
+                    try:
+                        val = float(opt.get("cost_usd"))
+                    except (TypeError, ValueError):
+                        continue
+                    if val > 0:
+                        return True
+                return False
+
             if cost_value is None:
                 cost_display = "TBD"
-            else:
+            elif cost_value > 0:
                 cost_display = f"${cost_value:,.0f}"
+            elif _options_have_numeric(pricing_options):
+                cost_display = f"${cost_value:,.0f}"
+            else:
+                cost_display = "TBD"
 
             base_cost = pricing.get("base_cost")
             if base_cost is None and item.pricing_snapshot:
