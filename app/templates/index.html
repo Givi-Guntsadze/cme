@@ -1,80 +1,382 @@
 {% extends "base.html" %}
 {% block content %}
 {% set current_mode = (plan_mode | default(request.query_params.get('mode', 'balanced')))|lower %}
-  <h1>CME/MOC Planner (ABPN POC)</h1>
-
-  {% if not user %}
-    <section class="card">
-      <h2>Setup</h2>
-      <form method="post" action="/setup">
-        <label>Target credits <input name="target_credits" type="number" step="0.5" value="10" required></label>
-        <label>Budget (USD) <input name="budget_usd" type="number" step="1" value="300" required></label>
-        <label>Days off allowed <input name="days_off" type="number" value="0" required></label>
-        <label>Allow live events? <input name="allow_live" type="checkbox"></label>
-        <label>Prefer live events? <input name="prefer_live" type="checkbox"></label>
-        <label>Name <input name="name" value="Doctor"></label>
-        <label>Specialty <input name="specialty" value="Psychiatry"></label>
-        <label>City <input name="city" placeholder="(optional)"></label>
-        <label>Residency completion year <input name="residency_completion_year" type="number" min="1980" max="2100" placeholder="e.g., 2021"></label>
-        <label>Professional stage
-          <select name="professional_stage">
-            <option value="" selected>Select…</option>
-            <option value="early_career">Early career (&lt;4 years post-residency)</option>
-            <option value="standard">Established practitioner</option>
-            <option value="resident">Resident / Fellow</option>
-          </select>
-        </label>
-        <label>Memberships (comma separated)
-          <input name="memberships" placeholder="American Psychiatric Association, State Society">
-        </label>
-        <button type="submit">Save setup</button>
-      </form>
-    </section>
-  {% else %}
-    <section class="stats">
-      <div class="badge">Remaining: {{ '%.1f' % user.remaining_credits }} credits</div>
-      <div>
-        Budget: ${{ '%.0f' % user.budget_usd }} | Days off: {{ user.days_off }} | Live OK: {{ 'Yes' if user.allow_live else 'No' }} | Prefer live: {{ 'Yes' if user.prefer_live else 'No' }}
-        {% if user.professional_stage %} | Stage: {{ user.professional_stage.replace('_', ' ')|title }}{% endif %}
-        {% if user.residency_completion_year %} | Residency: {{ user.residency_completion_year }}{% endif %}
-        {% if user.memberships %} | Memberships: {{ (user.memberships or [])|join(', ') }}{% endif %}
-        {% if is_dev %}
-          <span style="margin-left:8px;">
-            <a href="/ingest?debug=1" target="_blank">debug ingest</a>
-          </span>
-        {% endif %}
+{% if not user %}
+<div class="guest-shell">
+  <div class="guest-topbar">
+    <div class="brand-mark">
+      <div class="brand-icon" aria-hidden="true">🧠</div>
+      <div class="brand-text">
+        <span class="brand-name">CME Co-Pilot</span>
+        <span class="brand-tagline">Concierge CME planning</span>
       </div>
-    </section>
-
-    {% if policy_status and policy_status|length > 0 %}
-      <div class="policy-banner">
-        <span>Policy active:</span>
-        {% for p in policy_status %}
-          <span class="badge policy">
-            {{ p.mode|capitalize }}{% if p.hours_left is not none %} (expires in {{ p.hours_left }}h){% endif %}
-          </span>
-        {% endfor %}
-        <button
-          hx-post="/policy/clear"
-          hx-swap="none"
-          hx-on::after-request="window.location.reload()"
-          class="button"
-          style="margin-left:8px;"
-          type="button"
-        >Clear policy</button>
-        <form hx-post="/policy/clear" hx-target="#chat-window" hx-swap="beforeend" hx-on::after-request="const el=document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }" style="display:inline; margin-left:8px;">
-          <button type="submit" class="linklike">Clear</button>
-        </form>
-      </div>
-    {% endif %}
-
-    <section class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
-        <h2 style="margin:0;">Assistant</h2>
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-          <a href="/preferences" class="button">Edit Preferences</a>
+    </div>
+    <button id="theme-toggle" class="icon-button theme-toggle" type="button">
+      <span id="theme-toggle-icon" aria-hidden="true">🌙</span>
+    </button>
+  </div>
+  <section class="panel panel-setup">
+    <h1>Welcome to your CME Concierge</h1>
+    <p class="panel-subtitle">
+      Share a few preferences and we'll draft an ABPN-aligned plan tailored to you.
+    </p>
+    <form method="post" action="/setup" class="form-grid">
+      <label>Target credits
+        <input name="target_credits" type="number" step="0.5" value="10" required />
+      </label>
+      <label>Budget (USD)
+        <input name="budget_usd" type="number" step="1" value="300" required />
+      </label>
+      <label>Days off allowed
+        <input name="days_off" type="number" value="0" required />
+      </label>
+      <label class="checkbox">
+        <input name="allow_live" type="checkbox" />
+        Allow live events?
+      </label>
+      <label class="checkbox">
+        <input name="prefer_live" type="checkbox" />
+        Prefer live events?
+      </label>
+      <label>Name
+        <input name="name" value="Doctor" />
+      </label>
+      <label>Specialty
+        <input name="specialty" value="Psychiatry" />
+      </label>
+      <label>City
+        <input name="city" placeholder="(optional)" />
+      </label>
+      <label>Residency completion year
+        <input
+          name="residency_completion_year"
+          type="number"
+          min="1980"
+          max="2100"
+          placeholder="e.g., 2021"
+        />
+      </label>
+      <label>Professional stage
+        <select name="professional_stage">
+          <option value="" selected>Select…</option>
+          <option value="early_career">Early career (&lt;4 years post-residency)</option>
+          <option value="standard">Established practitioner</option>
+          <option value="resident">Resident / Fellow</option>
+        </select>
+      </label>
+      <label>Memberships (comma separated)
+        <input
+          name="memberships"
+          placeholder="American Psychiatric Association, State Society"
+        />
+      </label>
+      <button type="submit" class="btn-primary">Save setup</button>
+    </form>
+  </section>
+</div>
+{% else %}
+{% set pillars = validation.pillars if validation and validation.pillars else {} %}
+{% set cme_pillar = pillars.get('cme') if pillars else None %}
+{% set sa_pillar = pillars.get('sa_cme') if pillars else None %}
+{% set safety_pillar = pillars.get('patient_safety') if pillars else None %}
+{% set pip_pillar = pillars.get('pip') if pillars else None %}
+<div class="dashboard-layout">
+  <aside class="dashboard-sidebar" id="dashboard-sidebar">
+    <div class="sidebar-top">
+      <div class="brand-mark">
+        <div class="brand-icon" aria-hidden="true">🧠</div>
+        <div class="brand-text">
+          <h1>CME Co-Pilot</h1>
+          <span class="brand-tagline">For {{ user.name or 'Doctor' }}</span>
         </div>
       </div>
+      <button id="theme-toggle" class="icon-button theme-toggle" type="button">
+        <span id="theme-toggle-icon" aria-hidden="true">🌙</span>
+      </button>
+    </div>
+    <section class="sidebar-section">
+      <h2>Profile &amp; Preferences</h2>
+      <dl class="sidebar-list">
+        <div class="sidebar-row">
+          <dt>Target credits</dt>
+          <dd>
+            {% if user.target_credits %}
+              {{ '%.0f' % user.target_credits }}
+            {% elif validation %}
+              {{ '%.0f' % validation.summary.target_total }}
+            {% else %}
+              —
+            {% endif %}
+          </dd>
+        </div>
+        <div class="sidebar-row">
+          <dt>Max budget</dt>
+          <dd>
+            {% if user.budget_usd %}
+              ${{ '%.0f' % user.budget_usd }}
+            {% else %}
+              —
+            {% endif %}
+          </dd>
+        </div>
+        <div class="sidebar-row">
+          <dt>Days off</dt>
+          <dd>{{ user.days_off or 0 }}</dd>
+        </div>
+        <div class="sidebar-row">
+          <dt>Memberships</dt>
+          <dd>
+            {% if user.memberships %}
+              {{ (user.memberships or [])|join(', ') }}
+            {% else %}
+              —
+            {% endif %}
+          </dd>
+        </div>
+      </dl>
+    </section>
+    <section class="sidebar-section">
+      <h2>Requirements Status</h2>
+      <div class="progress-stack">
+        {% if cme_pillar %}
+          {% set cme = namespace(width=0, earned=cme_pillar.earned or 0, target=cme_pillar.target or 0) %}
+          {% if cme.target > 0 %}
+            {% set cme.width = (cme.earned / cme.target * 100) %}
+          {% elif cme.earned > 0 %}
+            {% set cme.width = 100 %}
+          {% endif %}
+          {% if cme.width > 100 %}
+            {% set cme.width = 100 %}
+          {% endif %}
+          <div class="progress-row">
+            <div class="progress-head">
+              <span>Total CME Credits</span>
+              {% if cme.target > 0 %}
+                <span>{{ '%.1f' % cme.earned }} / {{ '%.0f' % cme.target }}</span>
+              {% else %}
+                <span>{{ '%.1f' % cme.earned }}</span>
+              {% endif %}
+            </div>
+            <div class="progress-track">
+              <div class="progress-bar" style="width: {{ '%.0f' % cme.width }}%;"></div>
+            </div>
+          </div>
+        {% endif %}
+        {% if sa_pillar %}
+          {% set sa = namespace(width=0, earned=sa_pillar.earned or 0, target=sa_pillar.target or 0) %}
+          {% if sa.target > 0 %}
+            {% set sa.width = (sa.earned / sa.target * 100) %}
+          {% elif sa.earned > 0 %}
+            {% set sa.width = 100 %}
+          {% endif %}
+          {% if sa.width > 100 %}
+            {% set sa.width = 100 %}
+          {% endif %}
+          <div class="progress-row">
+            <div class="progress-head">
+              <span>Self-Assessment CME</span>
+              {% if sa.target > 0 %}
+                <span>{{ '%.1f' % sa.earned }} / {{ '%.1f' % sa.target }}</span>
+              {% else %}
+                <span>{{ '%.1f' % sa.earned }}</span>
+              {% endif %}
+            </div>
+            <div class="progress-track">
+              <div class="progress-bar" style="width: {{ '%.0f' % sa.width }}%;"></div>
+            </div>
+          </div>
+        {% endif %}
+        {% if safety_pillar %}
+          {% set safety = namespace(width=0, earned=safety_pillar.earned or 0, target=safety_pillar.target or 0) %}
+          {% if safety.target > 0 %}
+            {% set safety.width = (safety.earned / safety.target * 100) %}
+          {% elif safety.earned > 0 %}
+            {% set safety.width = 100 %}
+          {% endif %}
+          {% if safety.width > 100 %}
+            {% set safety.width = 100 %}
+          {% endif %}
+          <div class="progress-row">
+            <div class="progress-head">
+              <span>Patient Safety</span>
+              {% if safety.target > 0 %}
+                <span>{{ safety.earned }} / {{ safety.target }}</span>
+              {% else %}
+                <span>{{ safety.earned }}</span>
+              {% endif %}
+            </div>
+            <div class="progress-track">
+              <div class="progress-bar progress-bar-ok" style="width: {{ '%.0f' % safety.width }}%;"></div>
+            </div>
+            {% if safety_pillar.detail and safety_pillar.status != 'ok' %}
+              <p class="progress-note">{{ safety_pillar.detail }}</p>
+            {% endif %}
+          </div>
+        {% endif %}
+        {% if pip_pillar %}
+          {% set pip = namespace(width=0, earned=pip_pillar.earned or 0, target=pip_pillar.target or 0) %}
+          {% if pip.target > 0 %}
+            {% set pip.width = (pip.earned / pip.target * 100) %}
+          {% elif pip.earned > 0 %}
+            {% set pip.width = 100 %}
+          {% endif %}
+          {% if pip.width > 100 %}
+            {% set pip.width = 100 %}
+          {% endif %}
+          <div class="progress-row {% if pip_pillar.status != 'ok' %}progress-row-warn{% endif %}">
+            <div class="progress-head">
+              <span>Performance Improvement</span>
+              {% if pip.target > 0 %}
+                <span>{{ pip.earned }} / {{ pip.target }}</span>
+              {% else %}
+                <span>{{ pip.earned }}</span>
+              {% endif %}
+            </div>
+            <div class="progress-track">
+              <div class="progress-bar progress-bar-warn" style="width: {{ '%.0f' % pip.width }}%;"></div>
+            </div>
+            {% if pip_pillar.detail %}
+              <p class="progress-note">{{ pip_pillar.detail }}</p>
+            {% endif %}
+          </div>
+        {% endif %}
+      </div>
+      {% if validation and validation.meta %}
+        <div class="sidebar-footnote">
+          <span>{{ validation.meta.board }} · {{ validation.meta.specialty }}</span>
+          <span>Version {{ validation.meta.version }}</span>
+        </div>
+        {% if validation.meta.sources %}
+          <div class="sidebar-sources">
+            <span>Sources:</span>
+            {% for s in validation.meta.sources %}
+              <a href="{{ s }}" target="_blank" rel="noopener">{{ s }}</a>{% if not loop.last %}, {% endif %}
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endif %}
+    </section>
+    {% if validation and validation.gaps %}
+      <section class="sidebar-section sidebar-section-alert">
+        <h2>Focus Next</h2>
+        <ul>
+          {% for gap in validation.gaps %}
+            <li>{{ gap }}</li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+    <section class="sidebar-section sidebar-activity">
+      <h2>Activity Log</h2>
+      <p class="sidebar-activity-subtitle">Completed credits recorded across your cycle.</p>
+      <ul class="sidebar-activity-list">
+        {% if claims and claims|length > 0 %}
+          {% for c in claims %}
+            <li>
+              <div class="sidebar-activity-row">
+                <span class="sidebar-activity-date">{{ c.date }}</span>
+                <span class="sidebar-activity-credits">{{ '%.1f' % c.credits }} cr</span>
+              </div>
+              <div class="sidebar-activity-detail">
+                <span>{{ c.topic or 'general' }}</span>
+                <span>{{ c.source_text }}</span>
+              </div>
+            </li>
+          {% endfor %}
+        {% else %}
+          <li class="sidebar-activity-empty">No CME activities logged yet.</li>
+        {% endif %}
+      </ul>
+    </section>
+  </aside>
+  <div class="dashboard-main">
+    <div class="main-column">
+      <section class="panel plan-panel">
+        <header class="panel-header">
+          <div>
+            <h2>Your CME Plan</h2>
+            <p class="panel-subtitle">Balanced plan shown. Ask for alternatives or a cheaper mix anytime.</p>
+          </div>
+          <div class="plan-header-aside">
+            <div class="plan-stats">
+              <span class="stat-pill">Remaining {{ '%.1f' % user.remaining_credits }} cr</span>
+              {% if user.budget_usd %}
+                <span class="stat-pill">Budget ${{ '%.0f' % user.budget_usd }}</span>
+              {% endif %}
+              <span class="stat-pill">Days off {{ user.days_off or 0 }}</span>
+              <span class="stat-pill">Mode {{ current_mode|capitalize }}</span>
+              <span class="stat-pill">Live {{ 'Yes' if user.allow_live else 'No' }}</span>
+            </div>
+            {% if is_dev %}
+              <a href="/ingest?debug=1" target="_blank" class="btn-secondary btn-compact">Debug ingest</a>
+            {% endif %}
+          </div>
+        </header>
+        {% if policy_status and policy_status|length > 0 %}
+          <div class="policy-banner">
+            <div class="policy-label">
+              <span class="badge">Policy active</span>
+              {% for p in policy_status %}
+                <span class="policy-pill">
+                  {{ p.mode|capitalize }}{% if p.hours_left is not none %} · {{ p.hours_left }}h{% endif %}
+                </span>
+              {% endfor %}
+            </div>
+            <div class="policy-actions">
+              <button
+                type="button"
+                class="btn-secondary"
+                hx-post="/policy/clear"
+                hx-swap="none"
+                hx-on::after-request="window.location.reload()"
+              >Clear policy</button>
+              <form
+                hx-post="/policy/clear"
+                hx-target="#chat-window"
+                hx-swap="beforeend"
+                hx-on::after-request="const el=document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }"
+              >
+                <button type="submit" class="linklike">Clear via chat</button>
+              </form>
+            </div>
+          </div>
+        {% endif %}
+        {% set added = request.query_params.get('added') %}
+        {% set gcount = request.query_params.get('gcount') %}
+        {% set acount = request.query_params.get('acount') %}
+        {% set fallback = request.query_params.get('fallback') %}
+        {% set error = request.query_params.get('error') %}
+        <div id="ingest-banner" class="ingest-banner">
+          {% if added %}
+            <div class="ingest-notice ingest-ok">
+              Imported {{ added }} new activities{% if gcount or acount %} — Web: {{ gcount or 0 }}, AI: {{ acount or 0 }}{% endif %}{% if fallback == '1' %} (fallback used){% endif %}.
+            </div>
+          {% elif error %}
+            <div class="ingest-notice ingest-error">{{ error }}</div>
+          {% endif %}
+        </div>
+        <div
+          id="plan-card"
+          class="plan-card-container"
+          data-plan-mode="{{ current_mode }}"
+          hx-get="/fragment/plan?mode={{ current_mode }}"
+          hx-trigger="plan-refresh from:body"
+          hx-target="this"
+          hx-swap="innerHTML"
+          hx-vals='{"refresh":"1"}'
+        >
+          {% include '_plan.html' %}
+        </div>
+      </section>
+    </div>
+    <section class="panel chat-panel">
+      <header class="panel-header">
+        <div>
+          <h2>Assistant</h2>
+          <p class="panel-subtitle">Chat with the concierge to adapt your plan or log completions.</p>
+        </div>
+        <a href="/preferences" class="btn-secondary">Edit Preferences</a>
+      </header>
       <div
         id="chat-window"
         class="chat-window"
@@ -92,64 +394,11 @@
         hx-swap="beforeend"
         hx-on::after-request="this.reset(); const el = document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }"
       >
-        <input name="text" placeholder="Ask about this plan, request changes, or say 'explain why'…" required />
-        <button type="submit">Send</button>
+        <input name="text" placeholder="Tell me your goals or request a change…" required />
+        <button type="submit" class="btn-primary">Send</button>
       </form>
     </section>
-
-    {% set added = request.query_params.get('added') %}
-    {% set gcount = request.query_params.get('gcount') %}
-    {% set acount = request.query_params.get('acount') %}
-    {% set fallback = request.query_params.get('fallback') %}
-    {% set error = request.query_params.get('error') %}
-    <div id="ingest-banner">
-      {% if added %}
-        <div class="card" style="background:#f0fff4;border-left:4px solid #34d399;padding:8px 12px;margin:8px 0;">
-          Imported {{ added }} new activities{% if gcount or acount %} — Web: {{ gcount or 0 }}, AI: {{ acount or 0 }}{% endif %}{% if fallback == '1' %} (fallback used){% endif %}.
-        </div>
-      {% elif error %}
-        <div class="card" style="background:#fff7f7;border-left:4px solid #f87171;padding:8px 12px;margin:8px 0;">{{ error }}</div>
-      {% endif %}
-    </div>
-
-    <div id="plan-card" data-plan-mode="{{ current_mode }}"
-         hx-get="/fragment/plan?mode={{ current_mode }}"
-         hx-trigger="plan-refresh from:body"
-         hx-target="this"
-         hx-swap="innerHTML"
-         hx-vals='{"refresh":"1"}'>
-      {% include '_plan.html' %}
-    </div>
-
-{% if validation %}
-  <section class="card">
-    <h2>Requirements ({{ validation.meta.board }} — {{ validation.meta.specialty }})</h2>
-    <div class="meta">Version: {{ validation.meta.version }}</div>
-    <div class="meta">Totals: {{ '%.1f' % validation.summary.earned_total }} / {{ validation.summary.target_total }} (remaining {{ '%.1f' % validation.summary.remaining_total }})</div>
-    <ul class="checks">
-      {% for chk in validation.checks %}
-        <li>
-          {% if chk.status == 'ok' %}✅{% elif chk.status == 'warn' %}⚠️{% else %}❌{% endif %}
-          <strong>{{ chk.label }}</strong> — {{ chk.detail }}
-        </li>
-      {% endfor %}
-    </ul>
-    <div class="meta">Sources:
-      {% for s in validation.meta.sources %}
-        <a href="{{ s }}" target="_blank" rel="noopener">{{ s }}</a>{% if not loop.last %}, {% endif %}
-      {% endfor %}
-    </div>
-  </section>
+  </div>
+</div>
 {% endif %}
-
-    <section class="card">
-      <h2>Activity Log</h2>
-      <ul>
-        {% for c in claims or [] %}
-          <li>{{ c.date }} — {{ '%.1f' % c.credits }} cr — {{ c.topic or 'general' }} — {{ c.source_text }}</li>
-        {% endfor %}
-      </ul>
-    </section>
-
-  {% endif %}
 {% endblock %}

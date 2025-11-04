@@ -1,5 +1,8 @@
 from sqlmodel import SQLModel, create_engine, Session
 
+# Ensure catalog models register with SQLModel metadata
+from . import catalog  # noqa: F401
+
 # Simple session factory
 from contextlib import contextmanager
 from sqlalchemy import text

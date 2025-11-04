@@ -1,0 +1,198 @@
+Project CMECatalog {
+  database_type: "PostgreSQL"
+}
+
+Table providers {
+  provider_id uuid [pk]
+  legal_name varchar(255)
+  dba_name varchar(255)
+  accreditation_number varchar(100)
+  contact_email varchar(255)
+  contact_phone varchar(50)
+  website_url text
+  address_line1 varchar(255)
+  address_line2 varchar(255)
+  city varchar(100)
+  state_province varchar(100)
+  postal_code varchar(30)
+  country varchar(100)
+  preferred_partner boolean [default: false]
+  created_at timestamp [default: `now()`]
+  updated_at timestamp [default: `now()`]
+}
+
+Table provider_relationships {
+  relationship_id uuid [pk]
+  provider_id uuid [ref: > providers.provider_id]
+  relationship_type varchar(100)
+  start_date date
+  end_date date
+  notes text
+}
+
+Table activities {
+  activity_id uuid [pk]
+  provider_id uuid [ref: > providers.provider_id]
+  canonical_title text
+  slug varchar(255) [unique]
+  description text
+  modality varchar(20) // enum: online, live, hybrid
+  format varchar(50) // enum: conference, enduring, webinar, journal, pip, workshop, etc.
+  release_date date
+  expiration_date date
+  status varchar(20) // enum: active, archived, draft
+  max_claimable_credits numeric(5,2)
+  accreditation_statement text
+  last_verified_at timestamp
+  data_confidence numeric(3,2)
+  revision_of_activity_id uuid [ref: > activities.activity_id]
+  created_at timestamp [default: `now()`]
+  updated_at timestamp [default: `now()`]
+}
+
+Table topics {
+  topic_id uuid [pk]
+  taxonomy_term varchar(255)
+  taxonomy_path text
+  is_active boolean [default: true]
+  created_at timestamp [default: `now()`]
+}
+
+Table activity_topics {
+  activity_topic_id uuid [pk]
+  activity_id uuid [ref: > activities.activity_id]
+  topic_id uuid [ref: > topics.topic_id]
+  source varchar(50) // enum: provider, internal
+}
+
+Table activity_credit_types {
+  activity_credit_id uuid [pk]
+  activity_id uuid [ref: > activities.activity_id]
+  credit_type varchar(50) // enum: ama_pra_cat1, abpn_sa_cme, pip, patient_safety, ethics, etc.
+  credit_quantity numeric(5,2)
+  credit_expiration date
+  notes text
+}
+
+Table activity_sessions {
+  session_id uuid [pk]
+  activity_id uuid [ref: > activities.activity_id]
+  start_datetime timestamp
+  end_datetime timestamp
+  registration_deadline timestamp
+  time_zone varchar(50)
+  venue_name varchar(255)
+  street_address varchar(255)
+  city varchar(100)
+  state_province varchar(100)
+  postal_code varchar(30)
+  country varchar(100)
+  latitude numeric(9,6)
+  longitude numeric(9,6)
+  recurrence_pattern varchar(100)
+  capacity integer
+  waitlist_status varchar(50)
+  cancellation_policy_url text
+}
+
+Table activity_delivery_links {
+  delivery_id uuid [pk]
+  activity_id uuid [ref: > activities.activity_id]
+  access_url text
+  platform_name varchar(100)
+  instructions text
+  availability_start timestamp
+  availability_end timestamp
+  self_paced boolean
+}
+
+Table activity_pricing_tiers {
+  pricing_id uuid [pk]
+  activity_id uuid [ref: > activities.activity_id]
+  tier_name varchar(100)
+  price_amount numeric(10,2)
+  currency char(3)
+  price_type varchar(50) // enum: base, add_on, bundle
+  eligibility_notes text
+  discount_start timestamp
+  discount_end timestamp
+  taxes_and_fees numeric(10,2)
+  refund_policy text
+  last_checked_at timestamp
+}
+
+Table activity_eligibility_requirements {
+  eligibility_id uuid [pk]
+  activity_id uuid [ref: > activities.activity_id]
+  requirement_type varchar(50) // enum: membership, licensure, board_status, profession, geography, prerequisite, documentation
+  requirement_value text
+  notes text
+  verified_at timestamp
+}
+
+Table activity_commitment {
+  commitment_id uuid [pk]
+  activity_id uuid [ref: > activities.activity_id]
+  seat_time_hours numeric(5,2)
+  total_time_hours numeric(5,2)
+  completion_window_days integer
+  cohort_size integer
+  pacing varchar(50) // enum: self_paced, cohort, blended
+}
+
+Table activity_documents {
+  document_id uuid [pk]
+  activity_id uuid [ref: > activities.activity_id]
+  document_type varchar(50) // enum: brochure, syllabus, statement_of_credit, flyer, faq
+  file_url text
+  checksum varchar(128)
+  ingest_source_id uuid [ref: > ingest_sources.ingest_source_id]
+}
+
+Table requirement_mappings {
+  mapping_id uuid [pk]
+  activity_id uuid [ref: > activities.activity_id]
+  requirement_code varchar(100)
+  coverage_min numeric(5,2)
+  coverage_max numeric(5,2)
+  derived_from varchar(50) // enum: manual, llm, provider
+  confidence numeric(3,2)
+}
+
+Table ingest_sources {
+  ingest_source_id uuid [pk]
+  activity_id uuid [ref: > activities.activity_id]
+  source_url text
+  crawl_job_id varchar(100)
+  scraped_at timestamp
+  checksum varchar(128)
+  http_status integer
+  robots_mode varchar(20) // enum: allowed, disallowed, ignored
+  parser_version varchar(50)
+  manual_review_status varchar(20) // enum: pending, approved, rejected
+  reviewer_id uuid
+}
+
+Table quality_signals {
+  quality_id uuid [pk]
+  activity_id uuid [ref: > activities.activity_id]
+  metric_type varchar(50) // enum: user_rating, cancellation_rate, on_time_updates
+  metric_value numeric(5,2)
+  sample_size integer
+  collected_at timestamp
+}
+
+Ref: activity_topics.activity_id > activities.activity_id
+Ref: activity_topics.topic_id > topics.topic_id
+Ref: activities.provider_id > providers.provider_id
+Ref: activity_credit_types.activity_id > activities.activity_id
+Ref: activity_sessions.activity_id > activities.activity_id
+Ref: activity_delivery_links.activity_id > activities.activity_id
+Ref: activity_pricing_tiers.activity_id > activities.activity_id
+Ref: activity_eligibility_requirements.activity_id > activities.activity_id
+Ref: activity_commitment.activity_id > activities.activity_id
+Ref: activity_documents.activity_id > activities.activity_id
+Ref: requirement_mappings.activity_id > activities.activity_id
+Ref: quality_signals.activity_id > activities.activity_id
+Ref: ingest_sources.activity_id > activities.activity_id
+Ref: activities.revision_of_activity_id > activities.activity_id

@@ -1,7 +1,23 @@
 {% for m in messages %}
-  <div class="row {{ 'right' if m.role == 'user' else 'left' }}">
-    <div class="bubble {{ m.role }}">
-      {{ m.content | e }}
+  {% if m.role == 'user' %}
+    <div class="chat-message chat-message-out">
+      <div class="chat-bubble user">
+        {{ m.content | e }}
+      </div>
     </div>
-  </div>
+  {% elif m.role == 'error' %}
+    <div class="chat-message chat-message-error">
+      <div class="chat-avatar" aria-hidden="true">!</div>
+      <div class="chat-bubble error">
+        {{ m.content | e }}
+      </div>
+    </div>
+  {% else %}
+    <div class="chat-message chat-message-in">
+      <div class="chat-avatar" aria-hidden="true">AI</div>
+      <div class="chat-bubble assistant">
+        {{ m.content | e }}
+      </div>
+    </div>
+  {% endif %}
 {% endfor %}

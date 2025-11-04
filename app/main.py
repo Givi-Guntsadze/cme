@@ -18,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func
 from sqlmodel import select
 
+from .catalog.router import router as catalog_router
 from .db import create_db_and_tables, get_session
 from .models import (
     User,
@@ -181,6 +182,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="CME/MOC POC", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
+app.include_router(catalog_router)
 
 
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")

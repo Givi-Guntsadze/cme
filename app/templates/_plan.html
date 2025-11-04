@@ -1,143 +1,185 @@
-<section class="card">
-  <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
-    <h2 style="margin:0;">Recommended Plan</h2>
+<section class="plan-card">
+  <div class="plan-card-header">
+    <div>
+      <h3>Recommended Plan</h3>
+      <p class="plan-card-subtitle">
+        {% if plan_summary %}
+          Tailored to your profile and current requirement gaps.
+        {% else %}
+          Discover activities to start drafting your CME roadmap.
+        {% endif %}
+      </p>
+    </div>
     <button
+      type="button"
+      class="btn-primary"
       hx-post="/ingest"
       hx-swap="none"
       hx-on::before-request="this.dataset.originalText=this.textContent; this.disabled=true; this.textContent='Discovering…';"
-      hx-on::after-request="(function(btn, evt){ if(btn.dataset){ btn.textContent=btn.dataset.originalText||'Discover'; btn.disabled=false; } try { const xhr = evt.detail && evt.detail.xhr; if (xhr) { let data = {}; try { data = JSON.parse(xhr.responseText || '{}'); } catch (err) { data = {}; } if (typeof data.ingested !== 'undefined') { const params = new URLSearchParams(window.location.search); params.set('added', data.ingested || 0); if (typeof data.google_inserted !== 'undefined') { params.set('gcount', data.google_inserted || 0); } if (typeof data.ai_inserted !== 'undefined') { params.set('acount', data.ai_inserted || 0); } params.set('fallback', data.used_fallback ? '1' : '0'); history.replaceState(null, '', '?' + params.toString()); const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#f0fff4;border-left:4px solid #34d399;padding:8px 12px;margin:8px 0;\'>Imported ' + (data.ingested || 0) + ' new activities — Web: ' + (data.google_inserted || 0) + ', AI: ' + (data.ai_inserted || 0) + (data.used_fallback ? ' (fallback used)' : '') + '.</div>'; } const planRoot = document.getElementById('plan-card'); if (planRoot && window.htmx) { window.htmx.trigger(document.body || window, 'plan-refresh'); } return; } if (data.error) { const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\'card\' style=\'background:#fff7f7;border-left:4px solid #f87171;padding:8px 12px;margin:8px 0;\'>' + data.error + '</div>'; } return; } } } catch (err) { console.error(err); } })(this, event);"
-      class="button"
-      type="button"
-    >Discover</button>
+      hx-on::after-request="(function(btn, evt){ if(btn.dataset){ btn.textContent=btn.dataset.originalText||'Discover activities'; btn.disabled=false; } try { const xhr = evt.detail && evt.detail.xhr; if (xhr) { let data = {}; try { data = JSON.parse(xhr.responseText || '{}'); } catch (err) { data = {}; } if (typeof data.ingested !== 'undefined') { const params = new URLSearchParams(window.location.search); params.set('added', data.ingested || 0); if (typeof data.google_inserted !== 'undefined') { params.set('gcount', data.google_inserted || 0); } if (typeof data.ai_inserted !== 'undefined') { params.set('acount', data.ai_inserted || 0); } params.set('fallback', data.used_fallback ? '1' : '0'); history.replaceState(null, '', '?' + params.toString()); const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\"ingest-notice ingest-ok\">Imported ' + (data.ingested || 0) + ' new activities — Web: ' + (data.google_inserted || 0) + ', AI: ' + (data.ai_inserted || 0) + (data.used_fallback ? ' (fallback used)' : '') + '.</div>'; } const planRoot = document.getElementById('plan-card'); if (planRoot && window.htmx) { window.htmx.trigger(document.body || window, 'plan-refresh'); } return; } if (data.error) { const banner = document.getElementById('ingest-banner'); if (banner) { banner.innerHTML = '<div class=\"ingest-notice ingest-error\">' + data.error + '</div>'; } return; } } } catch (err) { console.error(err); } })(this, event);"
+    >
+      Discover activities
+    </button>
   </div>
-  <p class="meta" style="margin-top: -4px;">Balanced plan shown. Ask if you'd like more discovery or a cheaper mix.</p>
   {% if plan_summary %}
-    <div class="meta plan-summary">
-      {{ plan_summary.item_count }} {{ 'activity' if plan_summary.item_count == 1 else 'activities' }}
-      • {{ '%.1f' % plan_summary.total_credits }} cr
-      • {{ plan_summary.cost_display }}
+    <div class="plan-summary-row">
+      <span class="summary-pill">
+        {{ plan_summary.item_count }} {{ 'activity' if plan_summary.item_count == 1 else 'activities' }}
+      </span>
+      <span class="summary-pill">{{ '%.1f' % plan_summary.total_credits }} cr</span>
+      <span class="summary-pill">{{ plan_summary.cost_display }}</span>
       {% if plan_summary.days_used %}
-        • {{ plan_summary.days_used }} days off
+        <span class="summary-pill">{{ plan_summary.days_used }} days off</span>
       {% endif %}
     </div>
     <div class="plan-global-actions">
       <button
         type="button"
-        class="button"
+        class="btn-secondary"
         hx-post="/plan/accept_all"
         hx-target="#plan-card"
         hx-swap="innerHTML"
-      >Accept Plan</button>
+      >Accept plan</button>
       <button
         type="button"
-        class="button"
+        class="btn-secondary"
         hx-post="/plan/reject_all"
         hx-target="#plan-card"
         hx-swap="innerHTML"
-      >Reject Plan</button>
+      >Reject plan</button>
     </div>
   {% endif %}
   {% if plan_requirements and plan_requirements.messages %}
-    <div class="requirement-banner">
+    <div class="plan-focus-banner">
       <strong>Requirement focus:</strong> {{ plan_requirements.messages | join(' • ') }}
     </div>
   {% endif %}
   {% if plan and plan|length > 0 %}
-    <ul class="plan">
+    <ul class="plan-items">
       {% for p in plan %}
-        <li>
-          <div class="title">
-            {% if p.url %}
-              <a href="{{ p.url }}" target="_blank" rel="noopener noreferrer">{{ p.title }}</a>
-            {% else %}
-              {{ p.title }}
-            {% endif %}
+        {% set icon_ns = namespace(text='C') %}
+        {% if p.modality %}
+          {% set icon_ns.text = p.modality[0]|upper %}
+        {% endif %}
+        <li class="plan-item{% if p.committed %} plan-item-committed{% endif %}">
+          <div class="plan-item-header">
+            <div class="plan-item-info">
+              <div class="plan-item-icon" aria-hidden="true">{{ icon_ns.text }}</div>
+              <div class="plan-item-title-block">
+                <h4>
+                  {% if p.url %}
+                    <a href="{{ p.url }}" target="_blank" rel="noopener noreferrer">{{ p.title }}</a>
+                  {% else %}
+                    {{ p.title }}
+                  {% endif %}
+                </h4>
+                <div class="plan-item-meta">
+                  {% if p.provider %}
+                    <span>{{ p.provider }}</span>
+                  {% endif %}
+                  {% if p.modality %}
+                    <span>{{ p.modality }}</span>
+                  {% endif %}
+                  {% if p.city %}
+                    <span>{{ p.city }}</span>
+                  {% endif %}
+                </div>
+                <div class="plan-item-badges">
+                  {% if p.source_label %}
+                    <span class="badge badge-source">{{ p.source_label }}</span>
+                  {% endif %}
+                  {% if p.topic and p.topic != 'general' %}
+                    <span class="badge badge-topic">{{ p.topic.replace('_', ' ')|title }}</span>
+                  {% endif %}
+                  {% if p.hybrid_available %}
+                    <span class="badge badge-hybrid">Hybrid</span>
+                  {% endif %}
+                  {% if p.eligibility_status == 'eligible' %}
+                    <span class="badge badge-eligibility ok" title="{{ p.eligibility_text or 'Eligible for you' }}">Eligible</span>
+                  {% elif p.eligibility_status in ['uncertain', 'ineligible'] %}
+                    <span class="badge badge-eligibility warn" title="{{ p.eligibility_text or 'Eligibility may be restricted — please double check.' }}">Check eligibility</span>
+                  {% endif %}
+                  {% if p.price_label %}
+                    <span class="badge badge-price">{{ p.price_label }}</span>
+                  {% endif %}
+                </div>
+              </div>
+            </div>
+            <div class="plan-item-stats">
+              <span class="plan-item-credits">{{ '%.1f' % p.credits }} cr</span>
+              <span class="plan-item-cost">{{ p.cost_display }}</span>
+              {% if p.base_cost and p.base_cost != p.cost %}
+                <span class="plan-item-base">Std ${{ '%.0f' % p.base_cost }}</span>
+              {% endif %}
+            </div>
           </div>
-          <div class="meta">
-            {{ p.provider }} • {{ p.modality }}{% if p.city %} • {{ p.city }}{% endif %}
-            {% if p.source_label %}
-              <span class="badge" style="margin-left:8px; background:#eef;">{{ p.source_label }}</span>
-            {% endif %}
-            {% if p.topic and p.topic != 'general' %}
-              <span class="badge topic">{{ p.topic.replace('_', ' ')|title }}</span>
-            {% endif %}
-            {% if p.hybrid_available %}
-              <span class="badge" style="margin-left:8px; background:#e6fffa;">Hybrid</span>
-            {% endif %}
-            {% if p.eligibility_status == 'eligible' %}
-              <span class="badge eligibility ok" title="{{ p.eligibility_text or 'Eligible for you' }}">✅ Eligible</span>
-            {% elif p.eligibility_status in ['uncertain', 'ineligible'] %}
-              <span class="badge eligibility warn" title="{{ p.eligibility_text or 'Eligibility may be restricted — please double check.' }}">⚠️ Check eligibility</span>
-            {% endif %}
-          </div>
-          <div class="meta">
-            {{ '%.1f' % p.credits }} cr • {{ p.cost_display }}
-            {% if p.price_label %}
-              <span class="badge" style="margin-left:8px; background:#fef3c7;">{{ p.price_label }}</span>
-            {% endif %}
-            {% if p.base_cost and p.base_cost != p.cost %}
-              <span class="meta" style="margin-left:8px;">Std ${{ '%.0f' % p.base_cost }}</span>
-            {% endif %}
-          </div>
-          {% if p.deadline_text %}
-            <div class="meta" style="color:#b45309;">Register by {{ p.deadline_text }}{% if p.deadline_urgency %} ({{ p.deadline_urgency }}){% endif %}</div>
+          {% if p.deadline_text or p.pricing_notes or p.summary %}
+            <div class="plan-item-body">
+              {% if p.deadline_text %}
+                <div class="plan-item-deadline">Register by {{ p.deadline_text }}{% if p.deadline_urgency %} ({{ p.deadline_urgency }}){% endif %}</div>
+              {% endif %}
+              {% if p.pricing_notes %}
+                <div class="plan-item-note">{{ p.pricing_notes }}</div>
+              {% endif %}
+              {% if p.summary %}
+                <div class="plan-item-summary">{{ p.summary }}</div>
+              {% endif %}
+            </div>
           {% endif %}
-          {% if p.pricing_notes %}
-            <div class="meta" style="color:#6b7280;">{{ p.pricing_notes }}</div>
-          {% endif %}
-          {% if p.summary %}
-            <div class="meta">{{ p.summary }}</div>
-          {% endif %}
-          <div class="plan-actions">
+          <div class="plan-item-footer">
             {% if p.committed %}
               <span class="badge committed">Accepted</span>
-              <button
-                type="button"
-                class="linklike"
-                hx-post="/plan/reject/{{ p.activity_id }}"
-                hx-target="#plan-card"
-                hx-swap="innerHTML"
-                title="Remove this activity from the plan"
-              >Remove</button>
-              <button
-                type="button"
-                class="linklike"
-                hx-post="/plan/reject_with_substitute/{{ p.activity_id }}"
-                hx-target="#plan-card"
-                hx-swap="innerHTML"
-                title="Remove this activity and ask the assistant to find alternatives"
-              >Remove &amp; find substitute</button>
+              <div class="plan-item-actions">
+                <button
+                  type="button"
+                  class="linklike"
+                  hx-post="/plan/reject/{{ p.activity_id }}"
+                  hx-target="#plan-card"
+                  hx-swap="innerHTML"
+                  title="Remove this activity from the plan"
+                >Remove</button>
+                <button
+                  type="button"
+                  class="linklike"
+                  hx-post="/plan/reject_with_substitute/{{ p.activity_id }}"
+                  hx-target="#plan-card"
+                  hx-swap="innerHTML"
+                  title="Remove this activity and ask the assistant to find alternatives"
+                >Remove &amp; find substitute</button>
+              </div>
             {% else %}
-              <button
-                type="button"
-                class="linklike"
-                hx-post="/plan/accept/{{ p.activity_id }}"
-                hx-target="#plan-card"
-                hx-swap="innerHTML"
-                title="Accept this activity into your plan"
-              >Accept</button>
-              <button
-                type="button"
-                class="linklike"
-                hx-post="/plan/reject/{{ p.activity_id }}"
-                hx-target="#plan-card"
-                hx-swap="innerHTML"
-                title="Reject this suggestion"
-              >Reject</button>
-              <button
-                type="button"
-                class="linklike"
-                hx-post="/plan/reject_with_substitute/{{ p.activity_id }}"
-                hx-target="#plan-card"
-                hx-swap="innerHTML"
-                title="Reject and ask the assistant to find a substitute"
-              >Reject &amp; find substitute</button>
+              <div class="plan-item-actions">
+                <button
+                  type="button"
+                  class="linklike"
+                  hx-post="/plan/accept/{{ p.activity_id }}"
+                  hx-target="#plan-card"
+                  hx-swap="innerHTML"
+                  title="Accept this activity into your plan"
+                >Accept</button>
+                <button
+                  type="button"
+                  class="linklike"
+                  hx-post="/plan/reject/{{ p.activity_id }}"
+                  hx-target="#plan-card"
+                  hx-swap="innerHTML"
+                  title="Reject this suggestion"
+                >Reject</button>
+                <button
+                  type="button"
+                  class="linklike"
+                  hx-post="/plan/reject_with_substitute/{{ p.activity_id }}"
+                  hx-target="#plan-card"
+                  hx-swap="innerHTML"
+                  title="Reject and ask the assistant to find a substitute"
+                >Reject &amp; find substitute</button>
+              </div>
             {% endif %}
           </div>
         </li>
       {% endfor %}
     </ul>
   {% else %}
-    <p class="meta">You don't have a CME plan yet, let's fix that.</p>
+    <p class="empty-state">You don't have a CME plan yet. Run discovery or ask the assistant to find options.</p>
   {% endif %}
 </section>

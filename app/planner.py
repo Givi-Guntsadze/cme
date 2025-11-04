@@ -3,6 +3,7 @@ import logging
 from datetime import date
 from typing import List, Tuple, Dict, Any, Optional
 from sqlmodel import select
+from .catalog.bridge import sync_catalog_to_activity_table
 from .models import User, Activity, CompletedActivity, Claim
 from .requirements import (
     SA_CME_KEYWORDS,
@@ -480,6 +481,13 @@ def build_plan(
     days_override: Optional[int] = None,
     exclude_ids: Optional[set[int]] = None,
 ) -> Tuple[List[Activity], float, float, int]:
+    try:
+        sync_catalog_to_activity_table(session)
+    except Exception:
+        LOGGER.exception(
+            "Catalog sync failed; continuing with existing Activity records."
+        )
+
     remaining_target = (
         remaining_override
         if remaining_override is not None
