@@ -1,95 +1,186 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CME AI Concierge</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
-      rel="stylesheet"
-    />
-    <script>
-      (function () {
-        var storageKey = "cme-theme";
-        var storedTheme = null;
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CME AI Concierge</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script>
+    (function () {
+      var storageKey = "cme-theme";
+      var storedTheme = null;
+      try {
+        storedTheme = window.localStorage.getItem(storageKey);
+      } catch (err) {
+        storedTheme = null;
+      }
+      var prefersDark = false;
+      try {
+        prefersDark =
+          window.matchMedia &&
+          window.matchMedia("(prefers-color-scheme: dark)").matches;
+      } catch (err) {
+        prefersDark = false;
+      }
+      var initialTheme = storedTheme || (prefersDark ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", initialTheme);
+      document.documentElement.classList.add("theme-" + initialTheme);
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+</head>
+
+<body>
+  <main class="app-root">
+    {% block content %}{% endblock %}
+  </main>
+  <script>
+    (function () {
+      var storageKey = "cme-theme";
+      var current =
+        document.documentElement.getAttribute("data-theme") || "light";
+      function applyTheme(theme) {
+        current = theme;
+        document.documentElement.setAttribute("data-theme", theme);
+        document.body.setAttribute("data-theme", theme);
+        document.documentElement.classList.remove("theme-light", "theme-dark");
+        document.body.classList.remove("theme-light", "theme-dark");
+        document.documentElement.classList.add("theme-" + theme);
+        document.body.classList.add("theme-" + theme);
         try {
-          storedTheme = window.localStorage.getItem(storageKey);
+          window.localStorage.setItem(storageKey, theme);
         } catch (err) {
-          storedTheme = null;
+          /* ignore */
         }
-        var prefersDark = false;
-        try {
-          prefersDark =
-            window.matchMedia &&
-            window.matchMedia("(prefers-color-scheme: dark)").matches;
-        } catch (err) {
-          prefersDark = false;
+        var toggle = document.getElementById("theme-toggle");
+        if (toggle) {
+          toggle.setAttribute(
+            "aria-label",
+            theme === "dark"
+              ? "Switch to light theme"
+              : "Switch to dark theme"
+          );
+          toggle.setAttribute("data-theme", theme);
         }
-        var initialTheme = storedTheme || (prefersDark ? "dark" : "light");
-        document.documentElement.setAttribute("data-theme", initialTheme);
-        document.documentElement.classList.add("theme-" + initialTheme);
-      })();
-    </script>
-    <link rel="stylesheet" href="/static/style.css" />
-    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
-  </head>
-  <body>
-    <main class="app-root">
-      {% block content %}{% endblock %}
-    </main>
-    <script>
-      (function () {
-        var storageKey = "cme-theme";
-        var current =
-          document.documentElement.getAttribute("data-theme") || "light";
-        function applyTheme(theme) {
-          current = theme;
-          document.documentElement.setAttribute("data-theme", theme);
-          document.body.setAttribute("data-theme", theme);
-          document.documentElement.classList.remove("theme-light", "theme-dark");
-          document.body.classList.remove("theme-light", "theme-dark");
-          document.documentElement.classList.add("theme-" + theme);
-          document.body.classList.add("theme-" + theme);
+        var icon = document.getElementById("theme-toggle-icon");
+        if (icon) {
+          icon.textContent = theme === "dark" ? "☀️" : "🌙";
+        }
+      }
+      applyTheme(current);
+      window.cmeTheme = {
+        toggle: function () {
+          applyTheme(current === "dark" ? "light" : "dark");
+        },
+        set: function (theme) {
+          applyTheme(theme === "dark" ? "dark" : "light");
+        },
+      };
+      document.addEventListener("DOMContentLoaded", function () {
+        var toggle = document.getElementById("theme-toggle");
+        if (toggle) {
+          toggle.addEventListener("click", function () {
+            window.cmeTheme.toggle();
+          });
+        }
+      });
+    })();
+
+    // Handle ingest response from Discover button
+    window.handleIngestResponse = function (btn, evt) {
+      if (btn.dataset) {
+        btn.textContent = btn.dataset.originalText || 'Discover activities';
+        btn.disabled = false;
+      }
+      try {
+        var xhr = evt.detail && evt.detail.xhr;
+        if (xhr) {
+          var data = {};
           try {
-            window.localStorage.setItem(storageKey, theme);
+            data = JSON.parse(xhr.responseText || '{}');
           } catch (err) {
-            /* ignore */
+            data = {};
           }
-          var toggle = document.getElementById("theme-toggle");
-          if (toggle) {
-            toggle.setAttribute(
-              "aria-label",
-              theme === "dark"
-                ? "Switch to light theme"
-                : "Switch to dark theme"
-            );
-            toggle.setAttribute("data-theme", theme);
+          if (typeof data.ingested !== 'undefined') {
+            var params = new URLSearchParams(window.location.search);
+            params.set('added', data.ingested || 0);
+            if (typeof data.google_inserted !== 'undefined') {
+              params.set('gcount', data.google_inserted || 0);
+            }
+            if (typeof data.ai_inserted !== 'undefined') {
+              params.set('acount', data.ai_inserted || 0);
+            }
+            params.set('fallback', data.used_fallback ? '1' : '0');
+            history.replaceState(null, '', '?' + params.toString());
+            var banner = document.getElementById('ingest-banner');
+            if (banner) {
+              banner.innerHTML = '<div class="ingest-notice ingest-ok">Imported ' +
+                (data.ingested || 0) + ' new activities — Web: ' +
+                (data.google_inserted || 0) + ', AI: ' +
+                (data.ai_inserted || 0) +
+                (data.used_fallback ? ' (fallback used)' : '') + '.</div>';
+            }
+            var planRoot = document.getElementById('plan-card');
+            if (planRoot && window.htmx) {
+              window.htmx.trigger(document.body || window, 'plan-refresh');
+            }
+            return;
           }
-          var icon = document.getElementById("theme-toggle-icon");
-          if (icon) {
-            icon.textContent = theme === "dark" ? "☀️" : "🌙";
+          if (data.error) {
+            var banner = document.getElementById('ingest-banner');
+            if (banner) {
+              banner.innerHTML = '<div class="ingest-notice ingest-error">' + data.error + '</div>';
+            }
+            return;
           }
         }
-        applyTheme(current);
-        window.cmeTheme = {
-          toggle: function () {
-            applyTheme(current === "dark" ? "light" : "dark");
-          },
-          set: function (theme) {
-            applyTheme(theme === "dark" ? "dark" : "light");
-          },
-        };
-        document.addEventListener("DOMContentLoaded", function () {
-          var toggle = document.getElementById("theme-toggle");
-          if (toggle) {
-            toggle.addEventListener("click", function () {
-              window.cmeTheme.toggle();
-            });
+      } catch (err) {
+        console.error(err);
+      }
+    };
+
+    // Handle re-enrich response
+    window.handleReenrichResponse = function (btn, evt) {
+      if (btn.dataset) {
+        btn.textContent = btn.dataset.originalText || 'Enrich data';
+        btn.disabled = false;
+      }
+      try {
+        var xhr = evt.detail && evt.detail.xhr;
+        if (xhr) {
+          var data = {};
+          try {
+            data = JSON.parse(xhr.responseText || '{}');
+          } catch (err) {
+            data = {};
           }
-        });
-      })();
-    </script>
-  </body>
+          var banner = document.getElementById('ingest-banner');
+          if (data.error) {
+            if (banner) {
+              banner.innerHTML = '<div class="ingest-notice ingest-error">' + data.error + '</div>';
+            }
+            return;
+          }
+          if (typeof data.updated !== 'undefined') {
+            if (banner) {
+              banner.innerHTML = '<div class="ingest-notice ingest-ok">Enriched ' +
+                (data.updated || 0) + ' of ' + (data.checked || 0) + ' activities with pricing/eligibility data.</div>';
+            }
+            var planRoot = document.getElementById('plan-card');
+            if (planRoot && window.htmx) {
+              window.htmx.trigger(document.body || window, 'plan-refresh');
+            }
+          }
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    };
+  </script>
+</body>
+
 </html>

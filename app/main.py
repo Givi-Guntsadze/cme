@@ -1,4 +1,8 @@
 from __future__ import annotations
+
+from dotenv import load_dotenv
+load_dotenv()  # Load .env file before any other imports that need env vars
+
 import os
 import json
 import logging
@@ -38,6 +42,7 @@ from .ingest import (
     ingest_psychiatry_online_ai,
     safe_json_loads,
     discover_activity_by_title,
+    reenrich_activities,
 )
 from openai import OpenAI
 from .services.plan import (
@@ -451,6 +456,96 @@ def _extract_add_targets(text: str) -> list[str]:
         seen.add(key)
         deduped.append(item)
     return deduped
+
+
+# Patterns for extracting activity updates from user messages
+ACTIVITY_UPDATE_PATTERNS = [
+    # "X costs $Y" or "X will cost me $Y"
+    re.compile(
+        r"(?:the\s+)?(?P<title>[^$]+?)\s+(?:costs?|will\s+cost(?:\s+me)?|is|was)\s+\$(?P<cost>\d+(?:\.\d+)?)",
+        re.I,
+    ),
+    # "$Y for X"
+    re.compile(
+        r"\$(?P<cost>\d+(?:\.\d+)?)\s+(?:for|to\s+(?:take|attend))\s+(?:the\s+)?(?P<title>[^.;!?]+)",
+        re.I,
+    ),
+    # "update X to $Y" or "set X cost to $Y"
+    re.compile(
+        r"(?:update|set|change)\s+(?:the\s+)?(?P<title>[^$]+?)\s+(?:cost\s+)?(?:to|=)\s+\$(?P<cost>\d+(?:\.\d+)?)",
+        re.I,
+    ),
+]
+
+ELIGIBILITY_PATTERNS = [
+    # "I am eligible for X" or "I'm eligible for X"
+    re.compile(
+        r"i(?:'m|\s+am)\s+eligible\s+(?:for\s+)?(?:the\s+)?(?P<title>[^.;!?]+)",
+        re.I,
+    ),
+    # "X and I am eligible"
+    re.compile(
+        r"(?P<title>[^$]+?)\s+and\s+i(?:'m|\s+am)\s+eligible",
+        re.I,
+    ),
+    # "eligible for X"
+    re.compile(
+        r"eligible\s+for\s+(?:the\s+)?(?P<title>[^.;!?]+)",
+        re.I,
+    ),
+]
+
+
+def _extract_activity_update(text: str) -> dict | None:
+    """
+    Parse user text for activity update commands.
+    Returns a dict with keys: title, cost (optional), eligible (optional)
+    """
+    if not text:
+        return None
+    
+    result = {
+        "title": None,
+        "cost": None,
+        "eligible": None,
+    }
+    
+    # Check for cost updates
+    for pattern in ACTIVITY_UPDATE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            title = match.group("title")
+            cost = match.group("cost")
+            if title and cost:
+                result["title"] = _clean_title_fragment(title)
+                try:
+                    result["cost"] = float(cost)
+                except (TypeError, ValueError):
+                    pass
+                break
+    
+    # Check for eligibility updates
+    for pattern in ELIGIBILITY_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            title = match.group("title")
+            if title:
+                title_clean = _clean_title_fragment(title)
+                if result["title"] is None:
+                    result["title"] = title_clean
+                elif title_clean.lower() in result["title"].lower() or result["title"].lower() in title_clean.lower():
+                    # Same or overlapping title - merge
+                    pass
+                result["eligible"] = True
+                break
+    
+    # Also check for simple eligibility mention alongside the title
+    if result["title"] and ("eligible" in text.lower() or "i am eligible" in text.lower()):
+        result["eligible"] = True
+    
+    if result["title"]:
+        return result
+    return None
 
 
 def _title_tokens(text: str) -> set[str]:
@@ -1831,6 +1926,52 @@ async def ingest(request: Request = None):
         )
 
 
+@app.api_route("/reenrich", methods=["GET", "POST"])
+async def reenrich_endpoint(request: Request = None):
+    """Re-enrich existing activities using Perplexity to fill in missing data."""
+    logger = logging.getLogger(__name__)
+    logger.info("reenrich called")
+    try:
+        limit = 50
+        if request is not None:
+            qp = dict(request.query_params)
+            try:
+                limit = int(qp.get("limit", "50"))
+            except (TypeError, ValueError):
+                limit = 50
+        
+        result = await asyncio.to_thread(reenrich_activities, limit=limit)
+        
+        # If there are activities that still need manual input, post a message to the chat
+        needs_manual = result.get("needs_manual", [])
+        if needs_manual:
+            with get_session() as session:
+                user = session.exec(select(User)).first()
+                if user:
+                    # Build a helpful message for the user
+                    lines = ["I couldn't find complete pricing or eligibility info for some activities:"]
+                    for item in needs_manual[:5]:  # Limit to 5
+                        missing_str = " and ".join(item["missing"])
+                        lines.append(f"• **{item['title']}** (missing: {missing_str})")
+                    lines.append("")
+                    lines.append("You can update these by telling me, for example:")
+                    lines.append('_"The Opioid CME Courses costs $125 and I am eligible."_')
+                    
+                    message = AssistantMessage(
+                        user_id=user.id,
+                        role="assistant",
+                        content="\n".join(lines)
+                    )
+                    session.add(message)
+                    session.commit()
+        
+        return JSONResponse(result)
+    except Exception as e:
+        logger.exception("reenrich failed")
+        return JSONResponse(
+            {"error": "reenrich_failed", "detail": str(e)}, status_code=500
+        )
+
 @app.post("/assist")
 def assist():
     api_key = get_secret("OPENAI_API_KEY")
@@ -2392,6 +2533,45 @@ def chat_send(request: Request, text: str = Form(...)):
                         "I couldn’t locate details for "
                         + ", ".join(missing_additions)
                         + " yet—share a link or more info and I’ll add it."
+                    )
+
+            # Handle activity updates (e.g., "Opioid CME costs $125 and I am eligible")
+            activity_update = _extract_activity_update(text)
+            if activity_update and activity_update.get("title"):
+                target_title = activity_update["title"]
+                activity = find_activity_by_title(session, user, target_title)
+                if activity:
+                    update_parts = []
+                    
+                    # Update cost if provided
+                    if activity_update.get("cost") is not None:
+                        old_cost = activity.cost_usd or 0
+                        activity.cost_usd = activity_update["cost"]
+                        session.add(activity)
+                        update_parts.append(f"cost to ${activity_update['cost']:.0f}")
+                    
+                    # Update eligibility if confirmed
+                    if activity_update.get("eligible"):
+                        if not activity.eligibility_text:
+                            activity.eligibility_text = "User confirmed eligibility"
+                        activity.open_to_public = True
+                        session.add(activity)
+                        update_parts.append("eligibility confirmed")
+                    
+                    if update_parts:
+                        session.flush()
+                        PlanManager.invalidate_user_plans(
+                            session, user.id, reason="activity_update"
+                        )
+                        plan_update_needed = True
+                        force_plan_refresh = True
+                        pending_notes.append(
+                            f"Updated **{activity.title}**: {', '.join(update_parts)}."
+                        )
+                else:
+                    pending_notes.append(
+                        f"I couldn't find an activity matching \"{target_title}\" — "
+                        "please check the exact title from the plan."
                     )
 
             if "keep this plan" in normalized_text:

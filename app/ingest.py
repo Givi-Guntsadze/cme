@@ -1527,3 +1527,202 @@ def ingest_psychiatry_online_ai(
     web_count = cumulative_sources.get("web", 0) + cumulative_sources.get("seed", 0)
     ai_count = cumulative_sources.get("ai", 0)
     return total_added, used_fallback, web_count, ai_count
+
+
+def reenrich_activities(limit: int = 50, plan_only: bool = True) -> Dict[str, Any]:
+    """
+    Re-enrich existing activities that are missing pricing, eligibility, or dates.
+    Uses Perplexity to fetch missing data.
+    
+    Args:
+        limit: Maximum number of activities to check
+        plan_only: If True, only enrich activities in the current plan (default)
+    
+    Returns a dict with counts of activities checked and updated.
+    """
+    from .models import PlanItem, PlanRun
+    
+    api_key = get_secret("PERPLEXITY_API_KEY")
+    if not api_key:
+        return {"error": "Perplexity API key not configured", "checked": 0, "updated": 0}
+    
+    checked = 0
+    updated = 0
+    errors = 0
+    updated_titles = []
+    
+    with get_session() as session:
+        # Get activity IDs from current plan
+        plan_activity_ids = set()
+        plan_run = session.exec(select(PlanRun).order_by(PlanRun.id.desc())).first()
+        if plan_run:
+            plan_items = list(session.exec(
+                select(PlanItem).where(PlanItem.plan_run_id == plan_run.id)
+            ))
+            plan_activity_ids = {item.activity_id for item in plan_items}
+        
+        # Prioritize plan activities, then others
+        if plan_only and plan_activity_ids:
+            # Only get activities in the current plan
+            activities = list(session.exec(
+                select(Activity).where(Activity.id.in_(plan_activity_ids))
+            ))
+        else:
+            # Get plan activities first, then others
+            plan_activities = list(session.exec(
+                select(Activity).where(Activity.id.in_(plan_activity_ids))
+            )) if plan_activity_ids else []
+            
+            other_activities = list(session.exec(
+                select(Activity)
+                .where(Activity.id.notin_(plan_activity_ids) if plan_activity_ids else True)
+                .order_by(Activity.id.desc())
+                .limit(limit - len(plan_activities))
+            ))
+            activities = plan_activities + other_activities
+        
+        logger.info(f"Re-enrichment: checking {len(activities)} activities (plan_only={plan_only})")
+        
+        for activity in activities:
+            checked += 1
+            
+            # Check if this activity needs enrichment
+            needs_enrichment = False
+            missing = []
+            if activity.cost_usd is None or activity.cost_usd == 0:
+                needs_enrichment = True
+                missing.append("cost")
+            if not activity.pricing_options:
+                needs_enrichment = True
+                missing.append("pricing")
+            if not activity.eligibility_text and not activity.eligible_institutions and not activity.eligible_groups:
+                needs_enrichment = True
+                missing.append("eligibility")
+            if activity.modality in ("live", "hybrid") and not activity.start_date:
+                needs_enrichment = True
+                missing.append("dates")
+            
+            if not needs_enrichment:
+                logger.info(f"  Skipping (complete): {(activity.title or '')[:40]}")
+                continue
+            
+            logger.info(f"Re-enriching ID:{activity.id} missing:{missing} - {(activity.title or '')[:40]}...")
+            
+            try:
+                # Call Perplexity for details
+                detail = _perplexity_detail_lookup(
+                    activity.title or "",
+                    [
+                        f"{activity.title} registration fees pricing cost",
+                        f"{activity.title} eligibility requirements who can attend",
+                        f"{activity.title} CME conference dates 2025 2026",
+                    ]
+                )
+                
+                if not detail:
+                    logger.info(f"  No enrichment data found for: {(activity.title or '')[:40]}")
+                    continue
+                
+                # Update fields that are missing
+                changed = False
+                changes = []
+                
+                # Cost
+                if (activity.cost_usd is None or activity.cost_usd == 0) and detail.get("cost_usd"):
+                    try:
+                        new_cost = float(detail["cost_usd"])
+                        if new_cost > 0:
+                            activity.cost_usd = new_cost
+                            changed = True
+                            changes.append(f"cost=${new_cost}")
+                    except (TypeError, ValueError):
+                        pass
+                
+                # Pricing options
+                if not activity.pricing_options and detail.get("pricing_options"):
+                    pricing = _normalize_pricing_options(detail.get("pricing_options"))
+                    if pricing:
+                        activity.pricing_options = pricing
+                        changed = True
+                        changes.append(f"pricing={len(pricing)} tiers")
+                
+                # Eligibility
+                if not activity.eligibility_text:
+                    if detail.get("eligibility_text"):
+                        activity.eligibility_text = str(detail["eligibility_text"])[:500]
+                        changed = True
+                        changes.append("eligibility_text")
+                
+                if not activity.eligible_institutions and detail.get("eligible_institutions"):
+                    if isinstance(detail["eligible_institutions"], list):
+                        activity.eligible_institutions = detail["eligible_institutions"]
+                        changed = True
+                        changes.append("institutions")
+                
+                if not activity.eligible_groups and detail.get("eligible_groups"):
+                    if isinstance(detail["eligible_groups"], list):
+                        activity.eligible_groups = detail["eligible_groups"]
+                        changed = True
+                        changes.append("groups")
+                
+                if not activity.membership_required and detail.get("membership_required"):
+                    activity.membership_required = str(detail["membership_required"])[:200]
+                    changed = True
+                    changes.append("membership")
+                
+                # Dates
+                if not activity.start_date and detail.get("start_date"):
+                    try:
+                        activity.start_date = date.fromisoformat(detail["start_date"])
+                        changed = True
+                        changes.append(f"start={detail['start_date']}")
+                    except (TypeError, ValueError):
+                        pass
+                
+                if not activity.end_date and detail.get("end_date"):
+                    try:
+                        activity.end_date = date.fromisoformat(detail["end_date"])
+                        changed = True
+                        changes.append(f"end={detail['end_date']}")
+                    except (TypeError, ValueError):
+                        pass
+                
+                if changed:
+                    session.add(activity)
+                    updated += 1
+                    updated_titles.append((activity.title or "")[:40])
+                    logger.info(f"  Updated: {', '.join(changes)}")
+                else:
+                    logger.info(f"  No new data from Perplexity")
+                    
+            except Exception as exc:
+                logger.exception(f"Re-enrichment failed for {(activity.title or '')[:40]}: {exc}")
+                errors += 1
+                continue
+        
+        session.commit()
+        
+        # Check which activities still need manual input after enrichment
+        needs_manual = []
+        for activity in activities:
+            still_missing = []
+            if activity.cost_usd is None or activity.cost_usd == 0:
+                if not activity.pricing_options:  # Only flag if no pricing at all
+                    still_missing.append("cost")
+            if not activity.eligibility_text and not activity.eligible_institutions and not activity.eligible_groups:
+                still_missing.append("eligibility")
+            if still_missing:
+                needs_manual.append({
+                    "id": activity.id,
+                    "title": (activity.title or "")[:60],
+                    "missing": still_missing,
+                })
+    
+    return {
+        "checked": checked,
+        "updated": updated,
+        "errors": errors,
+        "updated_titles": updated_titles[:10],
+        "needs_manual": needs_manual,  # Activities still missing data
+    }
+
