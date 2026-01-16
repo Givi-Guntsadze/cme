@@ -180,6 +180,59 @@
         console.error(err);
       }
     };
+
+    // Chat Drawer Toggle
+    document.addEventListener('DOMContentLoaded', function () {
+      var drawer = document.getElementById('chat-drawer');
+      var toggle = document.getElementById('chat-drawer-toggle');
+
+      if (drawer && toggle) {
+        // Create overlay element
+        var overlay = document.createElement('div');
+        overlay.className = 'chat-drawer-overlay';
+        overlay.id = 'chat-drawer-overlay';
+        document.body.appendChild(overlay);
+
+        function openDrawer() {
+          drawer.classList.add('open');
+          overlay.classList.add('visible');
+          document.body.classList.add('chat-open');
+          document.body.style.overflow = 'hidden';
+        }
+
+        function closeDrawer() {
+          drawer.classList.remove('open');
+          overlay.classList.remove('visible');
+          document.body.classList.remove('chat-open');
+          document.body.style.overflow = '';
+        }
+
+        function toggleDrawer() {
+          if (drawer.classList.contains('open')) {
+            closeDrawer();
+          } else {
+            openDrawer();
+          }
+        }
+
+        toggle.addEventListener('click', toggleDrawer);
+        overlay.addEventListener('click', closeDrawer);
+
+        // Close on Escape key
+        document.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape' && drawer.classList.contains('open')) {
+            closeDrawer();
+          }
+        });
+
+        // Expose functions globally for HTMX events
+        window.cmeChatDrawer = {
+          open: openDrawer,
+          close: closeDrawer,
+          toggle: toggleDrawer
+        };
+      }
+    });
   </script>
 </body>
 

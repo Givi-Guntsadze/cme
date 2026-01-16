@@ -43,3 +43,5 @@ httpx==0.27.2
 openai
 beautifulsoup4
 lxml
+chromadb
+sentence-transformers

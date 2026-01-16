@@ -180,8 +180,12 @@ def _queue_plan_reset_prompt(session, user: User, titles: list[str]) -> None:
 async def lifespan(app: FastAPI):
     # Startup
     create_db_and_tables()
+    # Start the background scheduler for periodic source refresh
+    from .services.scheduler import start_scheduler, stop_scheduler
+    await start_scheduler()
     yield
-    # Shutdown: nothing for now
+    # Shutdown
+    await stop_scheduler()
 
 
 app = FastAPI(title="CME/MOC POC", lifespan=lifespan)
@@ -494,6 +498,41 @@ ELIGIBILITY_PATTERNS = [
         re.I,
     ),
 ]
+
+# Patterns for detecting discovery/search queries
+DISCOVERY_PATTERNS = [
+    # "find me X", "find X courses", "find X activities"
+    re.compile(r"find\s+(?:me\s+)?(?P<query>.+?)(?:\s+courses?|\s+activities?|\s+cme)?$", re.I),
+    # "search for X", "look for X"
+    re.compile(r"(?:search|look)\s+for\s+(?P<query>.+?)(?:\s+courses?|\s+activities?)?$", re.I),
+    # "show me X", "show X courses"
+    re.compile(r"show\s+(?:me\s+)?(?P<query>.+?)(?:\s+courses?|\s+activities?|\s+cme)?$", re.I),
+    # "what X courses/activities are available"
+    re.compile(r"what\s+(?P<query>.+?)\s+(?:courses?|activities?|cme)\s+(?:are\s+)?(?:available|there)", re.I),
+    # "any X courses", "any courses on X"
+    re.compile(r"any\s+(?P<query>.+?)\s+(?:courses?|activities?|cme)", re.I),
+    re.compile(r"any\s+(?:courses?|activities?|cme)\s+(?:on|about|for)\s+(?P<query>.+?)$", re.I),
+]
+
+
+def _extract_discovery_query(text: str) -> str | None:
+    """
+    Extract search query from user text if it looks like a discovery request.
+    Returns the query string or None if not a discovery request.
+    """
+    if not text:
+        return None
+    
+    for pattern in DISCOVERY_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            query = match.group("query").strip()
+            # Clean up common trailing words
+            query = re.sub(r"\s*(?:please|thanks?|thank\s+you)$", "", query, flags=re.I)
+            if query and len(query) > 2:
+                return query
+    
+    return None
 
 
 def _extract_activity_update(text: str) -> dict | None:
@@ -1424,7 +1463,6 @@ def home(request: Request):
             plan_run, user
         )
         requirements_data = load_abpn_psychiatry_requirements()
-        validation = validate_against_requirements(user, claims, requirements_data)
 
         pip_status = {"complete": False, "reason": None}
         for claim in claims:
@@ -1436,7 +1474,9 @@ def home(request: Request):
                 }
                 break
 
-        validation_full = validate_full_cc(user, claims, requirements_data, pip_status)
+        validation = validate_full_cc(
+            user, claims, requirements_data, pip_status=pip_status
+        )
 
         claims = list(session.exec(select(Claim).where(Claim.user_id == user.id)))
         return templates.TemplateResponse(
@@ -1450,7 +1490,6 @@ def home(request: Request):
                 "claims": claims,
                 "assistant_messages": msgs,
                 "validation": validation,
-                "validation_full": validation_full,
                 "active_policy": active_policy,
                 "policy_status": policy_status_entries,
                 "plan_mode": plan_mode,
@@ -2419,6 +2458,27 @@ def chat_send(request: Request, text: str = Form(...)):
             note_text = _maybe_complete_activity_from_text(user, text, session)
             if note_text:
                 pending_notes.append(note_text)
+
+            # Check for discovery/search queries - use RAG if available
+            discovery_query = _extract_discovery_query(text)
+            if discovery_query:
+                try:
+                    from .services import vectordb
+                    search_results = vectordb.search(discovery_query, n_results=5)
+                    if search_results:
+                        result_lines = [f"I found {len(search_results)} activities matching '{discovery_query}':"]
+                        for r in search_results:
+                            result_lines.append(
+                                f"• **{r['title']}** ({r['provider']}) - {r['credits']} credits"
+                                + (f", ${r['cost']}" if r['cost'] else "")
+                            )
+                        result_text = "\n".join(result_lines)
+                        pending_notes.append(result_text)
+                    else:
+                        pending_notes.append(f"No activities found matching '{discovery_query}'. Try a different search term or browse the catalog.")
+                except Exception as e:
+                    logger.warning("Vector search failed: %s", e)
+                    # Fall through to LLM-based response
 
             policy_bundle = None
             plan_run = None
@@ -3530,3 +3590,54 @@ def policy_clear_post():
 def policy_clear_get():
     _policy_clear_impl()
     return RedirectResponse("/", status_code=303)
+
+
+@app.post("/source/monitor")
+def source_monitor(request: Request, url: str = Form(...)):
+    """
+    Add a URL to the monitored sources for Apify scraping.
+    
+    The domain is extracted from the URL and stored in ScrapeSource.
+    """
+    from urllib.parse import urlparse
+    from .models import ScrapeSource
+    
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc or parsed.path.split("/")[0]
+        if not domain:
+            return JSONResponse({"error": "Invalid URL"}, status_code=400)
+        
+        # Use full URL
+        base_url = url.strip()
+        
+        with get_session() as session:
+            # Check if already monitored
+            existing = session.exec(
+                select(ScrapeSource).where(ScrapeSource.domain == domain)
+            ).first()
+            
+            if existing:
+                return JSONResponse({
+                    "status": "already_monitored",
+                    "domain": domain,
+                    "message": f"'{domain}' is already being monitored."
+                })
+            
+            # Add new source
+            new_source = ScrapeSource(
+                domain=domain,
+                url=base_url,
+                enabled=True,
+            )
+            session.add(new_source)
+            session.commit()
+            
+            return JSONResponse({
+                "status": "success",
+                "domain": domain,
+                "message": f"Now monitoring '{domain}'. New activities will appear after the next scheduled crawl."
+            })
+    except Exception as e:
+        logger.exception("Failed to add monitored source")
+        return JSONResponse({"error": str(e)}, status_code=500)

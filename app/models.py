@@ -150,3 +150,13 @@ class CompletedActivity(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.id")
     activity_id: int = Field(foreign_key="activity.id")
     completed_at: datetime = Field(default_factory=utcnow)
+
+
+class ScrapeSource(SQLModel, table=True):
+    """Monitored CME provider source for Apify scraping."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    domain: str  # e.g., "psychiatry.org"
+    url: str     # Base URL to crawl
+    enabled: bool = True
+    last_crawled: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=utcnow)

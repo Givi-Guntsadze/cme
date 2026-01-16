@@ -3,7 +3,12 @@
 ## Goal
 Improve the user interface for better chat accessibility, fix chat functionality, and implement a robust scraping pipeline using Apify with RAG capabilities.
 
-## 1. UI & Chat Improvements
+## Prerequisites & Accounts
+- **Apify**: You already have `APIFY_TOKEN` in `.env`. We use the public actor `apify/website-content-crawler`, so **no manual actor creation is required**.
+- **Vector DB**: We use **ChromaDB** which runs locally on your machine. **No account required**.
+- **Embeddings**: We use **HuggingFace** models (`sentence-transformers`) which run locally. **No account required**.
+
+## 1. UI & Chat Improvements (Completed)
 ### Problem
 - Chat is currently at the bottom of the page, requiring scrolling away from the plan.
 - User reported messages not appearing/sending when trying to update activities.

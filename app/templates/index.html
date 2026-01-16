@@ -48,13 +48,7 @@
         <input name="city" placeholder="(optional)" />
       </label>
       <label>Residency completion year
-        <input
-          name="residency_completion_year"
-          type="number"
-          min="1980"
-          max="2100"
-          placeholder="e.g., 2021"
-        />
+        <input name="residency_completion_year" type="number" min="1980" max="2100" placeholder="e.g., 2021" />
       </label>
       <label>Professional stage
         <select name="professional_stage">
@@ -65,10 +59,7 @@
         </select>
       </label>
       <label>Memberships (comma separated)
-        <input
-          name="memberships"
-          placeholder="American Psychiatric Association, State Society"
-        />
+        <input name="memberships" placeholder="American Psychiatric Association, State Society" />
       </label>
       <button type="submit" class="btn-primary">Save setup</button>
     </form>
@@ -101,11 +92,11 @@
           <dt>Target credits</dt>
           <dd>
             {% if user.target_credits %}
-              {{ '%.0f' % user.target_credits }}
+            {{ user.target_credits|int }}
             {% elif validation %}
-              {{ '%.0f' % validation.summary.target_total }}
+            {{ validation.summary.target_total|int }}
             {% else %}
-              —
+            —
             {% endif %}
           </dd>
         </div>
@@ -113,9 +104,9 @@
           <dt>Max budget</dt>
           <dd>
             {% if user.budget_usd %}
-              ${{ '%.0f' % user.budget_usd }}
+            ${{ user.budget_usd|int }}
             {% else %}
-              —
+            —
             {% endif %}
           </dd>
         </div>
@@ -127,9 +118,9 @@
           <dt>Memberships</dt>
           <dd>
             {% if user.memberships %}
-              {{ (user.memberships or [])|join(', ') }}
+            {{ (user.memberships or [])|join(', ') }}
             {% else %}
-              —
+            —
             {% endif %}
           </dd>
         </div>
@@ -139,152 +130,152 @@
       <h2>Requirements Status</h2>
       <div class="progress-stack">
         {% if cme_pillar %}
-          {% set cme = namespace(width=0, earned=cme_pillar.earned or 0, target=cme_pillar.target or 0) %}
-          {% if cme.target > 0 %}
-            {% set cme.width = (cme.earned / cme.target * 100) %}
-          {% elif cme.earned > 0 %}
-            {% set cme.width = 100 %}
-          {% endif %}
-          {% if cme.width > 100 %}
-            {% set cme.width = 100 %}
-          {% endif %}
-          <div class="progress-row">
-            <div class="progress-head">
-              <span>Total CME Credits</span>
-              {% if cme.target > 0 %}
-                <span>{{ '%.1f' % cme.earned }} / {{ '%.0f' % cme.target }}</span>
-              {% else %}
-                <span>{{ '%.1f' % cme.earned }}</span>
-              {% endif %}
-            </div>
-            <div class="progress-track">
-              <div class="progress-bar" style="width: {{ '%.0f' % cme.width }}%;"></div>
-            </div>
+        {% set cme = namespace(width=0, earned=cme_pillar.earned or 0, target=cme_pillar.target or 0) %}
+        {% if cme.target > 0 %}
+        {% set cme.width = (cme.earned / cme.target * 100) %}
+        {% elif cme.earned > 0 %}
+        {% set cme.width = 100 %}
+        {% endif %}
+        {% if cme.width > 100 %}
+        {% set cme.width = 100 %}
+        {% endif %}
+        <div class="progress-row">
+          <div class="progress-head">
+            <span>Total CME Credits</span>
+            {% if cme.target > 0 %}
+            <span>{{ cme.earned|round(1) }} / {{ cme.target|int }}</span>
+            {% else %}
+            <span>{{ cme.earned|round(1) }}</span>
+            {% endif %}
           </div>
+          <div class="progress-track">
+            <div class="progress-bar" style="--p: {{ cme.width|int }}%;"></div>
+          </div>
+        </div>
         {% endif %}
         {% if sa_pillar %}
-          {% set sa = namespace(width=0, earned=sa_pillar.earned or 0, target=sa_pillar.target or 0) %}
-          {% if sa.target > 0 %}
-            {% set sa.width = (sa.earned / sa.target * 100) %}
-          {% elif sa.earned > 0 %}
-            {% set sa.width = 100 %}
-          {% endif %}
-          {% if sa.width > 100 %}
-            {% set sa.width = 100 %}
-          {% endif %}
-          <div class="progress-row">
-            <div class="progress-head">
-              <span>Self-Assessment CME</span>
-              {% if sa.target > 0 %}
-                <span>{{ '%.1f' % sa.earned }} / {{ '%.1f' % sa.target }}</span>
-              {% else %}
-                <span>{{ '%.1f' % sa.earned }}</span>
-              {% endif %}
-            </div>
-            <div class="progress-track">
-              <div class="progress-bar" style="width: {{ '%.0f' % sa.width }}%;"></div>
-            </div>
+        {% set sa = namespace(width=0, earned=sa_pillar.earned or 0, target=sa_pillar.target or 0) %}
+        {% if sa.target > 0 %}
+        {% set sa.width = (sa.earned / sa.target * 100) %}
+        {% elif sa.earned > 0 %}
+        {% set sa.width = 100 %}
+        {% endif %}
+        {% if sa.width > 100 %}
+        {% set sa.width = 100 %}
+        {% endif %}
+        <div class="progress-row">
+          <div class="progress-head">
+            <span>Self-Assessment CME</span>
+            {% if sa.target > 0 %}
+            <span>{{ sa.earned|round(1) }} / {{ sa.target|round(1) }}</span>
+            {% else %}
+            <span>{{ sa.earned|round(1) }}</span>
+            {% endif %}
           </div>
+          <div class="progress-track">
+            <div class="progress-bar" style="--p: {{ sa.width|int }}%;"></div>
+          </div>
+        </div>
         {% endif %}
         {% if safety_pillar %}
-          {% set safety = namespace(width=0, earned=safety_pillar.earned or 0, target=safety_pillar.target or 0) %}
-          {% if safety.target > 0 %}
-            {% set safety.width = (safety.earned / safety.target * 100) %}
-          {% elif safety.earned > 0 %}
-            {% set safety.width = 100 %}
-          {% endif %}
-          {% if safety.width > 100 %}
-            {% set safety.width = 100 %}
-          {% endif %}
-          <div class="progress-row">
-            <div class="progress-head">
-              <span>Patient Safety</span>
-              {% if safety.target > 0 %}
-                <span>{{ safety.earned }} / {{ safety.target }}</span>
-              {% else %}
-                <span>{{ safety.earned }}</span>
-              {% endif %}
-            </div>
-            <div class="progress-track">
-              <div class="progress-bar progress-bar-ok" style="width: {{ '%.0f' % safety.width }}%;"></div>
-            </div>
-            {% if safety_pillar.detail and safety_pillar.status != 'ok' %}
-              <p class="progress-note">{{ safety_pillar.detail }}</p>
+        {% set safety = namespace(width=0, earned=safety_pillar.earned or 0, target=safety_pillar.target or 0) %}
+        {% if safety.target > 0 %}
+        {% set safety.width = (safety.earned / safety.target * 100) %}
+        {% elif safety.earned > 0 %}
+        {% set safety.width = 100 %}
+        {% endif %}
+        {% if safety.width > 100 %}
+        {% set safety.width = 100 %}
+        {% endif %}
+        <div class="progress-row">
+          <div class="progress-head">
+            <span>Patient Safety</span>
+            {% if safety.target > 0 %}
+            <span>{{ safety.earned }} / {{ safety.target }}</span>
+            {% else %}
+            <span>{{ safety.earned }}</span>
             {% endif %}
           </div>
+          <div class="progress-track">
+            <div class="progress-bar progress-bar-ok" style="--p: {{ safety.width|int }}%;"></div>
+          </div>
+          {% if safety_pillar.detail and safety_pillar.status != 'ok' %}
+          <p class="progress-note">{{ safety_pillar.detail }}</p>
+          {% endif %}
+        </div>
         {% endif %}
         {% if pip_pillar %}
-          {% set pip = namespace(width=0, earned=pip_pillar.earned or 0, target=pip_pillar.target or 0) %}
-          {% if pip.target > 0 %}
-            {% set pip.width = (pip.earned / pip.target * 100) %}
-          {% elif pip.earned > 0 %}
-            {% set pip.width = 100 %}
-          {% endif %}
-          {% if pip.width > 100 %}
-            {% set pip.width = 100 %}
-          {% endif %}
-          <div class="progress-row {% if pip_pillar.status != 'ok' %}progress-row-warn{% endif %}">
-            <div class="progress-head">
-              <span>Performance Improvement</span>
-              {% if pip.target > 0 %}
-                <span>{{ pip.earned }} / {{ pip.target }}</span>
-              {% else %}
-                <span>{{ pip.earned }}</span>
-              {% endif %}
-            </div>
-            <div class="progress-track">
-              <div class="progress-bar progress-bar-warn" style="width: {{ '%.0f' % pip.width }}%;"></div>
-            </div>
-            {% if pip_pillar.detail %}
-              <p class="progress-note">{{ pip_pillar.detail }}</p>
+        {% set pip = namespace(width=0, earned=pip_pillar.earned or 0, target=pip_pillar.target or 0) %}
+        {% if pip.target > 0 %}
+        {% set pip.width = (pip.earned / pip.target * 100) %}
+        {% elif pip.earned > 0 %}
+        {% set pip.width = 100 %}
+        {% endif %}
+        {% if pip.width > 100 %}
+        {% set pip.width = 100 %}
+        {% endif %}
+        <div class="progress-row {% if pip_pillar.status != 'ok' %}progress-row-warn{% endif %}">
+          <div class="progress-head">
+            <span>Performance Improvement</span>
+            {% if pip.target > 0 %}
+            <span>{{ pip.earned }} / {{ pip.target }}</span>
+            {% else %}
+            <span>{{ pip.earned }}</span>
             {% endif %}
           </div>
+          <div class="progress-track">
+            <div class="progress-bar progress-bar-warn" style="--p: {{ pip.width|int }}%;"></div>
+          </div>
+          {% if pip_pillar.detail %}
+          <p class="progress-note">{{ pip_pillar.detail }}</p>
+          {% endif %}
+        </div>
         {% endif %}
       </div>
       {% if validation and validation.meta %}
-        <div class="sidebar-footnote">
-          <span>{{ validation.meta.board }} · {{ validation.meta.specialty }}</span>
-          <span>Version {{ validation.meta.version }}</span>
-        </div>
-        {% if validation.meta.sources %}
-          <div class="sidebar-sources">
-            <span>Sources:</span>
-            {% for s in validation.meta.sources %}
-              <a href="{{ s }}" target="_blank" rel="noopener">{{ s }}</a>{% if not loop.last %}, {% endif %}
-            {% endfor %}
-          </div>
-        {% endif %}
+      <div class="sidebar-footnote">
+        <span>{{ validation.meta.board }} · {{ validation.meta.specialty }}</span>
+        <span>Version {{ validation.meta.version }}</span>
+      </div>
+      {% if validation.meta.sources %}
+      <div class="sidebar-sources">
+        <span>Sources:</span>
+        {% for s in validation.meta.sources %}
+        <a href="{{ s }}" target="_blank" rel="noopener">{{ s }}</a>{% if not loop.last %}, {% endif %}
+        {% endfor %}
+      </div>
+      {% endif %}
       {% endif %}
     </section>
     {% if validation and validation.gaps %}
-      <section class="sidebar-section sidebar-section-alert">
-        <h2>Focus Next</h2>
-        <ul>
-          {% for gap in validation.gaps %}
-            <li>{{ gap }}</li>
-          {% endfor %}
-        </ul>
-      </section>
+    <section class="sidebar-section sidebar-section-alert">
+      <h2>Focus Next</h2>
+      <ul>
+        {% for gap in validation.gaps %}
+        <li>{{ gap }}</li>
+        {% endfor %}
+      </ul>
+    </section>
     {% endif %}
     <section class="sidebar-section sidebar-activity">
       <h2>Activity Log</h2>
       <p class="sidebar-activity-subtitle">Completed credits recorded across your cycle.</p>
       <ul class="sidebar-activity-list">
         {% if claims and claims|length > 0 %}
-          {% for c in claims %}
-            <li>
-              <div class="sidebar-activity-row">
-                <span class="sidebar-activity-date">{{ c.date }}</span>
-                <span class="sidebar-activity-credits">{{ '%.1f' % c.credits }} cr</span>
-              </div>
-              <div class="sidebar-activity-detail">
-                <span>{{ c.topic or 'general' }}</span>
-                <span>{{ c.source_text }}</span>
-              </div>
-            </li>
-          {% endfor %}
+        {% for c in claims %}
+        <li>
+          <div class="sidebar-activity-row">
+            <span class="sidebar-activity-date">{{ c.date }}</span>
+            <span class="sidebar-activity-credits">{{ c.credits|round(1) }} cr</span>
+          </div>
+          <div class="sidebar-activity-detail">
+            <span>{{ c.topic or 'general' }}</span>
+            <span>{{ c.source_text }}</span>
+          </div>
+        </li>
+        {% endfor %}
         {% else %}
-          <li class="sidebar-activity-empty">No CME activities logged yet.</li>
+        <li class="sidebar-activity-empty">No CME activities logged yet.</li>
         {% endif %}
       </ul>
     </section>
@@ -299,47 +290,38 @@
           </div>
           <div class="plan-header-aside">
             <div class="plan-stats">
-              <span class="stat-pill">Remaining {{ '%.1f' % user.remaining_credits }} cr</span>
+              <span class="stat-pill">Remaining {{ user.remaining_credits|round(1) }} cr</span>
               {% if user.budget_usd %}
-                <span class="stat-pill">Budget ${{ '%.0f' % user.budget_usd }}</span>
+              <span class="stat-pill">Budget ${{ user.budget_usd|int }}</span>
               {% endif %}
               <span class="stat-pill">Days off {{ user.days_off or 0 }}</span>
               <span class="stat-pill">Mode {{ current_mode|capitalize }}</span>
               <span class="stat-pill">Live {{ 'Yes' if user.allow_live else 'No' }}</span>
             </div>
             {% if is_dev %}
-              <a href="/ingest?debug=1" target="_blank" class="btn-secondary btn-compact">Debug ingest</a>
+            <a href="/ingest?debug=1" target="_blank" class="btn-secondary btn-compact">Debug ingest</a>
             {% endif %}
           </div>
         </header>
         {% if policy_status and policy_status|length > 0 %}
-          <div class="policy-banner">
-            <div class="policy-label">
-              <span class="badge">Policy active</span>
-              {% for p in policy_status %}
-                <span class="policy-pill">
-                  {{ p.mode|capitalize }}{% if p.hours_left is not none %} · {{ p.hours_left }}h{% endif %}
-                </span>
-              {% endfor %}
-            </div>
-            <div class="policy-actions">
-              <button
-                type="button"
-                class="btn-secondary"
-                hx-post="/policy/clear"
-                hx-swap="none"
-                hx-on::after-request="window.location.reload()"
-              >Clear policy</button>
-              <form
-                hx-post="/policy/clear"
-                hx-target="#chat-window"
-                hx-swap="beforeend"
-                hx-on::after-request="const el=document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }"
-              >
-                <button type="submit" class="linklike">Clear via chat</button>
-              </form>
-            </div>
+        <div class="policy-banner">
+          <div class="policy-label">
+            <span class="badge">Policy active</span>
+            {% for p in policy_status %}
+            <span class="policy-pill">
+              {{ p.mode|capitalize }}{% if p.hours_left is not none %} · {{ p.hours_left }}h{% endif %}
+            </span>
+            {% endfor %}
           </div>
+          <div class="policy-actions">
+            <button type="button" class="btn-secondary" hx-post="/policy/clear" hx-swap="none"
+              hx-on::after-request="window.location.reload()">Clear policy</button>
+            <form hx-post="/policy/clear" hx-target="#chat-window" hx-swap="beforeend"
+              hx-on::after-request="const el=document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }">
+              <button type="submit" class="linklike">Clear via chat</button>
+            </form>
+          </div>
+        </div>
         {% endif %}
         {% set added = request.query_params.get('added') %}
         {% set gcount = request.query_params.get('gcount') %}
@@ -348,57 +330,48 @@
         {% set error = request.query_params.get('error') %}
         <div id="ingest-banner" class="ingest-banner">
           {% if added %}
-            <div class="ingest-notice ingest-ok">
-              Imported {{ added }} new activities{% if gcount or acount %} — Web: {{ gcount or 0 }}, AI: {{ acount or 0 }}{% endif %}{% if fallback == '1' %} (fallback used){% endif %}.
-            </div>
+          <div class="ingest-notice ingest-ok">
+            Imported {{ added }} new activities{% if gcount or acount %} — Web: {{ gcount or 0 }}, AI: {{ acount or 0
+            }}{% endif %}{% if fallback == '1' %} (fallback used){% endif %}.
+          </div>
           {% elif error %}
-            <div class="ingest-notice ingest-error">{{ error }}</div>
+          <div class="ingest-notice ingest-error">{{ error }}</div>
           {% endif %}
         </div>
-        <div
-          id="plan-card"
-          class="plan-card-container"
-          data-plan-mode="{{ current_mode }}"
-          hx-get="/fragment/plan?mode={{ current_mode }}"
-          hx-trigger="plan-refresh from:body"
-          hx-target="this"
-          hx-swap="innerHTML"
-          hx-vals='{"refresh":"1"}'
-        >
+        <div id="plan-card" class="plan-card-container" data-plan-mode="{{ current_mode }}"
+          hx-get="/fragment/plan?mode={{ current_mode }}" hx-trigger="plan-refresh from:body" hx-target="this"
+          hx-swap="innerHTML" hx-vals='{"refresh":"1"}'>
           {% include '_plan.html' %}
         </div>
       </section>
     </div>
-    <section class="panel chat-panel">
-      <header class="panel-header">
-        <div>
-          <h2>Assistant</h2>
-          <p class="panel-subtitle">Chat with the concierge to adapt your plan or log completions.</p>
-        </div>
-        <a href="/preferences" class="btn-secondary">Edit Preferences</a>
-      </header>
-      <div
-        id="chat-window"
-        class="chat-window"
-        hx-get="/chat"
-        hx-trigger="load, chat-refresh from:body"
-        hx-swap="innerHTML"
-        hx-on::after-settle="this.scrollTop = this.scrollHeight"
-      >
-        <!-- Chat messages load here -->
-      </div>
-      <form
-        class="chat-input"
-        hx-post="/chat/send"
-        hx-target="#chat-window"
-        hx-swap="beforeend"
-        hx-on::after-request="this.reset(); const el = document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }"
-      >
-        <input name="text" placeholder="Tell me your goals or request a change…" required />
-        <button type="submit" class="btn-primary">Send</button>
-      </form>
-    </section>
   </div>
 </div>
+<!-- Floating Chat Drawer -->
+<div class="chat-drawer" id="chat-drawer">
+  <section class="panel chat-panel">
+    <header class="panel-header">
+      <div>
+        <h2>Assistant</h2>
+        <p class="panel-subtitle">Chat with the concierge to adapt your plan or log completions.</p>
+      </div>
+      <a href="/preferences" class="btn-secondary btn-compact">Preferences</a>
+    </header>
+    <div id="chat-window" class="chat-window" hx-get="/chat" hx-trigger="load, chat-refresh from:body"
+      hx-swap="innerHTML" hx-on::after-settle="this.scrollTop = this.scrollHeight">
+      <!-- Chat messages load here -->
+    </div>
+    <form class="chat-input" hx-post="/chat/send" hx-target="#chat-window" hx-swap="beforeend"
+      hx-on::after-request="this.reset(); const el = document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }">
+      <input name="text" placeholder="Tell me your goals or request a change…" required />
+      <button type="submit" class="btn-primary">Send</button>
+    </form>
+  </section>
+</div>
+<!-- Chat Drawer Toggle Button (outside drawer for visibility) -->
+<button type="button" class="chat-drawer-toggle" id="chat-drawer-toggle" aria-label="Toggle chat">
+  <span class="chat-toggle-icon">💬</span>
+  <span class="chat-toggle-close">✕</span>
+</button>
 {% endif %}
 {% endblock %}
