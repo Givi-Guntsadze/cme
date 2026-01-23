@@ -361,10 +361,9 @@
       hx-swap="innerHTML" hx-on::after-settle="this.scrollTop = this.scrollHeight">
       <!-- Chat messages load here -->
     </div>
-    <form class="chat-input" hx-post="/chat/send" hx-target="#chat-window" hx-swap="beforeend"
-      hx-on::after-request="this.reset(); const el = document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }">
-      <input name="text" placeholder="Tell me your goals or request a change…" required />
-      <button type="submit" class="btn-primary">Send</button>
+    <form class="chat-input" id="chat-form">
+      <input name="text" id="chat-input-text" placeholder="Tell me your goals or request a change…" required />
+      <button type="submit" class="btn-primary" id="chat-send-btn">Send</button>
     </form>
   </section>
 </div>

@@ -497,6 +497,11 @@ ELIGIBILITY_PATTERNS = [
         r"eligible\s+for\s+(?:the\s+)?(?P<title>[^.;!?]+)",
         re.I,
     ),
+    # "change/set status to eligible for X" or "mark X as eligible"
+    re.compile(
+        r"(?:change|set|mark|update)\s+(?:.*?)\s+eligible\s+(?:for\s+)?(?P<title>[^.!?;]+)",
+        re.I,
+    ),
 ]
 
 # Patterns for detecting discovery/search queries
@@ -587,33 +592,14 @@ def _extract_activity_update(text: str) -> dict | None:
     return None
 
 
-def _title_tokens(text: str) -> set[str]:
-    tokens: set[str] = set()
-    for match in TITLE_TOKEN_RE.finditer(text or ""):
-        token = match.group(0).lower()
-        if not token:
-            continue
-        if token in TITLE_STOPWORDS and len(token) < 5:
-            continue
-        if token.isdigit() and len(token) < 4:
-            continue
-        tokens.add(token)
-    return tokens
-
-
-def _is_candidate_match(candidate_title: str, query_tokens: set[str]) -> bool:
-    if not candidate_title or not query_tokens:
-        return False
-    candidate_tokens = _title_tokens(candidate_title)
-    if not candidate_tokens:
-        return False
-    overlap = query_tokens & candidate_tokens
-    if not overlap:
-        return False
-    if len(query_tokens) <= 3:
-        return overlap == query_tokens
-    overlap_threshold = max(2, len(query_tokens) // 2)
-    return len(overlap) >= overlap_threshold
+from .services.discovery import (
+    find_activity_by_title, 
+    _title_tokens, 
+    _is_candidate_match, 
+    _match_score,
+    MIN_MATCH_SCORE
+)
+from .services.tools import TOOLS_SCHEMA, execute_tool_call
 
 
 def _normalize_response_text(text: str) -> str:
@@ -646,20 +632,7 @@ def _is_negative(text: str) -> bool:
     return first_word in NEGATIVE_REPLIES
 
 
-def _match_score(search: str, title: str) -> float:
-    title_lower = (title or "").lower()
-    if not title_lower:
-        return 0.0
-    ratio = SequenceMatcher(None, search, title_lower).ratio()
-    if search in title_lower:
-        ratio += 0.75
-    if title_lower.startswith(search):
-        ratio += 0.25
-    tokens = [t for t in search.split(" ") if t]
-    if tokens:
-        hits = sum(1 for token in tokens if token in title_lower)
-        ratio += 0.1 * hits
-    return ratio
+# _match_score is now imported from services.discovery
 
 
 MIN_MATCH_SCORE = 0.25
@@ -683,73 +656,7 @@ def _activity_cost_and_days(
     return cost, days_needed, combined
 
 
-def find_activity_by_title(session, user: User, text: str) -> Activity | None:
-    search = (text or "").strip().lower()
-    if not search:
-        return None
-
-    plan_manager = PlanManager(session)
-    policy_bundle = load_policy_bundle(session, user)
-    run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
-
-    candidates: list[tuple[int, float, int, Activity]] = []
-    seen_ids: set[int] = set()
-
-    if run:
-        plan_items = list(
-            session.exec(
-                select(PlanItem)
-                .where(PlanItem.plan_run_id == run.id)
-                .order_by(PlanItem.position.asc())
-            )
-        )
-        for item in plan_items:
-            activity = session.get(Activity, item.activity_id)
-            if not activity or not activity.title:
-                continue
-            score = _match_score(search, activity.title)
-            if score < MIN_MATCH_SCORE:
-                continue
-            priority = 0 if item.committed else 1
-            candidates.append(
-                (
-                    priority,
-                    -score,
-                    item.position,
-                    activity.id or 0,
-                    activity,
-                )
-            )
-            seen_ids.add(activity.id)
-
-    catalog_stmt = select(Activity)
-    for activity in session.exec(catalog_stmt):
-        if activity.id in seen_ids:
-            continue
-        if not activity.title:
-            continue
-        score = _match_score(search, activity.title)
-        if score < MIN_MATCH_SCORE:
-            continue
-        candidates.append(
-            (
-                2,
-                -score,
-                len(activity.title or ""),
-                activity.id or 0,
-                activity,
-            )
-        )
-
-    if not candidates:
-        return None
-
-    candidates.sort()
-    best_activity = candidates[0][4]
-    best_score = -candidates[0][1]
-    if best_score < MIN_MATCH_SCORE:
-        return None
-    return best_activity
+# find_activity_by_title is now imported from services.discovery
 
 
 def propose_substitute(
@@ -2411,1136 +2318,217 @@ def chat_send(request: Request, text: str = Form(...)):
             status_code=503,
         )
 
-    try:
-        normalized_text = text.strip().lower()
-        should_ingest = False
-        plan_update_needed = False
-        ingest_success = False
-        action_command: str | None = None
-        force_plan_refresh = False
-        activities_to_commit: set[int] = set()
-
-        with get_session() as session:
-            user = session.exec(select(User)).first()
-            if not user:
-                user = User(
-                    name="Doctor",
-                    specialty="Psychiatry",
-                    target_credits=30.0,
-                    remaining_credits=30.0,
-                )
-                session.add(user)
-                session.commit()
-                session.refresh(user)
-            elif user.id is None:
-                session.add(user)
-                session.commit()
-                session.refresh(user)
-
-            plan_manager = PlanManager(session)
-            user_message = AssistantMessage(
-                user_id=user.id, role="user", content=text.strip()[:4000]
-            )
-            session.add(user_message)
-
-            pending_notes: list[str] = []
-            removal_note, removal_changed = _maybe_remove_claim_from_text(
-                user, text, session
-            )
-            if removal_note:
-                pending_notes.append(removal_note)
-            if removal_changed:
-                plan_update_needed = True
-            note_text = _maybe_log_claim_from_text(user, text, session)
-            if note_text:
-                pending_notes.append(note_text)
-                plan_update_needed = True
-            note_text = _maybe_complete_activity_from_text(user, text, session)
-            if note_text:
-                pending_notes.append(note_text)
-
-            # Check for discovery/search queries - use RAG if available
-            discovery_query = _extract_discovery_query(text)
-            if discovery_query:
-                try:
-                    from .services import vectordb
-                    search_results = vectordb.search(discovery_query, n_results=5)
-                    if search_results:
-                        result_lines = [f"I found {len(search_results)} activities matching '{discovery_query}':"]
-                        for r in search_results:
-                            result_lines.append(
-                                f"• **{r['title']}** ({r['provider']}) - {r['credits']} credits"
-                                + (f", ${r['cost']}" if r['cost'] else "")
-                            )
-                        result_text = "\n".join(result_lines)
-                        pending_notes.append(result_text)
-                    else:
-                        pending_notes.append(f"No activities found matching '{discovery_query}'. Try a different search term or browse the catalog.")
-                except Exception as e:
-                    logger.warning("Vector search failed: %s", e)
-                    # Fall through to LLM-based response
-
-            policy_bundle = None
-            plan_run = None
-
-            removal_targets = _extract_remove_targets(text)
-            if removal_targets:
-                removal_hits: list[Activity] = []
-                missing_removals: list[str] = []
-                for target in removal_targets:
-                    activity = find_activity_by_title(session, user, target)
-                    if activity:
-                        removal_hits.append(activity)
-                    else:
-                        missing_removals.append(target)
-                if removal_hits:
-                    if policy_bundle is None:
-                        policy_bundle = load_policy_bundle(session, user)
-                    if plan_run is None:
-                        plan_run = plan_manager.ensure_plan(
-                            user, "balanced", policy_bundle
-                        )
-                    plan_items = list(
-                        session.exec(
-                            select(PlanItem).where(PlanItem.plan_run_id == plan_run.id)
-                        )
-                    )
-                    plan_item_lookup = {
-                        item.activity_id: item
-                        for item in plan_items
-                        if item.activity_id
-                    }
-                    for activity in removal_hits:
-                        item = plan_item_lookup.get(activity.id)
-                        if item and item.committed:
-                            item.committed = False
-                            session.add(item)
-                    removal_payload = json.dumps(
-                        {"remove_titles": [activity.title for activity in removal_hits]}
-                    )
-                    apply_policy_payloads(
-                        [removal_payload],
-                        user,
-                        session,
-                        invalidate=False,
-                        record_message=False,
-                    )
-                    session.flush()
-                    PlanManager.invalidate_user_plans(
-                        session, user.id, reason="plan_remove"
-                    )
-                    plan_update_needed = True
-                    force_plan_refresh = True
-                    removed_titles = ", ".join(
-                        activity.title for activity in removal_hits
-                    )
-                    pending_notes.append(f"Removed from plan: {removed_titles}.")
-                    plan_run = None
-                    policy_bundle = None
-                    pending_notes = [
-                        note
-                        for note in pending_notes
-                        if note != "No logged credits to remove."
-                    ]
-                if missing_removals:
-                    pending_notes.append(
-                        "I couldn't find "
-                        + ", ".join(missing_removals)
-                        + " in the current plan—double-check the titles and I'll remove them."
-                    )
-
-            addition_targets = _extract_add_targets(text)
-            if addition_targets:
-                added_titles: list[str] = []
-                missing_additions: list[str] = []
-                for target in addition_targets:
-                    pending_notes.append(f"Searching for details on {target}…")
-                for target in addition_targets:
-                    query_tokens = _title_tokens(target)
-                    candidate = find_activity_by_title(session, user, target)
-                    if not candidate:
-                        try:
-                            inserted = discover_activity_by_title(user, target)
-                            if inserted > 0:
-                                ingest_success = True
-                        except Exception:
-                            logging.exception(
-                                "targeted discovery failed for %s", target
-                            )
-                        PlanManager.invalidate_user_plans(
-                            session, user.id, reason="ingest_focus"
-                        )
-                        force_plan_refresh = True
-                        plan_run = None
-                        policy_bundle = None
-                        candidate = find_activity_by_title(session, user, target)
-                    if candidate:
-                        if _is_candidate_match(candidate.title or "", query_tokens):
-                            added_titles.append(candidate.title or target)
-                            activities_to_commit.add(candidate.id)
-                            plan_update_needed = True
-                            force_plan_refresh = True
-                        else:
-                            missing_additions.append(target)
-                    else:
-                        missing_additions.append(target)
-                if added_titles:
-                    pending_notes.append(
-                        "Added to plan: " + ", ".join(added_titles) + "."
-                    )
-                if missing_additions:
-                    pending_notes.append(
-                        "I couldn’t locate details for "
-                        + ", ".join(missing_additions)
-                        + " yet—share a link or more info and I’ll add it."
-                    )
-
-            # Handle activity updates (e.g., "Opioid CME costs $125 and I am eligible")
-            activity_update = _extract_activity_update(text)
-            if activity_update and activity_update.get("title"):
-                target_title = activity_update["title"]
-                activity = find_activity_by_title(session, user, target_title)
-                if activity:
-                    update_parts = []
-                    
-                    # Update cost if provided
-                    if activity_update.get("cost") is not None:
-                        old_cost = activity.cost_usd or 0
-                        activity.cost_usd = activity_update["cost"]
-                        session.add(activity)
-                        update_parts.append(f"cost to ${activity_update['cost']:.0f}")
-                    
-                    # Update eligibility if confirmed
-                    if activity_update.get("eligible"):
-                        if not activity.eligibility_text:
-                            activity.eligibility_text = "User confirmed eligibility"
-                        activity.open_to_public = True
-                        session.add(activity)
-                        update_parts.append("eligibility confirmed")
-                    
-                    if update_parts:
-                        session.flush()
-                        PlanManager.invalidate_user_plans(
-                            session, user.id, reason="activity_update"
-                        )
-                        plan_update_needed = True
-                        force_plan_refresh = True
-                        pending_notes.append(
-                            f"Updated **{activity.title}**: {', '.join(update_parts)}."
-                        )
-                else:
-                    pending_notes.append(
-                        f"I couldn't find an activity matching \"{target_title}\" — "
-                        "please check the exact title from the plan."
-                    )
-
-            if "keep this plan" in normalized_text:
-                if policy_bundle is None:
-                    policy_bundle = load_policy_bundle(session, user)
-                if plan_run is None:
-                    plan_run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
-                plan_items = list(
-                    session.exec(
-                        select(PlanItem)
-                        .where(PlanItem.plan_run_id == plan_run.id)
-                        .order_by(PlanItem.position.asc())
-                    )
-                )
-                newly_committed = 0
-                for item in plan_items:
-                    if not item.committed:
-                        item.committed = True
-                        session.add(item)
-                        newly_committed += 1
-                if newly_committed:
-                    PlanManager.invalidate_user_plans(
-                        session, user.id, reason="commit_all"
-                    )
-                session.commit()
-
-                refreshed_run = plan_manager.ensure_plan(
-                    user,
-                    "balanced",
-                    load_policy_bundle(session, user),
-                    force_refresh=True,
-                    reason="commit_all" if newly_committed else None,
-                )
-                plan, plan_summary, _ = plan_manager.serialize_plan(refreshed_run, user)
-                confirmation_text = (
-                    f"Locked in {len(plan)} activities; I'll keep them fixed while we fill remaining gaps."
-                    if newly_committed
-                    else "Everything in the current plan was already committed."
-                )
-                confirmation = AssistantMessage(
-                    user_id=user.id,
-                    role="assistant",
-                    content=confirmation_text[:4000],
-                )
-                session.add(confirmation)
-
-                item_count = len(plan)
-                total_cost_value = None
-                if isinstance(plan_summary, dict):
-                    total_cost_value = plan_summary.get("total_cost")
-                cost_phrase = (
-                    f"${total_cost_value:,.0f}"
-                    if isinstance(total_cost_value, (int, float))
-                    else "$0"
-                )
-                remaining_value = float(user.remaining_credits or 0.0)
-                plan_note = AssistantMessage(
-                    user_id=user.id,
-                    role="assistant",
-                    content=(
-                        f"Plan updated ({item_count} items, {cost_phrase} total, "
-                        f"{remaining_value:.1f} remaining)."
-                    ),
-                )
-                session.add(plan_note)
-                session.commit()
-
-                messages_to_render = [
-                    SimpleNamespace(
-                        role=user_message.role, content=user_message.content
-                    ),
-                    SimpleNamespace(
-                        role=confirmation.role, content=confirmation.content
-                    ),
-                    SimpleNamespace(role=plan_note.role, content=plan_note.content),
-                ]
-
-                time.sleep(1.2)
-                response = templates.TemplateResponse(
-                    "_chat_messages_append.html",
-                    {"request": request, "messages": messages_to_render},
-                )
-                response.headers["HX-Trigger"] = json.dumps({"plan-refresh": True})
-                return response
-
-            user_text_trimmed = text.strip()
-            if user_text_trimmed.lower().startswith("remove "):
-                target_text = user_text_trimmed[7:].strip().strip(".!")
-                activity = find_activity_by_title(session, user, target_text)
-
-                if not activity:
-                    miss_msg = AssistantMessage(
-                        user_id=user.id,
-                        role="assistant",
-                        content=(
-                            "I couldn't find that activity in the current plan. "
-                            "Double-check the title and I'll remove it."
-                        ),
-                    )
-                    session.add(miss_msg)
-                    session.commit()
-                    messages_to_render = [
-                        SimpleNamespace(
-                            role=user_message.role, content=user_message.content
-                        ),
-                        SimpleNamespace(role=miss_msg.role, content=miss_msg.content),
-                    ]
-                    time.sleep(1.2)
-                    return templates.TemplateResponse(
-                        "_chat_messages_append.html",
-                        {"request": request, "messages": messages_to_render},
-                    )
-
-                policy_bundle = load_policy_bundle(session, user)
-                run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
-                plan_items = list(
-                    session.exec(
-                        select(PlanItem)
-                        .where(
-                            PlanItem.plan_run_id == run.id,
-                            PlanItem.activity_id == activity.id,
-                        )
-                        .order_by(PlanItem.position.asc())
-                    )
-                )
-
-                for item in plan_items:
-                    if item.committed:
-                        item.committed = False
-                        session.add(item)
-
-                removal_payload = json.dumps({"remove_titles": [activity.title]})
-                apply_policy_payloads(
-                    [removal_payload],
-                    user,
-                    session,
-                    invalidate=False,
-                    record_message=False,
-                )
-
-                PlanManager.invalidate_user_plans(
-                    session, user.id, reason="remove_activity"
-                )
-                session.commit()
-
-                refreshed_run = plan_manager.ensure_plan(
-                    user,
-                    "balanced",
-                    load_policy_bundle(session, user),
-                    force_refresh=True,
-                    reason="remove_activity",
-                )
-                plan, plan_summary, _ = plan_manager.serialize_plan(refreshed_run, user)
-
-                cost_phrase = "$0"
-                if isinstance(plan_summary, dict):
-                    total_cost_value = plan_summary.get("total_cost")
-                    if isinstance(total_cost_value, (int, float)):
-                        cost_phrase = f"${total_cost_value:,.0f}"
-
-                remaining_value = float(user.remaining_credits or 0.0)
-
-                removal_msg = AssistantMessage(
-                    user_id=user.id,
-                    role="assistant",
-                    content=(f"Removed {activity.title}. Shall I find a substitute?"),
-                )
-                session.add(removal_msg)
-                session.add(
-                    AssistantMessage(
-                        user_id=user.id,
-                        role="assistant",
-                        content=f"INTERNAL:SUBSTITUTE_REQUEST:{activity.id}",
-                    )
-                )
-
-                plan_note = AssistantMessage(
-                    user_id=user.id,
-                    role="assistant",
-                    content=(
-                        f"Plan updated ({len(plan)} items, {cost_phrase} total, "
-                        f"{remaining_value:.1f} remaining)."
-                    ),
-                )
-                session.add(plan_note)
-                session.commit()
-
-                messages_to_render = [
-                    SimpleNamespace(
-                        role=user_message.role, content=user_message.content
-                    ),
-                    SimpleNamespace(role=removal_msg.role, content=removal_msg.content),
-                    SimpleNamespace(role=plan_note.role, content=plan_note.content),
-                ]
-
-                time.sleep(1.2)
-                response = templates.TemplateResponse(
-                    "_chat_messages_append.html",
-                    {"request": request, "messages": messages_to_render},
-                )
-                response.headers["HX-Trigger"] = json.dumps({"plan-refresh": True})
-                return response
-
-            affirmative = _is_affirmative(text)
-            negative = _is_negative(text)
-
-            if affirmative:
-                candidate_msg = _pop_internal_message(
-                    session, user.id, "INTERNAL:SUBSTITUTE_CANDIDATE:"
-                )
-                if candidate_msg:
-                    try:
-                        candidate_id = int(candidate_msg.content.split(":", 2)[-1])
-                    except Exception:
-                        candidate_id = None
-
-                    candidate_activity = (
-                        session.get(Activity, candidate_id) if candidate_id else None
-                    )
-                    if not candidate_activity:
-                        error_msg = AssistantMessage(
-                            user_id=user.id,
-                            role="assistant",
-                            content="I couldn't locate that option anymore, but I can search again if you'd like.",
-                        )
-                        session.add(error_msg)
-                        session.commit()
-                        messages_to_render = [
-                            SimpleNamespace(
-                                role=user_message.role, content=user_message.content
-                            ),
-                            SimpleNamespace(
-                                role=error_msg.role, content=error_msg.content
-                            ),
-                        ]
-                        time.sleep(1.2)
-                        return templates.TemplateResponse(
-                            "_chat_messages_append.html",
-                            {"request": request, "messages": messages_to_render},
-                        )
-
-                    policy_bundle = load_policy_bundle(session, user)
-                    run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
-                    plan_item = session.exec(
-                        select(PlanItem)
-                        .where(
-                            PlanItem.plan_run_id == run.id,
-                            PlanItem.activity_id == candidate_activity.id,
-                        )
-                        .limit(1)
-                    ).first()
-
-                    if plan_item is None:
-                        current_max = session.exec(
-                            select(func.max(PlanItem.position)).where(
-                                PlanItem.plan_run_id == run.id
-                            )
-                        ).first()
-                        next_position = int(current_max or 0) + 1
-                        cost, _, pricing = _activity_cost_and_days(
-                            user, candidate_activity
-                        )
-                        plan_item = PlanItem(
-                            user_id=user.id,
-                            activity_id=candidate_activity.id,
-                            plan_run_id=run.id,
-                            mode="balanced",
-                            position=next_position,
-                            chosen=True,
-                            pricing_snapshot={
-                                "cost": cost,
-                                "base_cost": pricing.get("base_cost"),
-                                "deadline_text": pricing.get("deadline_text"),
-                                "deadline_urgency": pricing.get("deadline_urgency"),
-                                "price_label": pricing.get("price_label"),
-                                "notes": pricing.get("notes"),
-                                "hybrid_available": pricing.get("hybrid_available"),
-                            },
-                            requirement_snapshot={
-                                "tags": [],
-                                "requirement_priority": False,
-                            },
-                            eligibility_status=(
-                                "eligible"
-                                if is_eligible(user, candidate_activity)
-                                else "uncertain"
-                            ),
-                            notes=pricing.get("notes"),
-                            committed=True,
-                        )
-                        session.add(plan_item)
-                    else:
-                        if not plan_item.committed:
-                            plan_item.committed = True
-                            session.add(plan_item)
-
-                    PlanManager.invalidate_user_plans(
-                        session, user.id, reason="commit_substitute"
-                    )
-                    session.commit()
-
-                    refreshed_run = plan_manager.ensure_plan(
-                        user,
-                        "balanced",
-                        load_policy_bundle(session, user),
-                        force_refresh=True,
-                        reason="commit_substitute",
-                    )
-                    plan, plan_summary, _ = plan_manager.serialize_plan(
-                        refreshed_run, user
-                    )
-
-                    cost_phrase = "$0"
-                    if isinstance(plan_summary, dict):
-                        total_cost_value = plan_summary.get("total_cost")
-                        if isinstance(total_cost_value, (int, float)):
-                            cost_phrase = f"${total_cost_value:,.0f}"
-
-                    remaining_value = float(user.remaining_credits or 0.0)
-
-                    ack = AssistantMessage(
-                        user_id=user.id,
-                        role="assistant",
-                        content=(
-                            f"Added {candidate_activity.title} to your plan. Anything else you'd like to adjust?"
-                        ),
-                    )
-                    session.add(ack)
-
-                    plan_note = AssistantMessage(
-                        user_id=user.id,
-                        role="assistant",
-                        content=(
-                            f"Plan updated ({len(plan)} items, {cost_phrase} total, "
-                            f"{remaining_value:.1f} remaining)."
-                        ),
-                    )
-                    session.add(plan_note)
-                    session.commit()
-
-                    messages_to_render = [
-                        SimpleNamespace(
-                            role=user_message.role, content=user_message.content
-                        ),
-                        SimpleNamespace(role=ack.role, content=ack.content),
-                        SimpleNamespace(role=plan_note.role, content=plan_note.content),
-                    ]
-
-                    time.sleep(1.2)
-                    response = templates.TemplateResponse(
-                        "_chat_messages_append.html",
-                        {"request": request, "messages": messages_to_render},
-                    )
-                    response.headers["HX-Trigger"] = json.dumps({"plan-refresh": True})
-                    return response
-
-                request_msg = _pop_internal_message(
-                    session, user.id, "INTERNAL:SUBSTITUTE_REQUEST:"
-                )
-                if request_msg:
-                    try:
-                        removed_id = int(request_msg.content.split(":", 2)[-1])
-                    except Exception:
-                        removed_id = None
-                    removed_activity = (
-                        session.get(Activity, removed_id) if removed_id else None
-                    )
-                    candidate = propose_substitute(session, user, removed_activity)
-                    if candidate:
-                        cost, _, pricing = _activity_cost_and_days(user, candidate)
-                        cost_phrase = f"${cost:,.0f}" if cost else "Free"
-                        message_text = (
-                            f"I found {candidate.title} ({candidate.credits:.1f} cr, {cost_phrase}). "
-                            "Add it to the plan?"
-                        )
-                        suggestion = AssistantMessage(
-                            user_id=user.id,
-                            role="assistant",
-                            content=message_text[:4000],
-                        )
-                        session.add(suggestion)
-                        session.add(
-                            AssistantMessage(
-                                user_id=user.id,
-                                role="assistant",
-                                content=f"INTERNAL:SUBSTITUTE_CANDIDATE:{candidate.id}",
-                            )
-                        )
-                        session.commit()
-                        messages_to_render = [
-                            SimpleNamespace(
-                                role=user_message.role, content=user_message.content
-                            ),
-                            SimpleNamespace(
-                                role=suggestion.role, content=suggestion.content
-                            ),
-                        ]
-                        time.sleep(1.2)
-                        return templates.TemplateResponse(
-                            "_chat_messages_append.html",
-                            {"request": request, "messages": messages_to_render},
-                        )
-                    else:
-                        no_sub_msg = AssistantMessage(
-                            user_id=user.id,
-                            role="assistant",
-                            content=(
-                                "I didn't find a good substitute yet, but I can broaden the search whenever you like."
-                            ),
-                        )
-                        session.add(no_sub_msg)
-                        session.commit()
-                        messages_to_render = [
-                            SimpleNamespace(
-                                role=user_message.role, content=user_message.content
-                            ),
-                            SimpleNamespace(
-                                role=no_sub_msg.role, content=no_sub_msg.content
-                            ),
-                        ]
-                        time.sleep(1.2)
-                        return templates.TemplateResponse(
-                            "_chat_messages_append.html",
-                            {"request": request, "messages": messages_to_render},
-                        )
-
-            if negative:
-                candidate_msg = _pop_internal_message(
-                    session, user.id, "INTERNAL:SUBSTITUTE_CANDIDATE:"
-                )
-                if candidate_msg:
-                    decline = AssistantMessage(
-                        user_id=user.id,
-                        role="assistant",
-                        content="No problem—I'll leave that slot open. Let me know if you want other ideas.",
-                    )
-                    session.add(decline)
-                    session.commit()
-                    messages_to_render = [
-                        SimpleNamespace(
-                            role=user_message.role, content=user_message.content
-                        ),
-                        SimpleNamespace(role=decline.role, content=decline.content),
-                    ]
-                    time.sleep(1.2)
-                    return templates.TemplateResponse(
-                        "_chat_messages_append.html",
-                        {"request": request, "messages": messages_to_render},
-                    )
-
-                request_msg = _pop_internal_message(
-                    session, user.id, "INTERNAL:SUBSTITUTE_REQUEST:"
-                )
-                if request_msg:
-                    decline = AssistantMessage(
-                        user_id=user.id,
-                        role="assistant",
-                        content="Got it—I’ll keep that slot empty for now.",
-                    )
-                    session.add(decline)
-                    session.commit()
-                    messages_to_render = [
-                        SimpleNamespace(
-                            role=user_message.role, content=user_message.content
-                        ),
-                        SimpleNamespace(role=decline.role, content=decline.content),
-                    ]
-                    time.sleep(1.2)
-                    return templates.TemplateResponse(
-                        "_chat_messages_append.html",
-                        {"request": request, "messages": messages_to_render},
-                    )
-
-            if normalized_text in {"clear policy", "clear policies", "reset policy"}:
-                cleared = clear_policies(session, user)
-                policy_message = (
-                    "Policy cleared. Planner reset."
-                    if cleared
-                    else "No active policy to clear."
-                )
-                confirm = AssistantMessage(
-                    user_id=user.id, role="assistant", content=policy_message
-                )
-                session.add(confirm)
-
-                policy_bundle = load_policy_bundle(session, user)
-                plan_run = plan_manager.ensure_plan(
-                    user,
-                    "balanced",
-                    policy_bundle,
-                    force_refresh=True,
-                    reason="policy_cleared",
-                )
-                plan_items, plan_summary, _ = plan_manager.serialize_plan(
-                    plan_run, user
-                )
-                item_count = len(plan_items)
-                total_cost_value = (
-                    plan_summary.get("total_cost")
-                    if isinstance(plan_summary, dict)
-                    else None
-                )
-                cost_phrase = (
-                    f"${total_cost_value:,.0f}"
-                    if isinstance(total_cost_value, (int, float))
-                    else "$0"
-                )
-                remaining_value = float(user.remaining_credits or 0.0)
-
-                summary_msg = AssistantMessage(
-                    user_id=user.id,
-                    role="assistant",
-                    content="Balanced plan refreshed.",
-                )
-                plan_note = AssistantMessage(
-                    user_id=user.id,
-                    role="assistant",
-                    content=(
-                        f"Plan updated ({item_count} items, {cost_phrase} total, "
-                        f"{remaining_value:.1f} remaining)."
-                    ),
-                )
-                session.add(summary_msg)
-                session.add(plan_note)
-                session.commit()
-
-                messages_to_render = [
-                    SimpleNamespace(
-                        role=user_message.role, content=user_message.content
-                    ),
-                    SimpleNamespace(role=confirm.role, content=confirm.content),
-                    SimpleNamespace(role=summary_msg.role, content=summary_msg.content),
-                    SimpleNamespace(role=plan_note.role, content=plan_note.content),
-                ]
-                response = templates.TemplateResponse(
-                    "_chat_messages_append.html",
-                    {"request": request, "messages": messages_to_render},
-                )
-                response.headers["HX-Trigger"] = json.dumps({"plan-refresh": True})
-                time.sleep(1.2)
-                return response
-
-            snapshot = _state_snapshot(session, user)
-            system_prompt = build_system_prompt(snapshot)
-
-            user_payload = f"User said: {text}\n\nCurrent state snapshot:\n{json.dumps(snapshot, default=str)}"
-
-            model_name = DEFAULT_ASSISTANT_MODEL
-            if os.getenv("ENABLE_GPT5") and os.getenv("ENABLE_GPT5").lower() in {
-                "1",
-                "true",
-                "yes",
-            }:
-                model_name = "gpt-5"
-
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_payload},
-            ]
-            reasoning_effort = "medium" if model_name.startswith("gpt-5") else None
-            response = call_responses(
-                openai_client,
-                model=model_name,
-                messages=messages,
-                temperature=0,
-                max_output_tokens=1200,
-                reasoning_effort=reasoning_effort,
-            )
-
-            reply = response_text(response)
-
-            patch_payloads: list[str] = []
-            policy_payloads: list[str] = []
-            action_command = None
-            visible_lines: list[str] = []
-            for line in reply.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("PATCH:"):
-                    payload = stripped.removeprefix("PATCH:").strip()
-                    if payload:
-                        patch_payloads.append(payload)
-                    continue
-                if stripped.startswith("POLICY:"):
-                    payload = stripped.removeprefix("POLICY:").strip()
-                    if payload:
-                        policy_payloads.append(payload)
-                    continue
-                if stripped.startswith("ACTION:"):
-                    action_command = (
-                        stripped.removeprefix("ACTION:").strip().lower() or None
-                    )
-                    if action_command in {"discover", "ingest", "refresh"}:
-                        should_ingest = True
-                    continue
-                visible_lines.append(line)
-
-            visible_reply = "\n".join(visible_lines).strip()
-            if not visible_reply:
-                visible_reply = "Updated the plan to match your request."
-
-            if action_command in {"discover", "ingest", "refresh"}:
-                should_ingest = True
-
-            if removal_changed:
-                removal_ack = "Cleared the logged credits you flagged and refreshed the plan around the remaining gaps."
-                deny_phrases = (
-                    "can't",
-                    "cannot",
-                    "unable",
-                    "don't have the capability",
-                    "do not have the capability",
-                    "can't modify",
-                    "cannot modify",
-                    "can't delete",
-                    "cannot delete",
-                    "unable to delete",
-                )
-                reply_lower = visible_reply.lower()
-                if any(phrase in reply_lower for phrase in deny_phrases):
-                    visible_reply = removal_ack
-                elif removal_ack.lower() not in reply_lower:
-                    visible_reply = f"{visible_reply}\n\n{removal_ack}"
-
-            if not patch_payloads and not policy_payloads:
-                derived_patch, derived_policy = _derive_controls(text, snapshot)
-                patch_payloads.extend(derived_patch)
-                policy_payloads.extend(derived_policy)
-
-            assistant_message = AssistantMessage(
-                user_id=user.id, role="assistant", content=visible_reply[:4000]
-            )
-            session.add(assistant_message)
-
-            extra_messages = _apply_patch_if_present(patch_payloads, user, session)
-            if extra_messages:
-                plan_update_needed = True
-            if policy_payloads:
-                apply_policy_payloads(
-                    policy_payloads,
-                    user,
-                    session,
-                    record_message=False,
-                )
-                plan_update_needed = True
-
-            confirmations: list[AssistantMessage] = []
-            for note_text in pending_notes:
-                note_msg = AssistantMessage(
-                    user_id=user.id, role="assistant", content=note_text[:4000]
-                )
-                session.add(note_msg)
-                confirmations.append(note_msg)
-            try:
-                match = PATCH_RE.search(reply or "")
-                if match:
-                    patch = _safe_json(match.group(1))
-                    if isinstance(patch, dict):
-                        changed = _apply_patch_to_user(patch, session, user)
-                        if changed:
-                            plan_update_needed = True
-                            confirm = AssistantMessage(
-                                user_id=user.id,
-                                role="assistant",
-                                content=(
-                                    "Applied: "
-                                    + ", ".join(changed)
-                                    + ". The plan will reflect these on refresh."
-                                ),
-                            )
-                            session.add(confirm)
-                            session.commit()
-                            confirmations.append(confirm)
-            except Exception:
-                logging.exception("PATCH apply failed")
-
-            try:
-                note = _maybe_set_remaining_from_text(user, text, session)
-                if note:
-                    adjustment_message = AssistantMessage(
-                        user_id=user.id, role="assistant", content=note
-                    )
-                    session.add(adjustment_message)
-                    session.commit()
-                    confirmations.append(adjustment_message)
-            except Exception:
-                logging.exception("Remaining adjustment failed")
-
-            if should_ingest:
-                trigger_reason = action_command or "keyword"
-                logger.info(
-                    "chat_send: triggering discovery (reason=%s)", trigger_reason
-                )
-                try:
-                    ingest_psychiatry_online_ai(count=10, debug=False)
-                    ingest_success = True
-                except Exception:
-                    logging.exception("ingest during chat failed")
-                if ingest_success:
-                    PlanManager.invalidate_user_plans(
-                        session, user.id, reason="ingest_refresh"
-                    )
-                plan_update_needed = True
-
-            if plan_update_needed:
-                logger.info(
-                    "chat_send: refreshing balanced plan (ingest_success=%s)",
-                    ingest_success,
-                )
-                policy_bundle = load_policy_bundle(session, user)
-                plan_run = plan_manager.ensure_plan(
-                    user,
-                    "balanced",
-                    policy_bundle,
-                    force_refresh=ingest_success or force_plan_refresh,
-                    reason=(
-                        "chat_refresh"
-                        if (ingest_success or force_plan_refresh)
-                        else None
-                    ),
-                )
-                if activities_to_commit:
-                    plan_items_db = list(
-                        session.exec(
-                            select(PlanItem).where(PlanItem.plan_run_id == plan_run.id)
-                        )
-                    )
-                    commit_changed = False
-                    plan_item_lookup = {
-                        item.activity_id: item
-                        for item in plan_items_db
-                        if item.activity_id
-                    }
-                    missing_activity_ids = [
-                        activity_id
-                        for activity_id in activities_to_commit
-                        if activity_id not in plan_item_lookup
-                    ]
-                    if missing_activity_ids:
-                        current_max = session.exec(
-                            select(func.max(PlanItem.position)).where(
-                                PlanItem.plan_run_id == plan_run.id
-                            )
-                        ).first()
-                        next_position = int(current_max or 0) + 1
-                        for activity_id in missing_activity_ids:
-                            activity = session.get(Activity, activity_id)
-                            if not activity:
-                                continue
-                            cost, _, pricing = _activity_cost_and_days(user, activity)
-                            new_item = PlanItem(
-                                user_id=user.id,
-                                activity_id=activity.id,
-                                plan_run_id=plan_run.id,
-                                mode="balanced",
-                                position=next_position,
-                                chosen=True,
-                                pricing_snapshot={
-                                    "cost": cost,
-                                    "base_cost": pricing.get("base_cost"),
-                                    "deadline_text": pricing.get("deadline_text"),
-                                    "deadline_urgency": pricing.get("deadline_urgency"),
-                                    "price_label": pricing.get("price_label"),
-                                    "notes": pricing.get("notes"),
-                                    "hybrid_available": pricing.get("hybrid_available"),
-                                },
-                                requirement_snapshot={
-                                    "tags": [],
-                                    "requirement_priority": False,
-                                },
-                                eligibility_status=(
-                                    "eligible"
-                                    if is_eligible(user, activity)
-                                    else "uncertain"
-                                ),
-                                notes=pricing.get("notes"),
-                                committed=True,
-                            )
-                            session.add(new_item)
-                            next_position += 1
-                            commit_changed = True
-                    for item in plan_items_db:
-                        if (
-                            item.activity_id in activities_to_commit
-                            and not item.committed
-                        ):
-                            item.committed = True
-                            session.add(item)
-                            commit_changed = True
-                    if commit_changed:
-                        session.commit()
-                        PlanManager.invalidate_user_plans(
-                            session, user.id, reason="commit_additions"
-                        )
-                        policy_bundle = load_policy_bundle(session, user)
-                        plan_run = plan_manager.ensure_plan(
-                            user,
-                            "balanced",
-                            policy_bundle,
-                            force_refresh=True,
-                            reason="commit_additions",
-                        )
-
-                plan_items, plan_summary, _ = plan_manager.serialize_plan(
-                    plan_run, user
-                )
-                item_count = len(plan_items)
-                total_cost_value = None
-                if isinstance(plan_summary, dict):
-                    total_cost_value = plan_summary.get("total_cost")
-                if isinstance(total_cost_value, (int, float)):
-                    cost_phrase = f"${total_cost_value:,.0f}"
-                else:
-                    cost_phrase = "$0"
-                remaining_value = float(user.remaining_credits or 0.0)
-                plan_note_message = AssistantMessage(
-                    user_id=user.id,
-                    role="assistant",
-                    content=(
-                        f"Plan updated ({item_count} items, {cost_phrase} total, "
-                        f"{remaining_value:.1f} remaining)."
-                    ),
-                )
-                session.add(plan_note_message)
-                confirmations.append(plan_note_message)
-            messages_to_render = [
-                SimpleNamespace(role=m.role, content=m.content)
-                for m in [
-                    user_message,
-                    assistant_message,
-                    *extra_messages,
-                    *confirmations,
-                ]
-            ]
-
-            session.commit()
-
-        response = templates.TemplateResponse(
-            "_chat_messages_append.html",
-            {"request": request, "messages": messages_to_render},
-        )
-        if plan_update_needed:
-            response.headers["HX-Trigger"] = json.dumps({"plan-refresh": True})
-        time.sleep(1.2)
-        return response
-    except Exception as exc:
-        logging.exception("chat_send failed")
-        return HTMLResponse(
-            f"<div class='bubble error'>Assistant error: {str(exc)[:200]}</div>",
-            status_code=500,
-        )
-
-
-@app.post("/plan/remove", response_class=HTMLResponse)
-def plan_remove(request: Request, title: str = Form(...)):
     with get_session() as session:
+        # 1. User Setup
         user = session.exec(select(User)).first()
         if not user:
-            return HTMLResponse("", status_code=204)
-
-        activity = find_activity_by_title(session, user, title)
-        if not activity:
-            return _refresh_plan_fragment_response(
-                request,
-                session,
-                user,
-                plan_mode="balanced",
-                force_refresh=False,
+            user = User(
+                name="Doctor",
+                specialty="Psychiatry",
+                target_credits=30.0,
+                remaining_credits=30.0,
             )
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+        elif user.id is None:
+            session.add(user)
+            session.commit()
+            session.refresh(user)
 
         plan_manager = PlanManager(session)
-        policy_bundle = load_policy_bundle(session, user)
-        run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
-        plan_items = list(
-            session.exec(
-                select(PlanItem)
-                .where(
-                    PlanItem.plan_run_id == run.id,
-                    PlanItem.activity_id == activity.id,
-                )
-                .order_by(PlanItem.position.asc())
-            )
+
+        # 2. Log User Message
+        user_message = AssistantMessage(
+            user_id=user.id, role="user", content=text.strip()[:4000]
         )
-
-        for item in plan_items:
-            if item.committed:
-                item.committed = False
-                session.add(item)
-
-        removal_payload = json.dumps({"remove_titles": [activity.title]})
-        apply_policy_payloads(
-            [removal_payload],
-            user,
-            session,
-            invalidate=False,
-            record_message=False,
-        )
-
-        PlanManager.invalidate_user_plans(session, user.id, reason="plan_remove")
+        session.add(user_message)
         session.commit()
 
-        return _refresh_plan_fragment_response(
-            request,
-            session,
-            user,
-            plan_mode="balanced",
-            force_refresh=True,
-            reason="plan_remove",
+        normalized_text = text.strip().lower()
+
+        # --- LEGACY FAST PATHS (Slash Commands) ---
+
+        # "Keep this plan" command
+        if "keep this plan" in normalized_text and "policy" not in normalized_text:
+            policy_bundle = load_policy_bundle(session, user)
+            plan_run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+            plan_items = list(
+                session.exec(
+                    select(PlanItem)
+                    .where(PlanItem.plan_run_id == plan_run.id)
+                    .order_by(PlanItem.position.asc())
+                )
+            )
+            newly_committed = 0
+            for item in plan_items:
+                if not item.committed:
+                    item.committed = True
+                    session.add(item)
+                    newly_committed += 1
+            if newly_committed:
+                PlanManager.invalidate_user_plans(
+                    session, user.id, reason="commit_all"
+                )
+            session.commit()
+
+            refreshed_run = plan_manager.ensure_plan(
+                user,
+                "balanced",
+                load_policy_bundle(session, user),
+                force_refresh=True,
+                reason="commit_all" if newly_committed else None,
+            )
+            plan, plan_summary, _ = plan_manager.serialize_plan(refreshed_run, user)
+            confirmation_text = (
+                f"Locked in {len(plan)} activities; I'll keep them fixed while we fill remaining gaps."
+                if newly_committed
+                else "Everything in the current plan was already committed."
+            )
+            confirmation = AssistantMessage(
+                user_id=user.id,
+                role="assistant",
+                content=confirmation_text[:4000],
+            )
+            session.add(confirmation)
+
+        # "Clear policy" command
+        if "clear policy" in normalized_text or "reset policy" in normalized_text:
+            apply_policy_payloads(
+                [json.dumps({"clear_all": True})], user, session, invalidate=True
+            )
+            cleared_msg = AssistantMessage(
+                user_id=user.id,
+                role="assistant",
+                content="I've cleared your planning policies (topics, filters). We're starting fresh.",
+            )
+            session.add(cleared_msg)
+            session.commit()
+            return templates.TemplateResponse(
+                "_chat_messages_append.html",
+                {
+                    "request": request,
+                    "messages": [
+                        SimpleNamespace(
+                            role=user_message.role, content=user_message.content
+                        ),
+                        SimpleNamespace(
+                            role=cleared_msg.role, content=cleared_msg.content
+                        ),
+                    ],
+                },
+            )
+
+        # --- AGENTIC LOOP ---
+        state = _state_snapshot(session, user)
+        system_prompt = build_system_prompt(state)
+
+        # History
+        history = session.exec(
+            select(AssistantMessage)
+            .where(AssistantMessage.user_id == user.id)
+            .order_by(AssistantMessage.created_at.desc())
+            .limit(10)
+        ).all()
+        history = list(reversed(history))
+
+        messages = [{"role": "system", "content": system_prompt}]
+        for m in history:
+            role = m.role if m.role in ["user", "assistant"] else "assistant"
+            messages.append({"role": role, "content": m.content})
+
+        context_note = f"\n[System Context]: Current Plan Status: {json.dumps(state['plan_summary'])}"
+        messages.append({"role": "user", "content": text + context_note})
+
+        final_response_text = "I'm thinking..."
+        tools_called = False
+
+        # Agent Loop (Max 5 turns)
+        for _ in range(5):
+            completion = openai_client.chat.completions.create(
+                model=DEFAULT_ASSISTANT_MODEL,
+                messages=messages,
+                tools=TOOLS_SCHEMA,
+                tool_choice="auto",
+            )
+            msg = completion.choices[0].message
+            messages.append(msg)
+
+            if msg.tool_calls:
+                tools_called = True
+                for tool_call in msg.tool_calls:
+                    fname = tool_call.function.name
+                    args_str = tool_call.function.arguments
+                    logger.info(f"Tool Call: {fname}({args_str})")
+                    try:
+                        args = json.loads(args_str)
+                        result = execute_tool_call(fname, args, session, user)
+                    except Exception as e:
+                        result = f"Error executing {fname}: {str(e)}"
+                    
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result
+                    })
+            else:
+                final_response_text = msg.content
+                break
+        
+        # Save Assistant Response
+        final_msg = AssistantMessage(
+            user_id=user.id,
+            role="assistant",
+            content=final_response_text or "Done.",
+        )
+        session.add(final_msg)
+        session.commit()
+
+        # Trigger plan refresh if tools were used
+        headers = {}
+        if tools_called:
+            headers["HX-Trigger"] = "plan-refresh"
+
+        # Build the response payload
+        messages_to_render = [
+            SimpleNamespace(role=user_message.role, content=user_message.content),
+            SimpleNamespace(role=final_msg.role, content=final_msg.content),
+        ]
+        logger.info(f"chat_send: returning {len(messages_to_render)} messages")
+        return templates.TemplateResponse(
+            "_chat_messages_append.html",
+            {
+                "request": request,
+                "messages": messages_to_render,
+            },
+            headers=headers
         )
 
+
+
+
+def _state_snapshot(session, user: User) -> dict:
+    """Collects context for the LLM."""
+    pm = PlanManager(session)
+    # Ensure plan exists to get valid summary
+    try:
+        run = pm.ensure_plan(user, "balanced", policy_bundle=None)
+        items = session.exec(select(PlanItem).where(PlanItem.plan_run_id == run.id).order_by(PlanItem.position)).all()
+        logger.info(f"_state_snapshot: Found {len(items)} plan items for run {run.id}")
+        plan_summary = [f"{i.position}. {i.activity.title} (${i.activity.cost_usd}) [{'Committed' if i.committed else 'Candidate'}]" for i in items if i.activity]
+        logger.info(f"_state_snapshot: plan_summary = {plan_summary[:3]}...")
+    except Exception as e:
+        logger.exception(f"_state_snapshot error: {e}")
+        plan_summary = ["(No plan available)"]
+
+    return {
+        "user_name": user.name,
+        "target_credits": user.target_credits,
+        "remaining_credits": user.remaining_credits,
+        "budget": user.budget_usd,
+        "plan_summary": plan_summary,
+        "days_off": user.days_off
+    }
 
 @app.get("/health")
 def health():

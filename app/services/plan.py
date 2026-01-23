@@ -567,7 +567,7 @@ class PlanManager:
                     activity.eligible_institutions
                     or activity.eligible_groups
                     or activity.membership_required
-                    or not getattr(activity, "open_to_public", True)
+                    or getattr(activity, "open_to_public", False)
                 )
             ):
                 eligibility_status = "uncertain"
@@ -797,7 +797,7 @@ class PlanManager:
                     activity.eligible_institutions
                     or activity.eligible_groups
                     or activity.membership_required
-                    or not getattr(activity, "open_to_public", True)
+                    or getattr(activity, "open_to_public", False)
                 )
             ):
                 status = "uncertain"

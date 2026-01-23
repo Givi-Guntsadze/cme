@@ -1168,6 +1168,25 @@ body.chat-open .chat-drawer-toggle .chat-toggle-close {
   display: block;
 }
 
+/* Move toggle button when drawer is open to avoid overlap with Send button */
+body.chat-open .chat-drawer-toggle {
+  right: 444px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+@media (max-width: 720px) {
+  body.chat-open .chat-drawer-toggle {
+    right: 16px;
+    bottom: auto;
+    top: 16px;
+    /* Move to top on mobile */
+    z-index: 1002;
+  }
+}
+
 /* Overlay when drawer is open */
 .chat-drawer-overlay {
   position: fixed;
@@ -1196,5 +1215,47 @@ body.chat-open .chat-drawer-toggle .chat-toggle-close {
     bottom: 16px;
     width: 52px;
     height: 52px;
+  }
+}
+
+/* ===== Typing Indicator ===== */
+.typing-indicator p {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.typing-indicator .dot {
+  width: 8px;
+  height: 8px;
+  background: var(--color-text-muted);
+  border-radius: 50%;
+  animation: typingBounce 1.4s ease-in-out infinite;
+}
+
+.typing-indicator .dot:nth-child(1) {
+  animation-delay: 0s;
+}
+
+.typing-indicator .dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.typing-indicator .dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes typingBounce {
+
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+
+  30% {
+    transform: translateY(-6px);
+    opacity: 1;
   }
 }

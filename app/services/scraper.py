@@ -19,7 +19,7 @@ from ..env import get_secret
 logger = logging.getLogger(__name__)
 
 APIFY_API_BASE = "https://api.apify.com/v2"
-WEBSITE_CONTENT_CRAWLER_ACTOR = "apify/website-content-crawler"
+WEBSITE_CONTENT_CRAWLER_ACTOR = "apify~website-content-crawler"
 
 
 def get_apify_token() -> str | None:

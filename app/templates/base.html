@@ -232,6 +232,112 @@
           toggle: toggleDrawer
         };
       }
+
+      // Chat form: instant message display with typing indicator
+      var chatForm = document.getElementById('chat-form');
+      var chatInput = document.getElementById('chat-input-text');
+      var chatWindow = document.getElementById('chat-window');
+      var chatSendBtn = document.getElementById('chat-send-btn');
+
+      if (chatForm && chatInput && chatWindow) {
+        chatForm.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var text = chatInput.value.trim();
+          if (!text) return;
+
+          // Disable input while processing
+          chatInput.disabled = true;
+          chatSendBtn.disabled = true;
+
+          // Immediately display user message
+          var userMsg = document.createElement('div');
+          userMsg.className = 'chat-message chat-message-out user';
+          userMsg.innerHTML = '<div class="chat-bubble user">' + escapeHtml(text) + '</div>';
+          chatWindow.appendChild(userMsg);
+
+          // Add typing indicator
+          var typingIndicator = document.createElement('div');
+          typingIndicator.className = 'chat-message chat-message-in';
+          typingIndicator.id = 'typing-indicator';
+          typingIndicator.innerHTML = `
+            <div class="chat-avatar" aria-hidden="true">AI</div>
+            <div class="chat-bubble assistant typing-indicator">
+              <p><span class="dot"></span><span class="dot"></span><span class="dot"></span></p>
+            </div>
+          `;
+          chatWindow.appendChild(typingIndicator);
+
+          // Scroll to bottom
+          chatWindow.scrollTop = chatWindow.scrollHeight;
+
+          // Clear input
+          chatInput.value = '';
+
+          // Make async request
+          var formData = new FormData();
+          formData.append('text', text);
+
+          fetch('/chat/send', {
+            method: 'POST',
+            body: formData
+          })
+            .then(function (response) {
+              return response.text();
+            })
+            .then(function (html) {
+              // Remove typing indicator
+              var indicator = document.getElementById('typing-indicator');
+              if (indicator) indicator.remove();
+
+              // Append assistant response (the server returns the assistant message HTML)
+              // But we need to filter out the user message since we already showed it
+              var temp = document.createElement('div');
+              temp.innerHTML = html;
+              var messages = temp.querySelectorAll('.chat-message');
+              messages.forEach(function (msg) {
+                // Only append non-user messages (assistant/error)
+                // Server uses 'chat-message-out' for user messages
+                if (!msg.classList.contains('chat-message-out')) {
+                  chatWindow.appendChild(msg);
+                }
+              });
+
+              // Scroll to bottom
+              chatWindow.scrollTop = chatWindow.scrollHeight;
+
+              // Trigger plan refresh if needed
+              if (window.htmx) {
+                window.htmx.trigger(document.body, 'plan-refresh');
+              }
+            })
+            .catch(function (err) {
+              console.error('Chat error:', err);
+              // Remove typing indicator
+              var indicator = document.getElementById('typing-indicator');
+              if (indicator) indicator.remove();
+
+              // Show error message
+              var errMsg = document.createElement('div');
+              errMsg.className = 'chat-message error';
+              errMsg.innerHTML = '<p>Something went wrong. Please try again.</p>';
+              chatWindow.appendChild(errMsg);
+              chatWindow.scrollTop = chatWindow.scrollHeight;
+            })
+            .finally(function () {
+              // Re-enable input
+              chatInput.disabled = false;
+              chatSendBtn.disabled = false;
+              chatInput.focus();
+            });
+        });
+      }
+
+      // Helper function to escape HTML
+      function escapeHtml(text) {
+        var div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+      }
     });
   </script>
 </body>
