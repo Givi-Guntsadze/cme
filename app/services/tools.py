@@ -143,9 +143,29 @@ def update_activity_status(session: Session, user: User, activity_title: str, co
         updates.append(f"cost set to ${cost}")
     
     if eligible is True:
+        # Clear ALL eligibility restriction fields
+        # This ensures the missing_profile_data check won't trigger 'uncertain' status
         activity.eligibility_text = None
         activity.open_to_public = True
+        activity.eligible_institutions = None  # Clear institution requirements
+        activity.eligible_groups = None        # Clear group requirements  
+        activity.membership_required = None    # Clear membership requirements
         updates.append("marked as eligible")
+        
+        # Also update PlanItem.eligibility_status (this is what the UI displays)
+        from sqlmodel import select
+        from app.models import PlanItem, PlanRun
+        # Find all PlanItems for this activity in user's plans
+        plan_items = session.exec(
+            select(PlanItem)
+            .join(PlanRun)
+            .where(PlanRun.user_id == user.id, PlanItem.activity_id == activity.id)
+        ).all()
+        logger.info(f"Found {len(plan_items)} PlanItems for activity {activity.id}")
+        for pi in plan_items:
+            logger.info(f"Updating PlanItem {pi.id} eligibility_status from '{pi.eligibility_status}' to 'eligible'")
+            pi.eligibility_status = "eligible"
+            session.add(pi)
     
     if not updates:
         return f"Found '{activity.title}' but no changes were requested."
@@ -153,28 +173,63 @@ def update_activity_status(session: Session, user: User, activity_title: str, co
     session.add(activity)
     session.commit()
     
-    # Invalidate plan to reflect changes
-    PlanManager.invalidate_user_plans(session, user.id, reason="activity_update")
+    # DEBUG: Verify the commit persisted correctly
+    session.refresh(activity)
+    logger.info(f"[ELIGIBILITY DEBUG] After commit: activity.id={activity.id}, open_to_public={activity.open_to_public}, eligibility_text='{activity.eligibility_text}'")
+    
+    # ALWAYS invalidate plans after updates to force regeneration with fresh data
+    # This ensures the plan is rebuilt using the updated activity.open_to_public value
+    PlanManager.invalidate_user_plans(session, user.id, reason="activity_status_update")
     
     return f"Updated '{activity.title}': {', '.join(updates)}."
 
 def remove_activity(session: Session, user: User, activity_title: str) -> str:
+    logger.info(f"[REMOVE_ACTIVITY] Called with title='{activity_title}' for user={user.id}")
     activity = find_activity_by_title(session, user, activity_title)
     if not activity:
+        logger.warning(f"[REMOVE_ACTIVITY] Activity not found for '{activity_title}'")
         return f"Error: Could not find activity matching '{activity_title}' to remove."
     
-    # Logic similar to main.py remove handler
-    policy_bundle = load_policy_bundle(session, user)
-    plan_manager = PlanManager(session)
-    # Ensure raw plan exists so we can uncommit items if needed
-    plan_manager.ensure_plan(user, "balanced", policy_bundle)
+    logger.info(f"[REMOVE_ACTIVITY] Found activity: {activity.title} (ID={activity.id})")
     
-    # We use the policy payload mechanism to persist removal
-    removal_payload = json.dumps({"remove_titles": [activity.title]})
+    # Step 1: Find and uncommit/remove any existing PlanItems for this activity
+    from sqlmodel import select
+    from app.models import PlanItem, PlanRun
+    
+    plan_items = list(session.exec(
+        select(PlanItem)
+        .join(PlanRun)
+        .where(
+            PlanRun.user_id == user.id,
+            PlanRun.status == "active",
+            PlanItem.activity_id == activity.id
+        )
+    ))
+    
+    for pi in plan_items:
+        logger.info(f"[REMOVE_ACTIVITY] Removing PlanItem {pi.id} for activity {activity.id}")
+        session.delete(pi)
+    
+    if plan_items:
+        session.flush()
+    
+    # Step 2: Apply policy to prevent activity from being re-added during plan regeneration
+    # Create policy for BOTH 'default' and 'balanced' modes to ensure coverage
+    removal_payload = json.dumps({
+        "by_mode": {
+            "balanced": {"remove_titles": [activity.title]},
+            "cheapest": {"remove_titles": [activity.title]},
+        },
+        "remove_titles": [activity.title]  # Also as default fallback
+    })
+    logger.info(f"[REMOVE_ACTIVITY] Applying policy payload: {removal_payload}")
     apply_policy_payloads([removal_payload], user, session, invalidate=False)
     
+    # Step 3: Invalidate plans to force regeneration
+    logger.info(f"[REMOVE_ACTIVITY] Invalidating user plans...")
     PlanManager.invalidate_user_plans(session, user.id, reason="remove_activity")
     session.commit()
+    logger.info(f"[REMOVE_ACTIVITY] Successfully removed '{activity.title}'")
     
     return f"Removed '{activity.title}' from your plan."
 
@@ -222,27 +277,64 @@ def search_activities(query: str) -> str:
         return "Error occurred during search."
 
 def mark_activity_complete(session: Session, user: User, activity_title: str, credits: Optional[float] = None) -> str:
+    """Mark an activity as completed. Creates a Claim, updates user credits, and archives the activity."""
+    from datetime import date as date_type
+    from app.models import Claim, CompletedActivity, PlanItem, PlanRun
+    from sqlmodel import select
+    
+    logger.info(f"[COMPLETE] Called for '{activity_title}' by user {user.id}")
+    
     activity = find_activity_by_title(session, user, activity_title)
     if not activity:
         return f"Error: Could not find activity matching '{activity_title}'."
     
-    # Simplistic logic: Just log it. In real app, we might check Claim table.
-    from app.models import Claim, CompletedActivity
+    earned_credits = credits if credits is not None else (activity.credits or 0.0)
+    logger.info(f"[COMPLETE] Found activity: {activity.title} (ID={activity.id}), credits={earned_credits}")
     
-    # Create claim
+    # Step 1: Create Claim record (required fields: user_id, credits, date, source_text)
     claim = Claim(
         user_id=user.id,
-        activity_id=activity.id,
-        credits=credits or activity.credits or 0.0,
-        date=None # Today?
+        credits=earned_credits,
+        topic=activity.title[:100] if activity.title else "CME Activity",
+        date=date_type.today(),
+        source_text=f"{activity.provider or 'Unknown'}: {activity.title or 'Activity'}"[:200],
     )
     session.add(claim)
+    logger.info(f"[COMPLETE] Created Claim for {earned_credits} credits")
     
-    # Also mark as completed behavior (invalidate plan)
+    # Step 2: Create CompletedActivity record to prevent it from appearing in future plans
+    completed = CompletedActivity(
+        user_id=user.id,
+        activity_id=activity.id,
+    )
+    session.add(completed)
+    logger.info(f"[COMPLETE] Created CompletedActivity record")
+    
+    # Step 3: Remove any PlanItems for this activity from active plans
+    plan_items = list(session.exec(
+        select(PlanItem)
+        .join(PlanRun)
+        .where(
+            PlanRun.user_id == user.id,
+            PlanRun.status == "active",
+            PlanItem.activity_id == activity.id
+        )
+    ))
+    for pi in plan_items:
+        logger.info(f"[COMPLETE] Removing PlanItem {pi.id}")
+        session.delete(pi)
+    
+    # Step 4: Update user's remaining credits
+    user.remaining_credits = max((user.remaining_credits or 0.0) - earned_credits, 0.0)
+    session.add(user)
+    logger.info(f"[COMPLETE] Updated user.remaining_credits to {user.remaining_credits}")
+    
+    # Step 5: Invalidate plans to trigger regeneration
     PlanManager.invalidate_user_plans(session, user.id, reason="activity_completed")
     session.commit()
+    logger.info(f"[COMPLETE] Successfully marked '{activity.title}' as complete")
     
-    return f"Marked '{activity.title}' as complete ({claim.credits} cr)."
+    return f"Marked '{activity.title}' as complete ({earned_credits:.1f} credits earned). Your remaining credits needed: {user.remaining_credits:.1f}."
 
 
 def execute_tool_call(tool_name: str, args: Dict[str, Any], session: Session, user: User) -> str:

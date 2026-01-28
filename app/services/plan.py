@@ -412,6 +412,9 @@ class PlanManager:
             run.status = "stale"
             run.reason = reason
             session.add(run)
+        # CRITICAL: Commit the stale status to DB so next session sees it
+        session.commit()
+        LOGGER.info(f"[PLAN INVALIDATION] Marked {len(runs)} plan(s) as stale for user {user_id}, reason: {reason}")
 
     def latest_run(self, user_id: int, mode: str) -> Optional[PlanRun]:
         stmt = (
@@ -551,28 +554,34 @@ class PlanManager:
             if _is_pip_activity(activity):
                 requirement_tags.add("pip")
 
-            eligible = is_eligible(user, activity)
-            missing_profile_data = False
-            if activity.eligible_institutions and not (user.affiliations or []):
-                missing_profile_data = True
-            if activity.eligible_groups and not getattr(user, "training_level", None):
-                missing_profile_data = True
-            if activity.membership_required and not (user.memberships or []):
-                missing_profile_data = True
-            if not eligible:
-                eligibility_status = "ineligible"
-            elif missing_profile_data or (
-                activity.eligibility_text
-                and not (
-                    activity.eligible_institutions
-                    or activity.eligible_groups
-                    or activity.membership_required
-                    or getattr(activity, "open_to_public", False)
-                )
-            ):
-                eligibility_status = "uncertain"
+            # FIX: Preserve existing eligibility status if it was manually set
+            # If the item has a specific status in the DB, trust it over re-calculation
+            if item.eligibility_status and item.eligibility_status in ["eligible", "ineligible"]:
+                eligibility_status = item.eligibility_status
             else:
-                eligibility_status = "eligible"
+                eligible = is_eligible(user, activity)
+                missing_profile_data = False
+                if activity.eligible_institutions and not (user.affiliations or []):
+                    missing_profile_data = True
+                if activity.eligible_groups and not getattr(user, "training_level", None):
+                    missing_profile_data = True
+                if activity.membership_required and not (user.memberships or []):
+                    missing_profile_data = True
+                if not eligible:
+                    eligibility_status = "ineligible"
+                elif missing_profile_data or (
+                    activity.eligibility_text
+                    and not (
+                        activity.eligible_institutions
+                        or activity.eligible_groups
+                        or activity.membership_required
+                        or getattr(activity, "open_to_public", False)
+                    )
+                ):
+                    eligibility_status = "uncertain"
+                else:
+                    eligibility_status = "eligible"
+
 
             committed_entries.append(
                 {
@@ -781,6 +790,11 @@ class PlanManager:
             if _is_pip_activity(activity):
                 requirement_tags.add("pip")
 
+            # CRITICAL: Refresh activity from DB to ensure we have latest eligibility data
+            # This is needed because activities may have been updated (e.g., open_to_public set to True)
+            # after they were loaded into memory during plan recommendation
+            self.session.refresh(activity)
+            
             eligible = is_eligible(user, activity)
             missing_profile_data = False
             if activity.eligible_institutions and not (user.affiliations or []):
@@ -803,6 +817,9 @@ class PlanManager:
                 status = "uncertain"
             else:
                 status = "eligible"
+            
+            # DEBUG: Log eligibility calculation for troubleshooting
+            LOGGER.info(f"[ELIGIBILITY CALC] Activity '{activity.title}' (id={activity.id}): is_eligible={eligible}, open_to_public={activity.open_to_public}, eligibility_text='{activity.eligibility_text}' -> status='{status}'")
 
             plan_items.append(
                 _build_plan_item(

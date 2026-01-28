@@ -31,7 +31,10 @@ def _get_embedding_model():
             _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
         except ImportError:
             logger.error("sentence-transformers not installed. Run: pip install sentence-transformers")
-            raise
+            return None
+        except Exception as e:
+            logger.exception("Failed to load embedding model: %s", e)
+            return None
     return _embedding_model
 
 
@@ -63,12 +66,18 @@ def _get_collection():
 def embed_text(text: str) -> List[float]:
     """Generate embedding for a single text string."""
     model = _get_embedding_model()
+    if model is None:
+        logger.warning("Embedding model unavailable. Returning empty embedding.")
+        return []
     return model.encode(text, convert_to_numpy=True).tolist()
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     """Generate embeddings for multiple texts (batched for efficiency)."""
     model = _get_embedding_model()
+    if model is None:
+        logger.warning("Embedding model unavailable. Returning empty embeddings.")
+        return []
     return model.encode(texts, convert_to_numpy=True).tolist()
 
 
@@ -162,10 +171,17 @@ def search(
       - tags: list of tags
       - score: similarity score (0-1, higher is better)
     """
-    collection = _get_collection()
+    try:
+        collection = _get_collection()
+    except Exception as e:
+        logger.exception("ChromaDB unavailable for search: %s", e)
+        return []
     
     # Generate query embedding
     query_embedding = embed_text(query)
+    if not query_embedding:
+        logger.warning("Empty query embedding. Returning no results.")
+        return []
     
     # Build where clause for filtering
     where = None

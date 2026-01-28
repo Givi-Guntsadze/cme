@@ -305,7 +305,16 @@
               // Scroll to bottom
               chatWindow.scrollTop = chatWindow.scrollHeight;
 
-              // Trigger plan refresh if needed
+              // Check if this was a credit-changing action (completion, etc.)
+              // If so, reload page to update sidebar credits and activity log
+              if (html.includes('credits earned') || html.includes('marked as complete')) {
+                setTimeout(function () {
+                  window.location.reload();
+                }, 1500); // Brief delay to show the message first
+                return;
+              }
+
+              // Trigger plan refresh for non-reload actions
               if (window.htmx) {
                 window.htmx.trigger(document.body, 'plan-refresh');
               }

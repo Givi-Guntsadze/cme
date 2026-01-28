@@ -1259,3 +1259,85 @@ body.chat-open .chat-drawer-toggle {
     opacity: 1;
   }
 }
+
+/* ===== HTMX Loading States ===== */
+/* Visual feedback when plan is being updated */
+.plan-card-container.htmx-request {
+  opacity: 0.6;
+  pointer-events: none;
+  position: relative;
+}
+
+.plan-card-container.htmx-request::after {
+  content: "Updating...";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--color-primary);
+  color: var(--color-text-inverse);
+  padding: 12px 24px;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 0.95rem;
+  box-shadow: 0 10px 30px rgba(59, 130, 246, 0.4);
+  z-index: 10;
+  animation: pulseLoad 1.2s ease-in-out infinite;
+}
+
+@keyframes pulseLoad {
+
+  0%,
+  100% {
+    opacity: 0.9;
+    transform: translate(-50%, -50%) scale(1);
+  }
+
+  50% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1.02);
+  }
+}
+
+/* Fade-in animation for newly loaded content */
+.plan-card-container.htmx-settling>* {
+  animation: fadeInUp 0.3s ease-out;
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Button loading states */
+.btn-primary.htmx-request,
+.btn-secondary.htmx-request {
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.btn-primary.htmx-request::after,
+.btn-secondary.htmx-request::after {
+  content: "...";
+  margin-left: 4px;
+  animation: dotPulse 1s infinite;
+}
+
+@keyframes dotPulse {
+
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}

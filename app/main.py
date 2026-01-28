@@ -144,13 +144,7 @@ def _maybe_nudge_requirements(
 
 
 def _queue_substitute_prompt(session, user: User, activity: Activity) -> None:
-    title = activity.title or "that activity"
-    prompt = (
-        f"Removed {title}. To swap it out, what matters most — covering ABPN gaps, "
-        "keeping travel light, staying under a budget, or something else? "
-        "I can tap national CME listings and recent conference calendars once you point me in the right direction."
-    )
-    session.add(AssistantMessage(user_id=user.id, role="assistant", content=prompt))
+    # SILENT: Only send the internal signal to trigger the search, no chat message
     session.add(
         AssistantMessage(
             user_id=user.id,
@@ -1581,6 +1575,7 @@ def _handle_plan_reject(
             )
         PlanManager.invalidate_user_plans(session, user.id, reason="plan_reject")
         if find_substitute and activity:
+             # SILENT SIGNAL: Triggers search without chat message
             _queue_substitute_prompt(session, user, activity)
             chat_refresh = True
         session.commit()
@@ -1594,12 +1589,13 @@ def _handle_plan_reject(
             force_refresh=True,
             reason="plan_reject",
         )
-        nudged = _maybe_nudge_requirements(session, user, plan_requirements)
-        if nudged:
-            session.commit()
-            chat_refresh = True
-        if chat_refresh:
-            response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
+        # REMOVED: Don't nudge via chat when user clicks buttons
+        # nudged = _maybe_nudge_requirements(session, user, plan_requirements)
+        # if nudged:
+        #     session.commit()
+        #     chat_refresh = True
+        # if chat_refresh:
+        #     response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
         return response
 
 
@@ -1638,10 +1634,11 @@ def plan_accept_all(request: Request):
             force_refresh=True,
             reason="accept_all",
         )
-        nudged = _maybe_nudge_requirements(session, user, plan_requirements)
-        if nudged:
-            session.commit()
-            response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
+        # REMOVED: Don't nudge via chat when user clicks buttons
+        # nudged = _maybe_nudge_requirements(session, user, plan_requirements)
+        # if nudged:
+        #     session.commit()
+        #     response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
         return response
 
 
@@ -1679,7 +1676,8 @@ def plan_reject_all(request: Request):
                 record_message=False,
             )
         PlanManager.invalidate_user_plans(session, user.id, reason="reject_all")
-        _queue_plan_reset_prompt(session, user, titles)
+        # REMOVED: Don't add chat messages when user clicks buttons
+        # _queue_plan_reset_prompt(session, user, titles)
         session.commit()
     with get_session() as session:
         user = session.exec(select(User)).first()
@@ -1691,10 +1689,11 @@ def plan_reject_all(request: Request):
             force_refresh=True,
             reason="reject_all",
         )
-        nudged = _maybe_nudge_requirements(session, user, plan_requirements)
-        if nudged:
-            session.commit()
-        response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
+        # REMOVED: Don't nudge via chat when user clicks buttons  
+        # nudged = _maybe_nudge_requirements(session, user, plan_requirements)
+        # if nudged:
+        #     session.commit()
+        # response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
         return response
 
 
@@ -2515,8 +2514,17 @@ def _state_snapshot(session, user: User) -> dict:
         run = pm.ensure_plan(user, "balanced", policy_bundle=None)
         items = session.exec(select(PlanItem).where(PlanItem.plan_run_id == run.id).order_by(PlanItem.position)).all()
         logger.info(f"_state_snapshot: Found {len(items)} plan items for run {run.id}")
-        plan_summary = [f"{i.position}. {i.activity.title} (${i.activity.cost_usd}) [{'Committed' if i.committed else 'Candidate'}]" for i in items if i.activity]
-        logger.info(f"_state_snapshot: plan_summary = {plan_summary[:3]}...")
+        
+        # Fetch activities for each item
+        plan_summary = []
+        for i in items:
+            if i.activity_id:
+                activity = session.get(Activity, i.activity_id)
+                if activity:
+                    status = 'Committed' if i.committed else 'Candidate'
+                    plan_summary.append(f"{i.position}. {activity.title} (${activity.cost_usd}) [{status}]")
+        
+        logger.info(f"_state_snapshot: plan_summary has {len(plan_summary)} items")
     except Exception as e:
         logger.exception(f"_state_snapshot error: {e}")
         plan_summary = ["(No plan available)"]
