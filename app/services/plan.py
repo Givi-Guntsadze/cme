@@ -756,12 +756,15 @@ class PlanManager:
             
             eligible = is_eligible(user, activity)
             missing_profile_data = False
-            if activity.eligible_institutions and not (user.affiliations or []):
-                missing_profile_data = True
-            if activity.eligible_groups and not getattr(user, "training_level", None):
-                missing_profile_data = True
-            if activity.membership_required and not (user.memberships or []):
-                missing_profile_data = True
+            # Only check for missing profile data if the activity is NOT open to the public
+            # If it is open to the public, we don't need to flag uncertainty based on profile data
+            if not getattr(activity, "open_to_public", False):
+                if activity.eligible_institutions and not (user.affiliations or []):
+                    missing_profile_data = True
+                if activity.eligible_groups and not getattr(user, "training_level", None):
+                    missing_profile_data = True
+                if activity.membership_required and not (user.memberships or []):
+                    missing_profile_data = True
             if not eligible:
                 status = "ineligible"
             elif missing_profile_data or (

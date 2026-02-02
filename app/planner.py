@@ -548,6 +548,10 @@ def build_plan(
     total_credits = 0.0
     total_cost = 0.0
     days_used = 0
+    pricing_cache: Dict[int, Dict[str, Any]] = {}  # Cache pricing context per activity
+    provider_counts: Dict[str, int] = {}  # Track provider diversity
+    modality_counts: Dict[str, int] = {}  # Track modality diversity
+    topic_counts: Dict[str, int] = {}  # Track topic diversity
 
     mode_key = "standard"
     config = STANDARD_CONFIG
