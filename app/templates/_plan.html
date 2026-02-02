@@ -1,4 +1,7 @@
 <section class="plan-card">
+  <div id="plan-loading-indicator" class="plan-loading-overlay">
+    <span class="plan-loading-text">🔍 Searching for substitute...</span>
+  </div>
   <div class="plan-card-header">
     <div>
       <h3>Recommended Plan</h3>
@@ -53,7 +56,8 @@
     {% if p.modality %}
     {% set icon_ns.text = p.modality[0]|upper %}
     {% endif %}
-    <li class="plan-item{% if p.committed %} plan-item-committed{% endif %}">
+    <li
+      class="plan-item{% if p.committed %} plan-item-committed{% endif %}{% if p.newly_added %} newly-added{% endif %}">
       <div class="plan-item-header">
         <div class="plan-item-info">
           <div class="plan-item-icon" aria-hidden="true">{{ icon_ns.text }}</div>
@@ -128,8 +132,9 @@
         <div class="plan-item-actions">
           <button type="button" class="linklike" hx-post="/plan/reject/{{ p.activity_id }}" hx-target="#plan-card"
             hx-swap="innerHTML" title="Remove this activity from the plan">Remove</button>
-          <button type="button" class="linklike" hx-post="/plan/reject_with_substitute/{{ p.activity_id }}"
-            hx-target="#plan-card" hx-swap="innerHTML"
+          <button type="button" class="linklike substitute-btn"
+            hx-post="/plan/reject_with_substitute/{{ p.activity_id }}" hx-target="#plan-card" hx-swap="innerHTML"
+            hx-indicator="#plan-loading-indicator"
             title="Remove this activity and ask the assistant to find alternatives">Remove &amp; find
             substitute</button>
         </div>
@@ -139,8 +144,9 @@
             hx-swap="innerHTML" title="Accept this activity into your plan">Accept</button>
           <button type="button" class="linklike" hx-post="/plan/reject/{{ p.activity_id }}" hx-target="#plan-card"
             hx-swap="innerHTML" title="Reject this suggestion">Reject</button>
-          <button type="button" class="linklike" hx-post="/plan/reject_with_substitute/{{ p.activity_id }}"
-            hx-target="#plan-card" hx-swap="innerHTML" title="Reject and ask the assistant to find a substitute">Reject
+          <button type="button" class="linklike substitute-btn"
+            hx-post="/plan/reject_with_substitute/{{ p.activity_id }}" hx-target="#plan-card" hx-swap="innerHTML"
+            hx-indicator="#plan-loading-indicator" title="Reject and ask the assistant to find a substitute">Reject
             &amp; find substitute</button>
         </div>
         {% endif %}

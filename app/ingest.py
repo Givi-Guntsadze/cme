@@ -57,20 +57,41 @@ def safe_json_loads(text: str) -> Optional[dict]:
         return None
 
 
-def fetch_page(url: str, timeout: int = 20) -> Optional[str]:
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; CMEBot/1.0)"}
-        if url in _page_cache:
-            return _page_cache[url]
-        r = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
-        if r.status_code == 200:
-            _page_cache[url] = r.text
-            return r.text
-        logger.info("page fetch non-200 for %s: %s", _redact_key(url), r.status_code)
-        return None
-    except Exception as e:
-        logger.exception("page fetch failed: %s", _redact_key(f"{url} {e}"))
-        return None
+def normalize_domain(domain: str) -> str:
+    """Normalize domain by removing www. prefix and lowercasing."""
+    d = (domain or "").strip().lower()
+    if d.startswith("www."):
+        d = d[4:]
+    return d
+
+
+def fetch_page(url: str, timeout: int = 30, retries: int = 1) -> Optional[str]:
+    import time
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; CMEBot/1.0)"}
+    if url in _page_cache:
+        return _page_cache[url]
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            r = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+            if r.status_code == 200:
+                _page_cache[url] = r.text
+                return r.text
+            logger.info("page fetch non-200 for %s: %s", _redact_key(url), r.status_code)
+            return None
+        except httpx.TimeoutException as e:
+            last_error = e
+            if attempt < retries:
+                wait_time = 2 ** attempt
+                logger.info("page fetch timeout for %s, retrying in %ds...", _redact_key(url), wait_time)
+                time.sleep(wait_time)
+                continue
+        except Exception as e:
+            logger.exception("page fetch failed: %s", _redact_key(f"{url} {e}"))
+            return None
+    if last_error:
+        logger.warning("page fetch timed out after %d retries: %s", retries, _redact_key(url))
+    return None
 
 
 def html_to_text(html: str) -> str:
@@ -127,7 +148,7 @@ def is_valid_record(r: Dict[str, Any]) -> bool:
         url = (r.get("url") or "").strip()
         if not provider and url:
             try:
-                provider = urlparse(url).netloc
+                provider = normalize_domain(urlparse(url).netloc)
                 if provider:
                     r["provider"] = provider
             except Exception:
@@ -917,8 +938,8 @@ def _insert_items(items: List[dict]) -> tuple[int, Dict[str, int]]:
                 title = (it.get("title") or "").strip()
                 provider_in = (it.get("provider") or "").strip()
                 url = (it.get("url") or "").strip() or None
-                # Fallback provider to domain if missing
-                provider = provider_in or (urlparse(url).netloc if url else "")
+                # Fallback provider to domain if missing (normalize to strip www.)
+                provider = provider_in or (normalize_domain(urlparse(url).netloc) if url else "")
                 credits_raw = it.get("credits")
                 try:
                     credits = float(credits_raw or 0)

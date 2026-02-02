@@ -52,24 +52,24 @@ async def run_website_crawler(
         "startUrls": [{"url": url} for url in urls],
         "maxCrawlDepth": max_crawl_depth,
         "maxPagesPerCrawl": max_pages,
-        "crawlerType": "playwright:firefox",
-        "includeUrlGlobs": [],
-        "excludeUrlGlobs": [],
-        "initialCookies": [],
+        "crawlerType": "playwright:adaptive",  # Adaptive is better for modern sites
         "proxyConfiguration": {"useApifyProxy": True},
-        "removeElementsCssSelector": "nav, footer, script, style, noscript, svg",
-        "clickElementsCssSelector": "",
+        "removeElementsCssSelector": "nav, footer, script, style, noscript, svg, img[src^='data:'], [role=\"alert\"], [role=\"banner\"], [role=\"dialog\"], [role=\"alertdialog\"], [role=\"region\"][aria-label*=\"skip\" i], [aria-modal=\"true\"]",
+        "clickElementsCssSelector": "[aria-expanded=\"false\"]",
         "htmlTransformer": "readableText",
         "readableTextCharThreshold": 100,
         "aggressivePrune": False,
         "debugMode": False,
         "debugLog": False,
         "saveHtml": False,
-        "saveMarkdown": True,
+        "saveMarkdown": True,     # We prefer markdown for LLM processing
         "saveFiles": False,
         "saveScreenshots": False,
         "maxScrollHeightPixels": 5000,
-        "dynamicContentWaitSecs": 10,
+        "clientSideMinChangePercentage": 15,
+        "renderingTypeDetectionPercentage": 10,
+        "removeCookieWarnings": True,
+        "expandIframes": True,
     }
 
     async with httpx.AsyncClient(timeout=120.0) as client:

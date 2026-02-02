@@ -936,6 +936,7 @@ class PlanManager:
                         (item.requirement_snapshot or {}).get("requirement_priority")
                     ),
                     "committed": bool(item.committed),
+                    "newly_added": (datetime.utcnow() - item.generated_at).total_seconds() < 10 if item.generated_at else False,
                 }
             )
 

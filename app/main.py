@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request, Form, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -30,7 +30,9 @@ from .models import (
     AssistantMessage,
     Activity,
     PlanItem,
+    PlanRun,
     CompletedActivity,
+    ScrapeSource,
 )
 from .requirements import (
     load_abpn_psychiatry_requirements,
@@ -1593,7 +1595,11 @@ def _handle_plan_reject(
             force_refresh=True,
             reason="plan_reject",
         )
-        # REMOVED: Don't nudge via chat when user clicks buttons
+        # Show toast when substitute search is triggered
+        if find_substitute:
+            response.headers["HX-Trigger"] = json.dumps({
+                "showToast": {"message": "🔍 Searching for alternatives... New activities will appear shortly.", "type": "info"}
+            })
         return response
 
 
@@ -1603,9 +1609,17 @@ def plan_accept_all(request: Request):
         user = session.exec(select(User)).first()
         if not user:
             return HTMLResponse("", status_code=204)
-        plan_manager = PlanManager(session)
-        policy_bundle = load_policy_bundle(session, user)
-        run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+        # Get existing active run WITHOUT rebuilding to preserve all items
+        run = session.exec(
+            select(PlanRun)
+            .where(PlanRun.user_id == user.id, PlanRun.status == "active")
+            .order_by(PlanRun.generated_at.desc())
+        ).first()
+        if not run:
+            # No active run exists, create one first
+            plan_manager = PlanManager(session)
+            policy_bundle = load_policy_bundle(session, user)
+            run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
         items = list(
             session.exec(
                 select(PlanItem)
@@ -1620,8 +1634,10 @@ def plan_accept_all(request: Request):
                 session.add(item)
                 changed = True
         if changed:
-            PlanManager.invalidate_user_plans(session, user.id, reason="accept_all")
-        session.commit()
+            # Don't invalidate - just commit the changes to preserve them
+            session.commit()
+        else:
+            session.commit()
     with get_session() as session:
         user = session.exec(select(User)).first()
         response, plan_requirements = _prepare_plan_fragment(
@@ -1629,14 +1645,9 @@ def plan_accept_all(request: Request):
             session,
             user,
             plan_mode="balanced",
-            force_refresh=True,
+            force_refresh=False,  # Don't force refresh - show updated items
             reason="accept_all",
         )
-        # REMOVED: Don't nudge via chat when user clicks buttons
-        # nudged = _maybe_nudge_requirements(session, user, plan_requirements)
-        # if nudged:
-        #     session.commit()
-        #     response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
         return response
 
 
@@ -1646,9 +1657,17 @@ def plan_reject_all(request: Request):
         user = session.exec(select(User)).first()
         if not user:
             return HTMLResponse("", status_code=204)
-        plan_manager = PlanManager(session)
-        policy_bundle = load_policy_bundle(session, user)
-        run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
+        # Get existing active run WITHOUT rebuilding to preserve all items
+        run = session.exec(
+            select(PlanRun)
+            .where(PlanRun.user_id == user.id, PlanRun.status == "active")
+            .order_by(PlanRun.generated_at.desc())
+        ).first()
+        if not run:
+            # No active run exists, create one first
+            plan_manager = PlanManager(session)
+            policy_bundle = load_policy_bundle(session, user)
+            run = plan_manager.ensure_plan(user, "balanced", policy_bundle)
         items = list(
             session.exec(
                 select(PlanItem)
@@ -1674,8 +1693,6 @@ def plan_reject_all(request: Request):
                 record_message=False,
             )
         PlanManager.invalidate_user_plans(session, user.id, reason="reject_all")
-        # REMOVED: Don't add chat messages when user clicks buttons
-        # _queue_plan_reset_prompt(session, user, titles)
         session.commit()
     with get_session() as session:
         user = session.exec(select(User)).first()
@@ -1687,11 +1704,6 @@ def plan_reject_all(request: Request):
             force_refresh=True,
             reason="reject_all",
         )
-        # REMOVED: Don't nudge via chat when user clicks buttons  
-        # nudged = _maybe_nudge_requirements(session, user, plan_requirements)
-        # if nudged:
-        #     session.commit()
-        # response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
         return response
 
 
@@ -2587,7 +2599,7 @@ def policy_clear_get():
 
 
 @app.post("/source/monitor")
-def source_monitor(request: Request, url: str = Form(...)):
+def source_monitor(request: Request, url: str = Form(...), background_tasks: BackgroundTasks = None):
     """
     Add a URL to the monitored sources for Apify scraping.
     
@@ -2623,15 +2635,115 @@ def source_monitor(request: Request, url: str = Form(...)):
                 domain=domain,
                 url=base_url,
                 enabled=True,
+                last_crawled=datetime.utcnow(),
             )
             session.add(new_source)
             session.commit()
             
+            # Trigger background crawl
+            # Note: User must be running with --workers or standard async loop for this to not block completely, 
+            # but since crawl_and_extract_activities is async, it should be fine.
+            if background_tasks:
+                background_tasks.add_task(run_crawl_background, base_url, domain)
+            
             return JSONResponse({
                 "status": "success",
                 "domain": domain,
-                "message": f"Now monitoring '{domain}'. New activities will appear after the next scheduled crawl."
+                "message": f"Now monitoring '{domain}'. Deep crawl started in background."
             })
     except Exception as e:
         logger.exception("Failed to add monitored source")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def run_crawl_background(url: str, domain: str):
+    """Background task to crawl a URL and ingest activities."""
+    logger.info(f"Starting background crawl for {url}")
+    try:
+        from .services.scraper import crawl_and_extract_activities
+        from .ingest import _insert_items
+        
+        # 1. Run the crawler (waits for completion)
+        activities = await crawl_and_extract_activities([url])
+        
+        if not activities:
+            logger.warning(f"Background crawl yielded no activities for {url}")
+            return
+
+        # 2. Convert Activity models to dicts for _insert_items
+        items_data = []
+        for act in activities:
+            # act is a SQLModel, .model_dump() gives a dict
+            data = act.model_dump()
+            items_data.append(data)
+            
+        # 3. Insert into DB (deduplicates by title/provider)
+        inserted, _ = _insert_items(items_data)
+        logger.info(f"Background crawl for {domain} finished. Inserted {inserted} new activities.")
+        
+        # 4. Update ScrapeSource.last_crawled
+        with get_session() as session:
+            source = session.exec(
+                select(ScrapeSource).where(ScrapeSource.domain == domain)
+            ).first()
+            if source:
+                source.last_crawled = datetime.utcnow()
+                session.add(source)
+                session.commit()
+                
+    except Exception:
+        logger.exception(f"Background crawl failed for {url}")
+
+
+@app.post("/webhook/apify")
+async def apify_webhook(request: Request):
+    """
+    Handle Apify actor run completion webhooks.
+    Expected payload: { "eventType": "ACTOR.RUN.SUCCEEDED", "resource": { "id": "RUN_ID", ... } }
+    """
+    try:
+        payload = await request.json()
+        event_type = payload.get("eventType")
+        resource = payload.get("resource", {})
+        run_id = resource.get("id")
+        
+        if event_type != "ACTOR.RUN.SUCCEEDED" or not run_id:
+            logger.info(f"Ignored Apify webhook: {event_type} run={run_id}")
+            return JSONResponse({"status": "ignored"})
+            
+        logger.info(f"Received Apify success webhook for run {run_id}")
+        
+        # We can reuse the same logic as background crawl, but starting from fetch
+        from .services.scraper import fetch_actor_results, normalize_to_activity
+        from .ingest import _insert_items
+        
+        # Fetch results
+        raw_items = await fetch_actor_results(run_id)
+        if not raw_items:
+            logger.warning(f"Webhook: no results for run {run_id}")
+            return JSONResponse({"status": "no_results"})
+            
+        activities = []
+        for item in raw_items:
+            url = item.get("url", "")
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(url).netloc or "unknown"
+            except Exception:
+                domain = "unknown"
+            
+            act = normalize_to_activity(item, source_domain=domain)
+            if act:
+                activities.append(act)
+                
+        if activities:
+            items_data = [act.model_dump() for act in activities]
+            inserted, _ = _insert_items(items_data)
+            logger.info(f"Webhook: Inserted {inserted} activities from run {run_id}")
+            return JSONResponse({"status": "processed", "inserted": inserted})
+            
+        return JSONResponse({"status": "processed", "inserted": 0})
+        
+    except Exception as e:
+        logger.exception("Apify webhook processing failed")
         return JSONResponse({"error": str(e)}, status_code=500)

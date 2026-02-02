@@ -1341,3 +1341,131 @@ body.chat-open .chat-drawer-toggle {
     opacity: 1;
   }
 }
+
+/* Plan loading overlay for substitute actions */
+.plan-loading-overlay {
+  display: none;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.85);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+  border-radius: 18px;
+}
+
+[data-theme="dark"] .plan-loading-overlay {
+  background: rgba(31, 41, 55, 0.9);
+}
+
+.plan-loading-overlay.htmx-request {
+  display: flex;
+}
+
+.plan-loading-text {
+  background: var(--color-surface);
+  padding: 16px 24px;
+  border-radius: 14px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--color-text);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+
+  50% {
+    transform: scale(1.02);
+    opacity: 0.85;
+  }
+}
+
+/* Ensure plan-card has relative positioning for overlay */
+.plan-card {
+  position: relative;
+}
+
+/* Highlight newly added activities */
+.plan-item.newly-added {
+  animation: highlightNew 2s ease-out;
+}
+
+@keyframes highlightNew {
+  0% {
+    background: var(--color-success-soft);
+    transform: scale(1.01);
+  }
+
+  100% {
+    background: var(--color-surface);
+    transform: scale(1);
+  }
+}
+
+/* Toast notification system */
+.toast-container {
+  position: fixed;
+  top: 24px;
+  right: 24px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  pointer-events: none;
+}
+
+.toast {
+  background: var(--color-surface);
+  border-radius: 14px;
+  padding: 16px 20px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--color-border);
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--color-text);
+  transform: translateX(120%);
+  opacity: 0;
+  transition: transform 0.3s ease, opacity 0.3s ease;
+  pointer-events: auto;
+  max-width: 380px;
+}
+
+.toast-visible {
+  transform: translateX(0);
+  opacity: 1;
+}
+
+.toast-hiding {
+  transform: translateX(120%);
+  opacity: 0;
+}
+
+.toast-info {
+  border-left: 4px solid var(--color-primary);
+}
+
+.toast-success {
+  border-left: 4px solid var(--color-success);
+}
+
+.toast-warning {
+  border-left: 4px solid var(--color-warning);
+}
+
+.toast-error {
+  border-left: 4px solid var(--color-danger);
+}
+
+.toast-message {
+  display: block;
+}

@@ -38,6 +38,10 @@
   <main class="app-root">
     {% block content %}{% endblock %}
   </main>
+
+  <!-- Toast notification container -->
+  <div id="toast-container" class="toast-container"></div>
+
   <script>
     (function () {
       var storageKey = "cme-theme";
@@ -89,6 +93,36 @@
         }
       });
     })();
+
+    // Toast notification system
+    window.showToast = function (message, type) {
+      type = type || 'info';
+      var container = document.getElementById('toast-container');
+      if (!container) return;
+
+      var toast = document.createElement('div');
+      toast.className = 'toast toast-' + type;
+      toast.innerHTML = '<span class="toast-message">' + message + '</span>';
+      container.appendChild(toast);
+
+      // Trigger animation
+      setTimeout(function () { toast.classList.add('toast-visible'); }, 10);
+
+      // Auto-dismiss after 5 seconds
+      setTimeout(function () {
+        toast.classList.remove('toast-visible');
+        toast.classList.add('toast-hiding');
+        setTimeout(function () { toast.remove(); }, 300);
+      }, 5000);
+    };
+
+    // Listen for HTMX showToast trigger
+    document.addEventListener('showToast', function (evt) {
+      var detail = evt.detail || {};
+      if (detail.message) {
+        window.showToast(detail.message, detail.type);
+      }
+    });
 
     // Handle ingest response from Discover button
     window.handleIngestResponse = function (btn, evt) {
