@@ -111,9 +111,11 @@
 
 ## Immediate Next Steps
 
-1. **Monitor Ingestion Results**
-   - Wait for Apify runs to finish (check Apify Console for run status of `apify/website-content-crawler`).
-   - Check `Activity` table in `cme.sqlite` for new items where `source='web'`.
+1. **Investigate Apify Integration Issues**
+   - User reported NO new runs appearing in Apify Console despite successful API calls.
+   - Verify `APIFY_TOKEN` matches the account being checked.
+   - Debug `app/services/scraper.py` logging to ensure API response is actually successful (currently assumes success).
+   - Check `Activity` table in `cme.sqlite` to see if ingestion happened silently (unlikely if runs aren't in console).
 
 2. **Implement RAG Connector**
    - Ensure the `vectordb.py` logic is correctly indexing the `web` activities (triggered at the end of `crawl_and_extract_activities`).
