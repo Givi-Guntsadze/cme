@@ -54,14 +54,7 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
     "culture": ["culture", "equity", "diversity", "inclusion", "bias"],
 }
 
-CHEAPEST = {
-    "diversity_w": 0.0,
-    "single_cap_ratio": 1.0,
-    "subscription_penalty": 0.1,
-    "topic_diversity_w": 0.0,
-}
-
-BALANCED = {
+STANDARD_CONFIG = {
     "diversity_w": 0.45,
     "topic_diversity_w": 0.45,
     "single_cap_ratio": 0.5,
@@ -556,16 +549,11 @@ def build_plan(
     total_cost = 0.0
     days_used = 0
 
-    mode_key = (mode or "").lower()
-    config = BALANCED if mode_key == "balanced" else CHEAPEST
-
-    provider_counts: Dict[str, int] = {}
-    modality_counts: Dict[str, int] = {}
-    topic_counts: Dict[str, int] = {}
-    pricing_cache: Dict[int, Dict[str, Any]] = {}
+    mode_key = "standard"
+    config = STANDARD_CONFIG
 
     def needs_more_balanced() -> bool:
-        return mode_key == "balanced" and len(chosen) < MIN_BALANCED_ITEMS
+        return len(chosen) < MIN_BALANCED_ITEMS
 
     while (total_credits < remaining_target or needs_more_balanced()) and activities:
         remaining_needed = max(remaining_target - total_credits, 0.0)
@@ -606,7 +594,8 @@ def build_plan(
                 if new_cost > budget_cap:
                     continue
 
-                if mode_key == "balanced" and current_remaining > 0:
+                # Standard balanced logic for caps
+                if current_remaining > 0:
                     limit = config.get("single_cap_ratio", 1.0) * current_remaining
                     if limit > 0 and a.credits > limit and not ignore_cap:
                         skipped_for_cap = True
@@ -632,22 +621,19 @@ def build_plan(
                     topic = _infer_topic(a)
                     a._topic_tag = topic
 
-                if mode_key == "balanced":
-                    provider = (a.provider or "").lower()
-                    modality = (a.modality or "").lower()
-                    div_w = float(config.get("diversity_w") or 0.0)
-                    score += div_w * provider_counts.get(provider, 0)
-                    score += 0.5 * div_w * modality_counts.get(modality, 0)
-                    topic_w = float(config.get("topic_diversity_w") or 0.0)
-                    if topic_w:
-                        score += topic_w * topic_counts.get(topic, 0)
-                    if config.get("subscription_penalty") and _is_subscription(a):
-                        score += float(config.get("subscription_penalty") or 0.0)
-                    if effective_cost == 0.0:
-                        score += 0.6
-                else:
-                    if config.get("subscription_penalty") and _is_subscription(a):
-                        score += float(config.get("subscription_penalty") or 0.0)
+                # Always apply standard balanced scoring
+                provider = (a.provider or "").lower()
+                modality = (a.modality or "").lower()
+                div_w = float(config.get("diversity_w") or 0.0)
+                score += div_w * provider_counts.get(provider, 0)
+                score += 0.5 * div_w * modality_counts.get(modality, 0)
+                topic_w = float(config.get("topic_diversity_w") or 0.0)
+                if topic_w:
+                    score += topic_w * topic_counts.get(topic, 0)
+                if config.get("subscription_penalty") and _is_subscription(a):
+                    score += float(config.get("subscription_penalty") or 0.0)
+                if effective_cost == 0.0:
+                    score += 0.6
 
                 safety_activity = _is_patient_safety_activity(a)
                 sa_activity = _is_sa_cme_activity(a)
@@ -812,11 +798,11 @@ def build_plan_with_policy(
     modality_counts: Dict[str, int] = {}
     topic_counts: Dict[str, int] = {}
     pricing_cache: Dict[int, Dict[str, Any]] = {}
-    mode_key = (mode or "").lower()
-    config = BALANCED if mode_key == "balanced" else CHEAPEST
+    mode_key = "standard"
+    config = STANDARD_CONFIG
 
     def needs_more_balanced() -> bool:
-        return mode_key == "balanced" and len(chosen) < MIN_BALANCED_ITEMS
+        return len(chosen) < MIN_BALANCED_ITEMS
 
     while (total_credits < remaining_target or needs_more_balanced()) and activities:
         remaining_needed = max(remaining_target - total_credits, 0.0)

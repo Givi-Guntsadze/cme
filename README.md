@@ -81,3 +81,14 @@ git commit -m "msg"      # commit staged changes without the commit_editmsg prom
 - Expand requirement knowledge bases beyond ABPN psychiatry.
 - Teach the planner to balance multiple conference blocks per cycle automatically.
 - Add richer telemetry on discovery results (conversion rate, eligibility blockers).
+
+
+## Packer Prompt
+the prompt to give before ending a session with an agent:
+
+"I am switching devices. Update the context.md file in the root. Overwrite it with our current status. Be extremely specific about the 'Mental Stack' and 'Next Steps' so the next agent knows exactly where to resume without hallucinations. Save the file."
+
+## Unpacker Prompt
+the prompt to give before starting a session with a different agent:
+
+"Read context.md. Adopt the persona of the previous agent. Load the 'Mental Stack' into your context. Confirm you have read the 'Key Decisions' and then tell me the very first step from the 'Next Steps' list that we need to execute."

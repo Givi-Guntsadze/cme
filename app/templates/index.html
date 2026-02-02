@@ -295,7 +295,7 @@
               <span class="stat-pill">Budget ${{ user.budget_usd|int }}</span>
               {% endif %}
               <span class="stat-pill">Days off {{ user.days_off or 0 }}</span>
-              <span class="stat-pill">Mode {{ current_mode|capitalize }}</span>
+
               <span class="stat-pill">Live {{ 'Yes' if user.allow_live else 'No' }}</span>
             </div>
             {% if is_dev %}
@@ -303,26 +303,7 @@
             {% endif %}
           </div>
         </header>
-        {% if policy_status and policy_status|length > 0 %}
-        <div class="policy-banner">
-          <div class="policy-label">
-            <span class="badge">Policy active</span>
-            {% for p in policy_status %}
-            <span class="policy-pill">
-              {{ p.mode|capitalize }}{% if p.hours_left is not none %} · {{ p.hours_left }}h{% endif %}
-            </span>
-            {% endfor %}
-          </div>
-          <div class="policy-actions">
-            <button type="button" class="btn-secondary" hx-post="/policy/clear" hx-swap="none"
-              hx-on::after-request="window.location.reload()">Clear policy</button>
-            <form hx-post="/policy/clear" hx-target="#chat-window" hx-swap="beforeend"
-              hx-on::after-request="const el=document.getElementById('chat-window'); if (el) { el.scrollTop = el.scrollHeight; }">
-              <button type="submit" class="linklike">Clear via chat</button>
-            </form>
-          </div>
-        </div>
-        {% endif %}
+
         {% set added = request.query_params.get('added') %}
         {% set gcount = request.query_params.get('gcount') %}
         {% set acount = request.query_params.get('acount') %}
@@ -338,9 +319,8 @@
           <div class="ingest-notice ingest-error">{{ error }}</div>
           {% endif %}
         </div>
-        <div id="plan-card" class="plan-card-container" data-plan-mode="{{ current_mode }}"
-          hx-get="/fragment/plan?mode={{ current_mode }}" hx-trigger="plan-refresh from:body" hx-target="this"
-          hx-swap="innerHTML" hx-vals='{"refresh":"1"}'>
+        <div id="plan-card" class="plan-card-container" hx-get="/fragment/plan" hx-trigger="plan-refresh from:body"
+          hx-target="this" hx-swap="innerHTML" hx-vals='{"refresh":"1"}'>
           {% include '_plan.html' %}
         </div>
       </section>

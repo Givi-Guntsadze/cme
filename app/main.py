@@ -1276,7 +1276,8 @@ def _derive_controls(
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    plan_mode = "balanced"
+    # Enforce standard mode
+    plan_mode = "standard"
 
     policy_status_entries: list[dict[str, object]] = []
 
@@ -1328,6 +1329,7 @@ def home(request: Request):
 
         plan_manager = PlanManager(session)
         policy_bundle = load_policy_bundle(session, user)
+        # Simplify policy lookup
         active_policy = policy_for_mode(policy_bundle, plan_mode)
         policy_status_entries = []
         for entry in active_policy_status(session, user):
@@ -1404,8 +1406,8 @@ def home(request: Request):
 
 @app.get("/fragment/plan", response_class=HTMLResponse)
 def plan_fragment(request: Request):
-    requested_mode = request.query_params.get("mode", "balanced").lower()
-    plan_mode = "cheapest" if requested_mode == "cheapest" else "balanced"
+    # Enforce standard mode
+    plan_mode = "standard"
     with get_session() as session:
         user = session.exec(select(User)).first()
         if not user:
@@ -1431,10 +1433,11 @@ def _prepare_plan_fragment(
     session,
     user: User,
     *,
-    plan_mode: str = "balanced",
+    plan_mode: str = "balanced",  # Keep signature for compatibility
     force_refresh: bool = True,
     reason: str | None = None,
 ):
+    plan_mode = "standard"  # Enforce single mode
     plan_manager = PlanManager(session)
     policy_bundle = load_policy_bundle(session, user)
     plan_run = plan_manager.ensure_plan(
@@ -1558,13 +1561,14 @@ def _handle_plan_reject(
         ).first()
         if not item:
             return _refresh_plan_fragment_response(
-                request, session, user, plan_mode="balanced", force_refresh=True
+                request, session, user, plan_mode="standard", force_refresh=True
             )
         activity = session.get(Activity, activity_id)
         if item.committed:
             item.committed = False
             session.add(item)
         if activity and activity.title:
+            # FIX: Plan is single-mode now, so a simple payload works for everything.
             payload = json.dumps({"remove_titles": [activity.title]})
             apply_policy_payloads(
                 [payload],
@@ -1585,17 +1589,11 @@ def _handle_plan_reject(
             request,
             session,
             user,
-            plan_mode="balanced",
+            plan_mode="standard",
             force_refresh=True,
             reason="plan_reject",
         )
         # REMOVED: Don't nudge via chat when user clicks buttons
-        # nudged = _maybe_nudge_requirements(session, user, plan_requirements)
-        # if nudged:
-        #     session.commit()
-        #     chat_refresh = True
-        # if chat_refresh:
-        #     response.headers["HX-Trigger"] = json.dumps({"chat-refresh": True})
         return response
 
 

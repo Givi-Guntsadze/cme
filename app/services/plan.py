@@ -167,7 +167,7 @@ def load_policy_bundle(session, user: User) -> Dict[str, Any]:
             .order_by(UserPolicy.created_at.desc())
         )
     )
-    result: Dict[str, Any] = {"by_mode": {}, "default": None}
+    result: Dict[str, Any] = {}
     changed = False
 
     for row in rows:
@@ -176,45 +176,22 @@ def load_policy_bundle(session, user: User) -> Dict[str, Any]:
             session.add(row)
             changed = True
             continue
+        
+        # Merge all active policies into one effective policy
         payload = row.payload or {}
-        if row.mode == "default":
-            if not result.get("default"):
-                result["default"] = payload
-        else:
-            if row.mode not in result["by_mode"]:
-                result["by_mode"][row.mode] = payload
+        result = _merge_policy_payload(result, payload)
 
     if changed:
         session.commit()
 
-    cleaned: Dict[str, Any] = {}
-    if result.get("by_mode"):
-        cleaned["by_mode"] = result["by_mode"]
-    if result.get("default"):
-        cleaned["default"] = result["default"]
-    return cleaned
+    return result
 
 
 def policy_for_mode(
     bundle: Optional[Dict[str, Any]], mode: str
 ) -> Optional[Dict[str, Any]]:
-    if not bundle:
-        return None
-    result: Optional[Dict[str, Any]] = None
-    by_mode = bundle.get("by_mode") if isinstance(bundle, dict) else None
-    if isinstance(by_mode, dict):
-        selected = by_mode.get(mode)
-        if isinstance(selected, dict):
-            result = selected
-    if not result:
-        default_policy = bundle.get("default") if isinstance(bundle, dict) else None
-        if isinstance(default_policy, dict):
-            result = default_policy
-    if not result and isinstance(bundle, dict):
-        fallback = {k: v for k, v in bundle.items() if k not in {"by_mode", "default"}}
-        if fallback:
-            result = fallback
-    return result
+    # Mode is ignored, return the single bundle
+    return bundle
 
 
 def apply_policy_payloads(
@@ -241,19 +218,15 @@ def apply_policy_payloads(
         if not isinstance(data, dict):
             continue
 
-        if "by_mode" in data and isinstance(data["by_mode"], dict):
-            for mode, rules in data["by_mode"].items():
-                if isinstance(rules, dict):
-                    entries.append((mode.lower(), rules))
-            continue
-
-        if "plan_mode" in data and isinstance(data["plan_mode"], str):
-            mode_key = data["plan_mode"].lower()
-            rules = {k: v for k, v in data.items() if k not in {"plan_mode", "by_mode"}}
-            entries.append((mode_key, rules))
-            continue
-
-        entries.append(("default", data))
+        if "by_mode" in data:
+             # Legacy: Flatten by_mode policies into main payload
+             legacy_modes = data.pop("by_mode")
+             if isinstance(legacy_modes, dict):
+                 for _, rules in legacy_modes.items():
+                     if isinstance(rules, dict):
+                         entries.append(("standard", rules))
+        
+        entries.append(("standard", data))
 
     if not entries:
         return
@@ -268,6 +241,8 @@ def apply_policy_payloads(
     active_by_mode: Dict[str, UserPolicy] = {
         (row.mode or "default"): row for row in active_policies
     }
+    # Since we are single-mode, there should ideally be only one active policy
+    # But filtering just in case
     preserved_remove_titles: List[str] = []
     if invalidate and active_policies:
         preserved_remove_titles = _dedupe_titles(
@@ -278,34 +253,27 @@ def apply_policy_payloads(
         for row in active_policies:
             row.active = False
             session.add(row)
-        active_by_mode = {}
         if preserved_remove_titles:
+            # Re-apply preserved titles to all incoming new payloads
             adjusted_entries: List[Tuple[str, Dict[str, Any]]] = []
             for mode, payload in entries:
                 if isinstance(payload, dict):
                     payload_copy = dict(payload)
-                    if "remove_titles" not in payload_copy:
-                        payload_copy["remove_titles"] = preserved_remove_titles
+                    current = payload_copy.get("remove_titles")
+                    if isinstance(current, list):
+                        payload_copy["remove_titles"] = _dedupe_titles(
+                            current, preserved_remove_titles
+                        )
                     else:
-                        current = payload_copy.get("remove_titles")
-                        if current is None:
-                            payload_copy["remove_titles"] = preserved_remove_titles
-                        elif isinstance(current, list):
-                            if current:
-                                payload_copy["remove_titles"] = _dedupe_titles(
-                                    current, preserved_remove_titles
-                                )
-                            else:
-                                payload_copy["remove_titles"] = []
-                        else:
-                            payload_copy["remove_titles"] = preserved_remove_titles
+                        payload_copy["remove_titles"] = preserved_remove_titles
                     adjusted_entries.append((mode, payload_copy))
                 else:
                     adjusted_entries.append((mode, payload))
+            
             if adjusted_entries:
                 entries = adjusted_entries
             else:
-                entries = [("default", {"remove_titles": preserved_remove_titles})]
+                entries = [("standard", {"remove_titles": preserved_remove_titles})]
 
     for mode, payload in entries:
         mode_key = (mode or "default") or "default"
@@ -427,18 +395,21 @@ class PlanManager:
     def ensure_plan(
         self,
         user: User,
-        mode: str,
-        policy_bundle: Optional[Dict[str, Any]],
+        mode: str = "balanced",  # Keep kwarg for compat but verify usage
+        policy_bundle: Optional[Dict[str, Any]] = None,
         force_refresh: bool = False,
         reason: Optional[str] = None,
     ) -> PlanRun:
-        run = self.latest_run(user.id, mode)
+        # Enforce single mode
+        effective_mode = "standard"
+        
+        run = self.latest_run(user.id, effective_mode)
         if run and not force_refresh and self._is_run_current(run, user):
             return run
 
         run = self._rebuild_run(
             user,
-            mode,
+            effective_mode,
             policy_bundle,
             reason,
             existing_run=run,
@@ -485,6 +456,7 @@ class PlanManager:
         existing_run: Optional[PlanRun] = None,
     ) -> PlanRun:
         plan_context = _compute_plan_context(self.session, user)
+        # Simplify policy lookup - just use what we have, flattened
         policy = policy_for_mode(policy_bundle, mode)
 
         committed_source_items: List[PlanItem] = []
@@ -499,19 +471,6 @@ class PlanManager:
                     .order_by(PlanItem.position.asc())
                 )
             )
-        if not committed_source_items and mode != "balanced":
-            anchor_run = self.latest_run(user.id, "balanced")
-            if anchor_run:
-                committed_source_items = list(
-                    self.session.exec(
-                        select(PlanItem)
-                        .where(
-                            PlanItem.plan_run_id == anchor_run.id,
-                            PlanItem.committed.is_(True),
-                        )
-                        .order_by(PlanItem.position.asc())
-                    )
-                )
 
         committed_entries: List[Dict[str, Any]] = []
         committed_ids: set[int] = set()
