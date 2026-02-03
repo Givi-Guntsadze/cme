@@ -57,6 +57,26 @@ pkill -f "uvicorn .*app.main:app" || true
 - **Templates**: Jinja + HTMX in `app/templates/` with styling in `static/style.css`. The plan card listens for a global `plan-refresh` event to reload fragments automatically.
 - **Database**: SQLite (`cme.sqlite`). See `app/db.py` for migrations.
 
+## ABPN Integration & Scraping
+We use a hybrid approach to ingest authoritative ABPN data:
+1. **Source of Truth**: The ABPN "Approved CC Activities" list (dynamically loaded).
+   - Use `python scripts/scrape_abpn_playwright.py` to automate browsing and extracting the latest list of approved URLS to `data/abpn_urls.txt`.
+   - Use `python scripts/extract_abpn_sources.py` if you have a raw HTML dump (`abpn_raw.html`).
+
+2. **Apify Crawling**:
+   - We use the `website-content-crawler` actor via Apify to deep-crawl the provider URLs.
+   - Run the batch crawler: `python scripts/crawl_all_sources.py` (processes `data/abpn_urls.txt`).
+   - This script uses **Smart Batching** (max 3 concurrent runs) to avoid hitting Apify's 32GB memory limit.
+
+3. **AI Extraction & Ingestion**:
+   - Apify results are raw markdown. We use `gpt-4o-mini` to extract structured CME data (credits, cost, dates).
+   - Ingest non-empty runs: `python scripts/ingest_apify_runs.py [RUN_ID1] [RUN_ID2]`.
+   - Or list recent runs: `python scripts/ingest_apify_runs.py --list`.
+
+4. **Activity Catalog**:
+   - Browse the ingested database at (**http://localhost:8000/catalog-page**).
+   - The AI assistant can search this catalog ("Find me SA-CME activities") before falling back to Google search.
+
 ## Testing
 ```bash
 pytest

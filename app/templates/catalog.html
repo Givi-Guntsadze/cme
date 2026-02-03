@@ -1,0 +1,318 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="catalog-page">
+  <header class="catalog-header">
+    <div class="catalog-title-row">
+      <h1>📚 CME Activity Catalog</h1>
+      <a href="/" class="back-link">← Back to Dashboard</a>
+    </div>
+    <p class="catalog-subtitle">Browse all {{ total }} CME activities in your database</p>
+  </header>
+
+  <div class="catalog-filters">
+    <form id="filter-form" method="get" action="/catalog-page">
+      <div class="filter-row">
+        <input type="text" name="search" placeholder="Search activities..." value="{{ search or '' }}" class="filter-input" />
+        <select name="modality" class="filter-select">
+          <option value="">All Modalities</option>
+          <option value="online" {% if modality == 'online' %}selected{% endif %}>Online</option>
+          <option value="live" {% if modality == 'live' %}selected{% endif %}>Live</option>
+          <option value="hybrid" {% if modality == 'hybrid' %}selected{% endif %}>Hybrid</option>
+        </select>
+        <select name="source" class="filter-select">
+          <option value="">All Sources</option>
+          <option value="web" {% if source == 'web' %}selected{% endif %}>Web Scraped</option>
+          <option value="abpn" {% if source == 'abpn' %}selected{% endif %}>ABPN Approved</option>
+        </select>
+        <button type="submit" class="filter-btn">Apply Filters</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="catalog-stats">
+    <span class="stat-item">📊 Total: {{ total }}</span>
+    <span class="stat-item">🌐 Web: {{ web_count }}</span>
+    <span class="stat-item">✅ ABPN: {{ abpn_count }}</span>
+  </div>
+
+  <div class="catalog-table-wrapper">
+    <table class="catalog-table">
+      <thead>
+        <tr>
+          <th>Title</th>
+          <th>Provider</th>
+          <th>Credits</th>
+          <th>Cost</th>
+          <th>Modality</th>
+          <th>Source</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for activity in activities %}
+        <tr>
+          <td class="title-cell">
+            <div class="activity-title">{{ activity.title[:80] }}{% if activity.title|length > 80 %}...{% endif %}</div>
+            {% if activity.summary %}
+            <div class="activity-summary">{{ activity.summary[:100] }}{% if activity.summary|length > 100 %}...{% endif %}</div>
+            {% endif %}
+          </td>
+          <td>{{ activity.provider[:30] }}{% if activity.provider|length > 30 %}...{% endif %}</td>
+          <td class="credits-cell">{{ activity.credits or '-' }}</td>
+          <td class="cost-cell">{% if activity.cost_usd %}${{ "%.2f"|format(activity.cost_usd) }}{% else %}-{% endif %}</td>
+          <td><span class="modality-badge modality-{{ activity.modality or 'online' }}">{{ activity.modality or 'online' }}</span></td>
+          <td><span class="source-badge source-{{ activity.source or 'web' }}">{{ activity.source or 'web' }}</span></td>
+          <td>
+            {% if activity.url %}
+            <a href="{{ activity.url }}" target="_blank" class="action-link">View →</a>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="7" class="empty-state">No activities found. Try adjusting your filters or run a crawl.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if total > 50 %}
+  <div class="pagination">
+    <p>Showing {{ activities|length }} of {{ total }} activities</p>
+  </div>
+  {% endif %}
+</div>
+
+<style>
+  .catalog-page {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 2rem;
+  }
+
+  .catalog-header {
+    margin-bottom: 2rem;
+  }
+
+  .catalog-title-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+  }
+
+  .catalog-header h1 {
+    margin: 0;
+    font-size: 2rem;
+    color: var(--text-primary, #1a1a2e);
+  }
+
+  .back-link {
+    color: var(--accent, #4a90d9);
+    text-decoration: none;
+    font-weight: 500;
+  }
+
+  .back-link:hover {
+    text-decoration: underline;
+  }
+
+  .catalog-subtitle {
+    margin-top: 0.5rem;
+    color: var(--text-secondary, #666);
+  }
+
+  .catalog-filters {
+    background: var(--bg-secondary, #f8f9fa);
+    padding: 1rem;
+    border-radius: 12px;
+    margin-bottom: 1.5rem;
+  }
+
+  .filter-row {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+
+  .filter-input {
+    flex: 1;
+    min-width: 200px;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--border, #ddd);
+    border-radius: 8px;
+    font-size: 1rem;
+  }
+
+  .filter-select {
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--border, #ddd);
+    border-radius: 8px;
+    font-size: 1rem;
+    background: white;
+    min-width: 150px;
+  }
+
+  .filter-btn {
+    padding: 0.75rem 1.5rem;
+    background: var(--accent, #4a90d9);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+
+  .filter-btn:hover {
+    background: var(--accent-dark, #357abd);
+  }
+
+  .catalog-stats {
+    display: flex;
+    gap: 1.5rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+  }
+
+  .stat-item {
+    font-weight: 500;
+    color: var(--text-secondary, #666);
+  }
+
+  .catalog-table-wrapper {
+    overflow-x: auto;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  }
+
+  .catalog-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--bg-primary, white);
+  }
+
+  .catalog-table th {
+    background: var(--bg-secondary, #f8f9fa);
+    padding: 1rem;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-primary, #1a1a2e);
+    border-bottom: 2px solid var(--border, #ddd);
+  }
+
+  .catalog-table td {
+    padding: 1rem;
+    border-bottom: 1px solid var(--border, #eee);
+    vertical-align: top;
+  }
+
+  .catalog-table tr:hover {
+    background: var(--bg-hover, #f5f7fa);
+  }
+
+  .title-cell {
+    max-width: 400px;
+  }
+
+  .activity-title {
+    font-weight: 500;
+    color: var(--text-primary, #1a1a2e);
+  }
+
+  .activity-summary {
+    font-size: 0.85rem;
+    color: var(--text-secondary, #666);
+    margin-top: 0.25rem;
+  }
+
+  .credits-cell, .cost-cell {
+    text-align: center;
+    font-weight: 500;
+  }
+
+  .modality-badge, .source-badge {
+    display: inline-block;
+    padding: 0.25rem 0.75rem;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    text-transform: capitalize;
+  }
+
+  .modality-online { background: #e3f2fd; color: #1565c0; }
+  .modality-live { background: #e8f5e9; color: #2e7d32; }
+  .modality-hybrid { background: #fff3e0; color: #e65100; }
+
+  .source-web { background: #f3e5f5; color: #7b1fa2; }
+  .source-abpn { background: #e0f2f1; color: #00695c; }
+
+  .action-link {
+    color: var(--accent, #4a90d9);
+    text-decoration: none;
+    font-weight: 500;
+  }
+
+  .action-link:hover {
+    text-decoration: underline;
+  }
+
+  .empty-state {
+    text-align: center;
+    padding: 3rem !important;
+    color: var(--text-secondary, #666);
+  }
+
+  .pagination {
+    margin-top: 1rem;
+    text-align: center;
+    color: var(--text-secondary, #666);
+  }
+
+  /* Dark mode */
+  [data-theme="dark"] .catalog-page {
+    color: #e0e0e0;
+  }
+
+  [data-theme="dark"] .catalog-header h1 {
+    color: #fff;
+  }
+
+  [data-theme="dark"] .catalog-filters {
+    background: #2a2a3e;
+  }
+
+  [data-theme="dark"] .filter-input,
+  [data-theme="dark"] .filter-select {
+    background: #1a1a2e;
+    border-color: #3a3a5e;
+    color: #e0e0e0;
+  }
+
+  [data-theme="dark"] .catalog-table {
+    background: #1a1a2e;
+  }
+
+  [data-theme="dark"] .catalog-table th {
+    background: #2a2a3e;
+    color: #fff;
+    border-color: #3a3a5e;
+  }
+
+  [data-theme="dark"] .catalog-table td {
+    border-color: #2a2a3e;
+  }
+
+  [data-theme="dark"] .catalog-table tr:hover {
+    background: #252540;
+  }
+
+  [data-theme="dark"] .activity-title {
+    color: #fff;
+  }
+</style>
+{% endblock %}

@@ -1069,6 +1069,10 @@ def _insert_items(items: List[dict]) -> tuple[int, Dict[str, int]]:
                 if credits <= 0:
                     if exists and exists.credits:
                         credits = float(exists.credits)
+                    elif source_val == "abpn":
+                        # ABPN-approved activities may not have credit info in the list
+                        # Allow them with 0 credits - they'll be enriched later
+                        credits = 0.0
                     else:
                         continue
 

@@ -48,38 +48,50 @@ async def run_website_crawler(
         logger.error("APIFY_TOKEN not configured")
         return {"error": "APIFY_TOKEN not configured"}
 
+    # Debug: Log token prefix to verify it's loaded
+    logger.info("Using APIFY_TOKEN: %s...", token[:8] if len(token) > 8 else "SHORT")
+
     actor_input = {
         "startUrls": [{"url": url} for url in urls],
         "maxCrawlDepth": max_crawl_depth,
         "maxPagesPerCrawl": max_pages,
-        "crawlerType": "playwright:adaptive",  # Adaptive is better for modern sites
+        # GENTLE SETTINGS - prioritize compatibility over cleanliness
+        "crawlerType": "playwright:firefox",  # More stable for legacy sites
         "proxyConfiguration": {"useApifyProxy": True},
-        "removeElementsCssSelector": "nav, footer, script, style, noscript, svg, img[src^='data:'], [role=\"alert\"], [role=\"banner\"], [role=\"dialog\"], [role=\"alertdialog\"], [role=\"region\"][aria-label*=\"skip\" i], [aria-modal=\"true\"]",
-        "clickElementsCssSelector": "[aria-expanded=\"false\"]",
+        # Minimal stripping - let LLM handle the noise
+        "removeElementsCssSelector": "script, style, noscript, svg",
+        "clickElementsCssSelector": "",  # Don't try to expand things
         "htmlTransformer": "readableText",
-        "readableTextCharThreshold": 100,
+        "readableTextCharThreshold": 50,  # Lower threshold = more content
         "aggressivePrune": False,
         "debugMode": False,
         "debugLog": False,
         "saveHtml": False,
-        "saveMarkdown": True,     # We prefer markdown for LLM processing
+        "saveMarkdown": True,
         "saveFiles": False,
         "saveScreenshots": False,
-        "maxScrollHeightPixels": 5000,
-        "clientSideMinChangePercentage": 15,
-        "renderingTypeDetectionPercentage": 10,
+        "maxScrollHeightPixels": 3000,  # Less scrolling = fewer timeouts
+        "dynamicContentWaitSecs": 15,   # Wait longer for slow ASP.NET sites
         "removeCookieWarnings": True,
-        "expandIframes": True,
+        "expandIframes": False,  # Iframes often cause hangs
     }
+
+    api_url = f"{APIFY_API_BASE}/acts/{WEBSITE_CONTENT_CRAWLER_ACTOR}/runs"
+    logger.info("Calling Apify API: %s", api_url)
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         try:
             # Start the actor run
             response = await client.post(
-                f"{APIFY_API_BASE}/acts/{WEBSITE_CONTENT_CRAWLER_ACTOR}/runs",
+                api_url,
                 params={"token": token},
                 json=actor_input,
             )
+            
+            # Debug: Log full response details
+            logger.info("Apify response status: %s", response.status_code)
+            logger.debug("Apify response body: %s", response.text[:500] if response.text else "empty")
+            
             response.raise_for_status()
             data = response.json()
             run_id = data.get("data", {}).get("id")
@@ -88,7 +100,7 @@ async def run_website_crawler(
                 logger.error("No run_id returned from Apify: %s", data)
                 return {"error": "No run_id returned"}
 
-            logger.info("Started Apify run: %s", run_id)
+            logger.info("Started Apify run: %s for URLs: %s", run_id, urls)
             return {
                 "run_id": run_id,
                 "status": data.get("data", {}).get("status", "RUNNING"),
@@ -220,6 +232,109 @@ def normalize_to_activity(scraped_data: dict[str, Any], source_domain: str = "we
         source="web",
         open_to_public=True,
     )
+
+
+def ai_extract_activities_from_markdown(
+    markdown: str,
+    page_url: str,
+    source_domain: str = "web",
+    source_tag: str = "web",
+) -> list[Activity]:
+    """
+    Use OpenAI to extract structured CME activities from raw markdown content.
+
+    Args:
+        markdown: Raw markdown/text from a scraped page
+        page_url: URL of the source page
+        source_domain: Domain for provider attribution
+
+    Returns:
+        List of Activity objects extracted by the LLM
+    """
+    import json
+    from openai import OpenAI
+
+    api_key = get_secret("OPENAI_API_KEY")
+    if not api_key:
+        logger.warning("OPENAI_API_KEY not set, skipping AI extraction")
+        return []
+
+    # Truncate markdown to avoid token limits (roughly 12k chars ~ 3k tokens)
+    truncated = markdown[:12000] if len(markdown) > 12000 else markdown
+
+    prompt = f"""You are a CME (Continuing Medical Education) activity extractor.
+
+Analyze the following webpage content and extract all CME activities/courses you can find.
+
+For each activity, extract:
+- title: The name of the CME activity/course
+- credits: Number of CME credits (as a float, e.g., 1.0, 2.5). Use 0 if not specified.
+- credit_type: Type of credits (e.g., "AMA PRA Category 1", "SA-CME", "MOC", "Patient Safety"). Use "CME" if not specified.
+- cost_usd: Cost in USD (as a float). Use 0 if free or not specified.
+- modality: "online", "live", or "hybrid"
+- description: Brief summary of the activity (1-2 sentences)
+- url: Direct URL to the activity if found in the content, otherwise null
+
+Return a JSON array of objects. If no CME activities are found, return an empty array [].
+Only include actual educational activities, not general website pages or navigation content.
+
+SOURCE URL: {page_url}
+
+WEBPAGE CONTENT:
+{truncated}
+
+RESPOND ONLY WITH VALID JSON (no markdown, no explanation):"""
+
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Fast and cheap for extraction
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=4000,
+        )
+
+        raw_output = response.choices[0].message.content.strip()
+
+        # Clean potential markdown wrapping
+        if raw_output.startswith("```"):
+            lines = raw_output.split("\n")
+            raw_output = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
+
+        extracted = json.loads(raw_output)
+        if not isinstance(extracted, list):
+            extracted = [extracted] if extracted else []
+
+        activities = []
+        for item in extracted:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title", "").strip()
+            if not title or len(title) < 5:
+                continue
+
+            activity = Activity(
+                title=title[:500],
+                provider=source_domain,
+                credits=float(item.get("credits", 0) or 0),
+                cost_usd=float(item.get("cost_usd", 0) or 0),
+                modality=item.get("modality", "online"),
+                url=item.get("url") or page_url,
+                summary=item.get("description", "")[:1000] if item.get("description") else None,
+                source=source_tag,
+                open_to_public=True,
+            )
+            activities.append(activity)
+
+        logger.info("AI extracted %d activities from %s", len(activities), page_url)
+        return activities
+
+    except json.JSONDecodeError as e:
+        logger.warning("AI extraction JSON parse failed for %s: %s", page_url, e)
+        return []
+    except Exception as e:
+        logger.exception("AI extraction failed for %s: %s", page_url, e)
+        return []
 
 
 async def crawl_and_extract_activities(

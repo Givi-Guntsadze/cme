@@ -2162,6 +2162,48 @@ def assist_reply(answer: str = Form(...)):
     return RedirectResponse("/", status_code=303)
 
 
+@app.get("/catalog-page", response_class=HTMLResponse)
+def catalog_page(
+    request: Request,
+    search: str = "",
+    modality: str = "",
+    source: str = "",
+):
+    """Browse all CME activities in the database."""
+    with get_session() as session:
+        query = select(Activity)
+        
+        # Apply filters
+        if search:
+            query = query.where(Activity.title.contains(search))
+        if modality:
+            query = query.where(Activity.modality == modality)
+        if source:
+            query = query.where(Activity.source == source)
+        
+        # Get filtered activities (limit 100 for performance)
+        activities = session.exec(query.order_by(Activity.id.desc()).limit(100)).all()
+        
+        # Get counts
+        total = session.exec(select(Activity)).all()
+        web_count = len([a for a in total if a.source == "web"])
+        abpn_count = len([a for a in total if a.source == "abpn"])
+        
+    return templates.TemplateResponse(
+        "catalog.html",
+        {
+            "request": request,
+            "activities": activities,
+            "total": len(total),
+            "web_count": web_count,
+            "abpn_count": abpn_count,
+            "search": search,
+            "modality": modality,
+            "source": source,
+        },
+    )
+
+
 @app.get("/preferences", response_class=HTMLResponse)
 def preferences_form(request: Request):
     with get_session() as session:
