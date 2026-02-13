@@ -12,18 +12,20 @@
 
   <div class="catalog-filters">
     <form id="filter-form" method="get" action="/catalog-page">
+      <input type="hidden" name="page" value="1" />
       <div class="filter-row">
-        <input type="text" name="search" placeholder="Search activities..." value="{{ search or '' }}" class="filter-input" />
+        <input type="text" name="search" placeholder="Search activities..." value="{{ search or '' }}"
+          class="filter-input" />
         <select name="modality" class="filter-select">
           <option value="">All Modalities</option>
-          <option value="online" {% if modality == 'online' %}selected{% endif %}>Online</option>
-          <option value="live" {% if modality == 'live' %}selected{% endif %}>Live</option>
-          <option value="hybrid" {% if modality == 'hybrid' %}selected{% endif %}>Hybrid</option>
+          <option value="online" {% if modality=='online' %}selected{% endif %}>Online</option>
+          <option value="live" {% if modality=='live' %}selected{% endif %}>Live</option>
+          <option value="hybrid" {% if modality=='hybrid' %}selected{% endif %}>Hybrid</option>
         </select>
         <select name="source" class="filter-select">
           <option value="">All Sources</option>
-          <option value="web" {% if source == 'web' %}selected{% endif %}>Web Scraped</option>
-          <option value="abpn" {% if source == 'abpn' %}selected{% endif %}>ABPN Approved</option>
+          <option value="web" {% if source=='web' %}selected{% endif %}>Web Scraped</option>
+          <option value="abpn" {% if source=='abpn' %}selected{% endif %}>ABPN Approved</option>
         </select>
         <button type="submit" class="filter-btn">Apply Filters</button>
       </div>
@@ -55,14 +57,18 @@
           <td class="title-cell">
             <div class="activity-title">{{ activity.title[:80] }}{% if activity.title|length > 80 %}...{% endif %}</div>
             {% if activity.summary %}
-            <div class="activity-summary">{{ activity.summary[:100] }}{% if activity.summary|length > 100 %}...{% endif %}</div>
+            <div class="activity-summary">{{ activity.summary[:100] }}{% if activity.summary|length > 100 %}...{% endif
+              %}</div>
             {% endif %}
           </td>
           <td>{{ activity.provider[:30] }}{% if activity.provider|length > 30 %}...{% endif %}</td>
           <td class="credits-cell">{{ activity.credits or '-' }}</td>
-          <td class="cost-cell">{% if activity.cost_usd %}${{ "%.2f"|format(activity.cost_usd) }}{% else %}-{% endif %}</td>
-          <td><span class="modality-badge modality-{{ activity.modality or 'online' }}">{{ activity.modality or 'online' }}</span></td>
-          <td><span class="source-badge source-{{ activity.source or 'web' }}">{{ activity.source or 'web' }}</span></td>
+          <td class="cost-cell">{% if activity.cost_usd %}${{ "%.2f"|format(activity.cost_usd) }}{% else %}-{% endif %}
+          </td>
+          <td><span class="modality-badge modality-{{ activity.modality or 'online' }}">{{ activity.modality or 'online'
+              }}</span></td>
+          <td><span class="source-badge source-{{ activity.source or 'web' }}">{{ activity.source or 'web' }}</span>
+          </td>
           <td>
             {% if activity.url %}
             <a href="{{ activity.url }}" target="_blank" class="action-link">View →</a>
@@ -78,9 +84,38 @@
     </table>
   </div>
 
-  {% if total > 50 %}
+  {% if total_pages > 1 %}
   <div class="pagination">
-    <p>Showing {{ activities|length }} of {{ total }} activities</p>
+    <div class="pagination-info">
+      Showing {{ activities|length }} of {{ filtered_total }} activities (Page {{ page }} of {{ total_pages }})
+    </div>
+    <div class="pagination-controls">
+      {% if page > 1 %}
+      <a href="/catalog-page?page={{ page - 1 }}{% if search %}&search={{ search }}{% endif %}{% if modality %}&modality={{ modality }}{% endif %}{% if source %}&source={{ source }}{% endif %}"
+        class="pagination-btn">← Previous</a>
+      {% else %}
+      <span class="pagination-btn disabled">← Previous</span>
+      {% endif %}
+
+      {% for p in range(1, total_pages + 1) %}
+      {% if p == page %}
+      <span class="pagination-btn active">{{ p }}</span>
+      {% elif p <= 3 or p> total_pages - 2 or (p >= page - 1 and p <= page + 1) %} <a
+          href="/catalog-page?page={{ p }}{% if search %}&search={{ search }}{% endif %}{% if modality %}&modality={{ modality }}{% endif %}{% if source %}&source={{ source }}{% endif %}"
+          class="pagination-btn">{{ p }}</a>
+          {% elif p == 4 and page > 5 %}
+          <span class="pagination-ellipsis">…</span>
+          {% elif p == total_pages - 2 and page < total_pages - 4 %} <span class="pagination-ellipsis">…</span>
+            {% endif %}
+            {% endfor %}
+
+            {% if page < total_pages %} <a
+              href="/catalog-page?page={{ page + 1 }}{% if search %}&search={{ search }}{% endif %}{% if modality %}&modality={{ modality }}{% endif %}{% if source %}&source={{ source }}{% endif %}"
+              class="pagination-btn">Next →</a>
+              {% else %}
+              <span class="pagination-btn disabled">Next →</span>
+              {% endif %}
+    </div>
   </div>
   {% endif %}
 </div>
@@ -187,7 +222,7 @@
   .catalog-table-wrapper {
     overflow-x: auto;
     border-radius: 12px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
   }
 
   .catalog-table {
@@ -230,12 +265,14 @@
     margin-top: 0.25rem;
   }
 
-  .credits-cell, .cost-cell {
+  .credits-cell,
+  .cost-cell {
     text-align: center;
     font-weight: 500;
   }
 
-  .modality-badge, .source-badge {
+  .modality-badge,
+  .source-badge {
     display: inline-block;
     padding: 0.25rem 0.75rem;
     border-radius: 20px;
@@ -244,12 +281,30 @@
     text-transform: capitalize;
   }
 
-  .modality-online { background: #e3f2fd; color: #1565c0; }
-  .modality-live { background: #e8f5e9; color: #2e7d32; }
-  .modality-hybrid { background: #fff3e0; color: #e65100; }
+  .modality-online {
+    background: #e3f2fd;
+    color: #1565c0;
+  }
 
-  .source-web { background: #f3e5f5; color: #7b1fa2; }
-  .source-abpn { background: #e0f2f1; color: #00695c; }
+  .modality-live {
+    background: #e8f5e9;
+    color: #2e7d32;
+  }
+
+  .modality-hybrid {
+    background: #fff3e0;
+    color: #e65100;
+  }
+
+  .source-web {
+    background: #f3e5f5;
+    color: #7b1fa2;
+  }
+
+  .source-abpn {
+    background: #e0f2f1;
+    color: #00695c;
+  }
 
   .action-link {
     color: var(--accent, #4a90d9);
@@ -268,8 +323,61 @@
   }
 
   .pagination {
-    margin-top: 1rem;
+    margin-top: 1.5rem;
     text-align: center;
+    color: var(--text-secondary, #666);
+  }
+
+  .pagination-info {
+    margin-bottom: 0.75rem;
+    font-size: 0.9rem;
+  }
+
+  .pagination-controls {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 0.25rem;
+    flex-wrap: wrap;
+  }
+
+  .pagination-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 2.25rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    text-decoration: none;
+    color: var(--text-primary, #1a1a2e);
+    background: var(--bg-secondary, #f8f9fa);
+    border: 1px solid var(--border, #ddd);
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+
+  .pagination-btn:hover:not(.disabled):not(.active) {
+    background: var(--accent, #4a90d9);
+    color: white;
+    border-color: var(--accent, #4a90d9);
+  }
+
+  .pagination-btn.active {
+    background: var(--accent, #4a90d9);
+    color: white;
+    border-color: var(--accent, #4a90d9);
+    cursor: default;
+  }
+
+  .pagination-btn.disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .pagination-ellipsis {
+    padding: 0.5rem 0.25rem;
     color: var(--text-secondary, #666);
   }
 
@@ -313,6 +421,22 @@
 
   [data-theme="dark"] .activity-title {
     color: #fff;
+  }
+
+  [data-theme="dark"] .pagination-btn {
+    background: #2a2a3e;
+    border-color: #3a3a5e;
+    color: #e0e0e0;
+  }
+
+  [data-theme="dark"] .pagination-btn:hover:not(.disabled):not(.active) {
+    background: #4a90d9;
+    color: white;
+  }
+
+  [data-theme="dark"] .pagination-btn.active {
+    background: #4a90d9;
+    color: white;
   }
 </style>
 {% endblock %}

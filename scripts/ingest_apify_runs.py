@@ -169,11 +169,12 @@ def main():
     parser = argparse.ArgumentParser(description="Ingest Apify runs into CME database with AI extraction")
     parser.add_argument("run_ids", metavar="RUN_ID", type=str, nargs="*", help="Apify Run IDs to ingest")
     parser.add_argument("--list", action="store_true", help="List recent successful runs")
+    parser.add_argument("--limit", type=int, default=30, help="Number of runs to list (default: 30)")
     
     args = parser.parse_args()
 
     if args.list or not args.run_ids:
-        asyncio.run(list_recent_runs())
+        asyncio.run(list_recent_runs(limit=args.limit))
         if not args.run_ids:
             print("\nUsage: python scripts/ingest_apify_runs.py [RUN_ID ...]")
             return

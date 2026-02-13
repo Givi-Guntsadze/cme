@@ -1563,14 +1563,11 @@ def _handle_plan_reject(
         ).first()
         if not item:
             return _refresh_plan_fragment_response(
-                request, session, user, plan_mode="standard", force_refresh=True
+                request, session, user, plan_mode="standard", force_refresh=False
             )
         activity = session.get(Activity, activity_id)
-        if item.committed:
-            item.committed = False
-            session.add(item)
         if activity and activity.title:
-            # FIX: Plan is single-mode now, so a simple payload works for everything.
+            # Add to policy so future plan rebuilds also exclude this title
             payload = json.dumps({"remove_titles": [activity.title]})
             apply_policy_payloads(
                 [payload],
@@ -1579,28 +1576,50 @@ def _handle_plan_reject(
                 invalidate=False,
                 record_message=False,
             )
-        PlanManager.invalidate_user_plans(session, user.id, reason="plan_reject")
-        if find_substitute and activity:
-             # SILENT SIGNAL: Triggers search without chat message
-            _queue_substitute_prompt(session, user, activity)
-            chat_refresh = True
-        session.commit()
-    with get_session() as session:
-        user = session.exec(select(User)).first()
-        response, plan_requirements = _prepare_plan_fragment(
-            request,
-            session,
-            user,
-            plan_mode="standard",
-            force_refresh=True,
-            reason="plan_reject",
-        )
-        # Show toast when substitute search is triggered
         if find_substitute:
-            response.headers["HX-Trigger"] = json.dumps({
-                "showToast": {"message": "🔍 Searching for alternatives... New activities will appear shortly.", "type": "info"}
-            })
-        return response
+            # For substitute: remove item, invalidate plan, force rebuild
+            session.delete(item)
+            PlanManager.invalidate_user_plans(session, user.id, reason="plan_reject")
+            if activity:
+                _queue_substitute_prompt(session, user, activity)
+                chat_refresh = True
+            session.commit()
+            with get_session() as session2:
+                user2 = session2.exec(select(User)).first()
+                response, plan_requirements = _prepare_plan_fragment(
+                    request,
+                    session2,
+                    user2,
+                    plan_mode="standard",
+                    force_refresh=True,
+                    reason="plan_reject",
+                )
+                response.headers["HX-Trigger"] = json.dumps({
+                    "showToast": {"message": "🔍 Searching for alternatives... New activities will appear shortly.", "type": "info"}
+                })
+                return response
+        else:
+            # Plain reject: just remove the item from the plan, no rebuild
+            session.delete(item)
+            # Update the PlanRun totals
+            if activity:
+                run.total_credits = max((run.total_credits or 0) - float(activity.credits or 0), 0)
+                run.total_cost = max((run.total_cost or 0) - float(activity.cost_usd or 0), 0)
+                if activity.modality == "live":
+                    run.days_used = max((run.days_used or 0) - (activity.days_required or 0), 0)
+                session.add(run)
+            session.commit()
+            with get_session() as session2:
+                user2 = session2.exec(select(User)).first()
+                response, _ = _prepare_plan_fragment(
+                    request,
+                    session2,
+                    user2,
+                    plan_mode="standard",
+                    force_refresh=False,
+                    reason=None,
+                )
+                return response
 
 
 @app.post("/plan/accept_all", response_class=HTMLResponse)
@@ -2168,11 +2187,18 @@ def catalog_page(
     search: str = "",
     modality: str = "",
     source: str = "",
+    page: int = 1,
 ):
-    """Browse all CME activities in the database."""
+    """Browse all CME activities in the database with pagination."""
+    PAGE_SIZE = 50
+    if page < 1:
+        page = 1
+
     with get_session() as session:
+        from sqlmodel import func as sqlfunc
+
         query = select(Activity)
-        
+
         # Apply filters
         if search:
             query = query.where(Activity.title.contains(search))
@@ -2180,26 +2206,45 @@ def catalog_page(
             query = query.where(Activity.modality == modality)
         if source:
             query = query.where(Activity.source == source)
-        
-        # Get filtered activities (limit 100 for performance)
-        activities = session.exec(query.order_by(Activity.id.desc()).limit(100)).all()
-        
-        # Get counts
-        total = session.exec(select(Activity)).all()
-        web_count = len([a for a in total if a.source == "web"])
-        abpn_count = len([a for a in total if a.source == "abpn"])
-        
+
+        # Count filtered results efficiently
+        count_query = select(sqlfunc.count()).select_from(query.subquery())
+        filtered_total = session.exec(count_query).one()
+
+        # Paginate
+        offset = (page - 1) * PAGE_SIZE
+        activities = session.exec(
+            query.order_by(Activity.id.desc()).offset(offset).limit(PAGE_SIZE)
+        ).all()
+
+        total_pages = max(1, (filtered_total + PAGE_SIZE - 1) // PAGE_SIZE)
+
+        # Get global counts (unfiltered)
+        total_all = session.exec(
+            select(sqlfunc.count()).select_from(Activity)
+        ).one()
+        web_count = session.exec(
+            select(sqlfunc.count()).select_from(Activity).where(Activity.source == "web")
+        ).one()
+        abpn_count = session.exec(
+            select(sqlfunc.count()).select_from(Activity).where(Activity.source == "abpn")
+        ).one()
+
     return templates.TemplateResponse(
         "catalog.html",
         {
             "request": request,
             "activities": activities,
-            "total": len(total),
+            "total": total_all,
+            "filtered_total": filtered_total,
             "web_count": web_count,
             "abpn_count": abpn_count,
             "search": search,
             "modality": modality,
             "source": source,
+            "page": page,
+            "total_pages": total_pages,
+            "page_size": PAGE_SIZE,
         },
     )
 

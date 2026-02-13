@@ -1,41 +1,37 @@
-# Project Context: ABPN-Focused CME Concierge
-The user is building an AI agent to help Psychiatrists manage their ABPN Continuing Certification (CC) requirements. The immediate focus has been on **ingesting authoritative ABPN-approved activities** and making them searchable via an AI chat.
+# ABPN Data Ingestion & Stabilization (Current Phase)
 
-## Current State (Session Checkpoint)
-We have a fully functional pipeline for crawling, ingesting, and searching ABPN activities.
-- **Data Source**: 154 unique ABPN activity URLs extracted.
-- **Crawling**: Smart-batch crawling (max 3 concurrent) implemented. First 20 sites have been crawled.
-- **Ingestion**: 
-    - `ingest_apify_runs.py` automatically tags activities from ABPN URLs with `source="abpn"`.
-    - **69 activities** are currently in the database (49 properly tagged as ABPN).
-- **Search & UI**: 
-    - **Catalog Page**: `http://localhost:8000/catalog-page` allows browsing/filtering.
-    - **Vector Search**: All SQLite activities have been indexed into ChromaDB.
-    - **Chat**: The AI concierge can successfully find and search these activities (verified with "drug use/opioid" query).
+## ✅ Completed Tasks (Confirmed)
+- **Batch 1-4 Complete**: Source URLs at indices 0-80 have been successfully crawled, ingested, and indexed.
+- **Current Database Count**: **450 Activities** are live and searchable.
+- **UI Fixes Deployed**: 
+  - **Catalog**: Implemented pagination (50 items/page), Previous/Next controls, and preserved filter state.
+  - **Navigation**: Added "📚 Browse Catalog" button to the main plan page.
+  - **Plan Logic**: Fixed "Reject" button behavior to simply remove the item without triggering a full plan rebuild (prevents unwanted substitutes).
+  - **Styling**: Added dark mode support for pagination controls.
 
-## Mental Stack (Where we left off)
-1.  **Pipeline verified**: The entire loop from "Raw HTML" -> "Crawler" -> "Sqlite" -> "Vector DB" -> "Chat" works.
-2.  **Indexing Requirement**: Note that currently, SQLite -> Vector DB sync is manual. You must run `python scripts/index_activities_vectordb.py` after ingesting new runs to make them show up in chat.
-3.  **Partial Data**: We still only have the first 20/154 ABPN sites crawled.
+## 🧠 Mental Stack (Resume Point)
+- **Context**: We are incrementally processing the `data/abpn_urls.txt` list in batches of 20 to manage API limits and stability.
+- **Last Completed Action**: Batch 4 (URLs 60-80) finished ingestion and indexing.
+- **Next Logical Batch**: Batch 5 (URLs 80-100).
+- **Total Progress**: ~52% complete (80 out of ~155 URLs).
 
-## Key Decisions
-- **Source Tagging**: We modified `ingest_apify_runs.py` to check the URL against `data/abpn_urls.txt`. If it matches (exact or domain), the activity gets `source="abpn"`. This is critical for trust.
-- **Vector Sync**: The chat tool (`search_activities`) queries ChromaDB, not SQLite. Therefore, keeping ChromaDB in sync is essential.
+## ⏭️ Next Steps (Execute Immediately)
+1. **Start Batch 5 Crawl (URLs 80-100)**:
+   - Run command: `python scripts/crawl_all_sources.py --start 80 --end 100`
+   - *Note: This will trigger ~20 runs on Apify. Wait for them to complete.*
 
-## Immediate Next Steps (To-Do List)
-1.  **Run Full Crawl**: 
-    - We stopped at 20 URLs for testing.
-    - ACTION: Run `python scripts/crawl_all_sources.py` to process the remaining 134 ABPN URLs.
-2.  **Ingest & Index**:
-    - After the crawl finishes (check Apify console or `ingest_apify_runs.py --list`):
-    - Run `python scripts/ingest_apify_runs.py [NEW_RUN_IDS]`
-    - Run `python scripts/index_activities_vectordb.py` (Crucial step!)
-3.  **Refine Ranking**:
-    - Build logic to prioritize `source="abpn"` activities in the `planner.py` algorithm so they appear in top recommendations, not just chat search.
+2. **Ingest Batch 5 Results**:
+   - List the successful runs: `python scripts/ingest_apify_runs.py --list --limit 20`
+   - Run the ingestion command with the new Run IDs.
 
-## Relevant Commands
-- **Run Batch Crawler**: `python scripts/crawl_all_sources.py`
-- **List Successful Runs**: `python scripts/ingest_apify_runs.py --list`
-- **Ingest Specific Runs**: `python scripts/ingest_apify_runs.py RUN_ID1 RUN_ID2`
-- **Sync Vector DB**: `python scripts/index_activities_vectordb.py` (Run this after ingestion!)
-- **Browse Catalog**: `http://localhost:8000/catalog-page`
+3. **Update Vector Index**:
+   - Run command: `python scripts/index_activities_vectordb.py`
+
+4. **Verify Application**:
+   - Start server: `uvicorn app.main:app --reload`
+   - Visit `http://localhost:8000/catalog-page` to verify the new activity count and pagination.
+
+## ⚠️ Critical Operational Notes (Do Not Ignore)
+- **Batch Size**: Stick to **20 URLs per batch**. Increasing this risks timeouts or hitting `MAX_CONCURRENT_RUNS` limits on Apify.
+- **Database Concurrency**: While `uvicorn` (reader) and ingestion scripts (writer) can technically run together, it is safer to stop `uvicorn` during heavy ingestion to prevent `database is locked` errors.
+- **Deduplication**: The system automatically handles duplicate URLs. If a batch overlaps with previous ones, it will skip existing entries safely.

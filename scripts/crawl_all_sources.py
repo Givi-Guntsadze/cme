@@ -54,9 +54,27 @@ async def main():
                 all_urls.append(url)
     
     # Process all ABPN URLs
-    pending_urls = all_urls
+    # Support for batching via CLI args
+    start_idx = 0
+    end_idx = None
     
-    print(f"Found {len(pending_urls)} ABPN URLs to process")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", type=int, default=0, help="Start index (0-based)")
+    parser.add_argument("--end", type=int, default=None, help="End index (exclusive)")
+    args, _ = parser.parse_known_args()
+    
+    start_idx = args.start
+    end_idx = args.end
+    
+    # Slice the list
+    if end_idx is not None:
+        pending_urls = all_urls[start_idx:end_idx]
+        print(f"Processing batch: indices {start_idx} to {end_idx} (Total: {len(pending_urls)})")
+    else:
+        pending_urls = all_urls[start_idx:]
+        print(f"Processing batch: indices {start_idx} to END (Total: {len(pending_urls)})")
+    
     print(f"Processing with MAX_CONCURRENT_RUNS = {MAX_CONCURRENT_RUNS}")
     print("=" * 60)
 
